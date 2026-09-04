@@ -9,9 +9,16 @@ use std::{fs, io::Write};
 /// Returns the Desktop directory for Bedrock .mcworld file output.
 /// Falls back to home directory, then current directory.
 pub fn get_bedrock_output_directory() -> PathBuf {
-    dirs::desktop_dir()
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(|| PathBuf::from("."))
+    #[cfg(target_os = "android")]
+    {
+        PathBuf::from("/storage/emulated/0/Download")
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        dirs::desktop_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
 }
 
 /// Returns Luanti's worlds directory for the current OS.
@@ -87,6 +94,11 @@ pub fn sanitize_for_filename(name: &str) -> String {
 /// Builds the Bedrock output path and level name for a given bounding box.
 /// Combines area name lookup, sanitization, and path construction.
 pub fn build_bedrock_output(bbox: &LLBBox, output_dir: PathBuf) -> (PathBuf, String) {
+    let output_dir = if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download")
+    } else {
+        output_dir
+    };
     let area_name = get_area_name_for_bedrock(bbox);
     let safe_name = sanitize_for_filename(&area_name);
     let filename = format!("Arnis {safe_name}.mcworld");
@@ -216,8 +228,10 @@ pub fn create_new_world(base_path: &Path) -> Result<String, String> {
         .map_err(|e| format!("Failed to finalize compression for level.dat: {e}"))?;
 
     // Write the level.dat file
-    fs::write(new_world_path.join("level.dat"), compressed_level_data)
+    let level_dat_path = new_world_path.join("level.dat");
+    fs::write(&level_dat_path, compressed_level_data)
         .map_err(|e| format!("Failed to create level.dat file: {e}"))?;
+    let _ = fs::copy(&level_dat_path, new_world_path.join("level.dat_old"));
 
     // Add the icon.png file
     const ICON_TEMPLATE: &[u8] = include_bytes!("../assets/minecraft/icon.png");
@@ -344,6 +358,7 @@ fn register_tall_datapack_in_level_dat(world_path: &Path) -> Result<(), String> 
         .finish()
         .map_err(|e| format!("Failed to finalize level.dat compression: {e}"))?;
     fs::write(&level_path, compressed).map_err(|e| format!("Failed to write level.dat: {e}"))?;
+    let _ = fs::copy(&level_path, world_path.join("level.dat_old"));
 
     Ok(())
 }
@@ -396,6 +411,7 @@ pub fn apply_java_world_settings(
         .finish()
         .map_err(|e| format!("Failed to finalize level.dat compression: {e}"))?;
     fs::write(&level_path, compressed).map_err(|e| format!("Failed to write level.dat: {e}"))?;
+    let _ = fs::copy(&level_path, world_path.join("level.dat_old"));
 
     Ok(())
 }
@@ -412,6 +428,7 @@ pub fn set_spawn_in_level_dat(
     spawn_y: i32,
     spawn_z: i32,
 ) -> Result<(), String> {
+    let spawn_y = spawn_y.max(64);
     let level_path = world_path.join("level.dat");
     if !level_path.exists() {
         return Err(format!("level.dat not found at {level_path:?}"));
@@ -482,6 +499,7 @@ pub fn set_spawn_in_level_dat(
 
     fs::write(&level_path, compressed_data)
         .map_err(|e| format!("Failed to write updated level.dat: {e}"))?;
+    let _ = fs::copy(&level_path, world_path.join("level.dat_old"));
 
     Ok(())
 }

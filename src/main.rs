@@ -1,126 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod args;
-mod bedrock_block_map;
-mod bench;
-mod biome;
-mod block_definitions;
-mod block_palette;
-mod bresenham;
-mod canopy;
-mod celestial;
-mod climate;
-mod clipping;
-mod colors;
-mod coordinate_system;
-mod data_processing;
-mod decals;
-mod deterministic_rng;
-mod element_processing;
-mod elevation;
-mod elevation_data;
-mod floodfill;
-mod floodfill_cache;
-mod ground;
-mod ground_generation;
-mod land_cover;
-mod landmarks;
-mod luanti_block_map;
-mod map_item;
-mod map_item_palette;
-mod map_preview;
-mod map_renderer;
-mod map_transformation;
-mod models_3d;
-mod net;
-mod ore_generation;
-mod osm_parser;
-mod overture;
-#[cfg(feature = "gui")]
-mod preview_3d;
-#[cfg(feature = "gui")]
-mod progress;
-mod projection;
-mod retrieve_data;
-mod structures;
-#[cfg(feature = "gui")]
-mod telemetry;
-#[cfg(test)]
-mod test_utilities;
-mod tile;
-mod trees;
-mod version_check;
-mod water_depth;
-mod world_editor;
-mod world_utils;
-
-use args::Args;
+use arnis_lib::*;
+use arnis_lib::args::Args;
 use clap::Parser;
 use colored::*;
 use std::path::PathBuf;
-#[cfg(all(feature = "gui", target_os = "linux"))]
-use std::process::Command;
 use std::{env, fs, io::Write};
-
-// mimalloc scales far better than the system allocator under the concurrent
-// 4 KiB section-vec / hashmap churn of tile-parallel processing.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(feature = "gui")]
-mod gui;
-
-// If the user does not want the GUI, it's easiest to just mock the progress module to do nothing
-#[cfg(not(feature = "gui"))]
-mod progress {
-    pub fn emit_gui_error(_message: &str) {}
-    pub fn emit_gui_progress_update(_progress: f64, _message: &str) {}
-    pub fn emit_gui_progress_update_ex(_progress: f64, _message: &str, _streaming: bool) {}
-    pub fn emit_map_preview_ready() {}
-    pub fn emit_show_in_folder(_path: &str) {}
-    pub fn is_running_with_gui() -> bool {
-        false
-    }
-}
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-
-#[cfg(all(feature = "gui", target_os = "linux"))]
-const EGL_ZINK_RETRY_MARKER: &str = "ARNIS_EGL_ZINK_RETRY";
-
-#[cfg(all(feature = "gui", target_os = "linux"))]
-fn has_user_rendering_override() -> bool {
-    [
-        "MESA_LOADER_DRIVER_OVERRIDE",
-        "LIBGL_ALWAYS_SOFTWARE",
-        "GALLIUM_DRIVER",
-    ]
-    .iter()
-    .any(|name| env::var_os(name).is_some())
-}
-
-#[cfg(all(feature = "gui", target_os = "linux"))]
-fn is_egl_startup_failure(error_message: &str) -> bool {
-    let lowered = error_message.to_ascii_lowercase();
-    lowered.contains("egl_not_initialized")
-        || lowered.contains("surfaceless egl")
-        || (lowered.contains("libegl") && lowered.contains("failed"))
-}
-
-#[cfg(all(feature = "gui", target_os = "linux"))]
-fn retry_gui_with_zink() -> Result<(), String> {
-    let executable = env::current_exe()
-        .map_err(|e| format!("Failed to locate current executable for EGL fallback retry: {e}"))?;
-    let status = Command::new(executable)
-        .env(EGL_ZINK_RETRY_MARKER, "1")
-        .env("MESA_LOADER_DRIVER_OVERRIDE", "zink")
-        .env("LIBGL_ALWAYS_SOFTWARE", "0")
-        .env("GALLIUM_DRIVER", "zink")
-        .status()
-        .map_err(|e| format!("Failed to relaunch with zink EGL workaround: {e}"))?;
-
-    std::process::exit(status.code().unwrap_or(1));
-}
 
 /// Reattach to the console this process was launched from, so terminal output
 /// works in both CLI and GUI runs.
@@ -575,7 +462,7 @@ fn run_cli() {
     let spawn_y_for_java = spawn_point.map(|(sx, sz)| {
         use coordinate_system::cartesian::XZPoint;
         let rel = XZPoint::new(sx - xzbbox.min_x(), sz - xzbbox.min_z());
-        ground.level(rel) + 3
+        (ground.level(rel) + 3).max(64)
     });
 
     // Build generation options
@@ -648,28 +535,7 @@ fn main() {
     {
         let gui_mode = std::env::args().len() == 1; // Just "arnis" with no args
         if gui_mode {
-            #[cfg(target_os = "linux")]
-            let user_rendering_override = has_user_rendering_override();
-
-            if let Err(e) = gui::run_gui() {
-                #[cfg(target_os = "linux")]
-                {
-                    let already_retried = env::var_os(EGL_ZINK_RETRY_MARKER).is_some();
-                    if !already_retried && !user_rendering_override && is_egl_startup_failure(&e) {
-                        eprintln!(
-                            "{} Linux EGL initialization failed; retrying once with zink.",
-                            "Warning:".yellow().bold()
-                        );
-                        if let Err(retry_error) = retry_gui_with_zink() {
-                            eprintln!("{} {}", "Error:".red().bold(), retry_error);
-                        }
-                    }
-                }
-
-                eprintln!("{} {}", "Error:".red().bold(), e);
-                std::process::exit(1);
-            }
-
+            arnis_lib::run();
             return;
         }
     }

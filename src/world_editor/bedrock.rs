@@ -162,13 +162,23 @@ impl BedrockWriter {
     ) -> Self {
         // If the path ends with .mcworld, use it as the final archive path
         // and create a temp directory without that extension for working files
-        let (output_dir, mcworld_path) =
-            if output_path.extension().is_some_and(|ext| ext == "mcworld") {
-                (output_path.with_extension(""), output_path)
+        let (output_dir, mcworld_path) = if cfg!(target_os = "android") {
+            let temp_staging = std::env::temp_dir().join(format!(
+                "arnis_bedrock_{}",
+                level_name.replace(['/', '\\', ' '], "_")
+            ));
+            let filename = if output_path.extension().is_some_and(|ext| ext == "mcworld") {
+                output_path.file_name().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("{level_name}.mcworld")))
             } else {
-                let mcworld_path = append_mcworld_extension(&output_path);
-                (output_path, mcworld_path)
+                append_mcworld_extension(&output_path).file_name().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(format!("{level_name}.mcworld")))
             };
+            (temp_staging, PathBuf::from("/storage/emulated/0/Download").join(filename))
+        } else if output_path.extension().is_some_and(|ext| ext == "mcworld") {
+            (output_path.with_extension(""), output_path)
+        } else {
+            let mcworld_path = append_mcworld_extension(&output_path);
+            (output_path, mcworld_path)
+        };
 
         Self {
             output_dir,
@@ -264,7 +274,7 @@ impl BedrockWriter {
                 let rel_x = spawn_x - xzbbox.min_x();
                 let rel_z = spawn_z - xzbbox.min_z();
                 let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
-                ground.level(coord) + 3 // Add 3 blocks above ground for safety
+                (ground.level(coord) + 3).max(64) // Add 3 blocks above ground for safety
             })
             .unwrap_or(64);
 
@@ -446,12 +456,18 @@ impl BedrockWriter {
             .map_err(|e| BedrockSaveError::Nbt(format!("level.dat: {e}")))?;
 
         // Write with header
-        let mut file = File::create(self.output_dir.join("level.dat"))?;
+        let level_dat_path = self.output_dir.join("level.dat");
+        let mut file = File::create(&level_dat_path)?;
         // Storage version: 10 (current Bedrock format)
         file.write_u32::<LittleEndian>(10)?;
         // Length of NBT data
         file.write_u32::<LittleEndian>(nbt_bytes.len() as u32)?;
         file.write_all(&nbt_bytes)?;
+        drop(file);
+
+        // Duplicate level.dat as level.dat_old
+        let level_dat_old_path = self.output_dir.join("level.dat_old");
+        let _ = fs::copy(&level_dat_path, &level_dat_old_path);
 
         Ok(())
     }
@@ -787,12 +803,21 @@ impl BedrockWriter {
     }
 
     fn package_mcworld(&self) -> Result<(), BedrockSaveError> {
-        let file = File::create(&self.mcworld_path)?;
+        let package_target = if cfg!(target_os = "android") {
+            std::env::temp_dir().join(format!(
+                "{}.mcworld.tmp",
+                self.level_name.replace(['/', '\\', ' '], "_")
+            ))
+        } else {
+            self.mcworld_path.clone()
+        };
+
+        let file = File::create(&package_target)?;
         let mut writer = ZipWriter::new(file);
         let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
 
         // Add top-level files
-        for file_name in ["levelname.txt", "metadata.json", "level.dat"] {
+        for file_name in ["levelname.txt", "metadata.json", "level.dat", "level.dat_old"] {
             let path = self.output_dir.join(file_name);
             if path.exists() {
                 writer.start_file(file_name, options)?;
@@ -840,6 +865,19 @@ impl BedrockWriter {
         }
 
         writer.finish()?;
+
+        if cfg!(target_os = "android") {
+            let dest_dir = PathBuf::from("/storage/emulated/0/Download");
+            let _ = fs::create_dir_all(&dest_dir);
+            let dest_file = dest_dir.join(
+                self.mcworld_path
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("world.mcworld")),
+            );
+            fs::copy(&package_target, &dest_file)?;
+            let _ = fs::remove_file(&package_target);
+        }
+
         Ok(())
     }
 

@@ -12,7 +12,9 @@ const TILE_CACHE_MAX_AGE_DAYS: u64 = 30;
 /// Uses the OS-standard cache directory (e.g. AppData/Local on Windows, ~/.cache on Linux).
 /// Falls back to ./arnis-tile-cache if the OS cache directory is unavailable.
 pub fn get_cache_dir(provider_name: &str) -> PathBuf {
-    let base = if let Some(cache_dir) = dirs::cache_dir() {
+    let base = if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache").join(TILE_CACHE_DIR_NAME)
+    } else if let Some(cache_dir) = dirs::cache_dir() {
         cache_dir.join(TILE_CACHE_DIR_NAME)
     } else {
         PathBuf::from(format!("./{TILE_CACHE_DIR_NAME}"))
@@ -22,7 +24,9 @@ pub fn get_cache_dir(provider_name: &str) -> PathBuf {
 
 /// Returns the base tile cache directory path (without provider subdirectory).
 pub fn get_base_cache_dir() -> PathBuf {
-    if let Some(cache_dir) = dirs::cache_dir() {
+    if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache").join(TILE_CACHE_DIR_NAME)
+    } else if let Some(cache_dir) = dirs::cache_dir() {
         cache_dir.join(TILE_CACHE_DIR_NAME)
     } else {
         PathBuf::from(format!("./{TILE_CACHE_DIR_NAME}"))

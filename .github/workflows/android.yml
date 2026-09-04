@@ -1,0 +1,175 @@
+name: Build Android Apk
+
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'cmdline-tools;latest platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018'
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android
+
+      - name: Environment
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          NDK_DIR="$ANDROID_HOME/ndk/27.2.12479018"
+          echo "NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> $GITHUB_PATH
+          echo "PATH=$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin:$ANDROID_HOME/build-tools/35.0.0:$PATH" >> $GITHUB_ENV
+          echo "CC_aarch64_linux_android=$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang" >> $GITHUB_ENV
+          echo "CXX_aarch64_linux_android=$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang++" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> $GITHUB_ENV
+
+      - name: Tauri CLI
+        run: cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Tauri Init
+        run: cargo tauri android init
+
+      - name: Configure Android
+        run: |
+          python3 - << 'PYEOF'
+          import os
+          import re
+
+          gradle_path = "gen/android/app/build.gradle.kts"
+          if not os.path.exists(gradle_path):
+              for root, dirs, files in os.walk("."):
+                  if "build.gradle.kts" in files and os.path.join("gen", "android") in root:
+                      gradle_path = os.path.join(root, "build.gradle.kts")
+                      break
+
+          print(f"Configuring {gradle_path}...")
+          with open(gradle_path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          content = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 35', content)
+          content = re.sub(r'compileSdkVersion\s*\(\s*\d+\s*\)', 'compileSdk = 35', content)
+          content = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 35', content)
+          content = re.sub(r'targetSdkVersion\s*\(\s*\d+\s*\)', 'targetSdk = 35', content)
+          content = re.sub(r'minSdk\s*=\s*\d+', 'minSdk = 28', content)
+          content = re.sub(r'minSdkVersion\s*\(\s*\d+\s*\)', 'minSdk = 28', content)
+
+          if "ndkVersion" in content:
+              content = re.sub(r'ndkVersion\s*=\s*"[^"]*"', 'ndkVersion = "27.2.12479018"', content)
+          else:
+              content = re.sub(r'(android\s*\{)', r'\1\n    ndkVersion = "27.2.12479018"', content, count=1)
+
+          ndk_block = """
+                  ndk {
+                      abiFilters.clear()
+                      abiFilters.add("arm64-v8a")
+                  }
+          """
+          if "abiFilters" in content:
+              content = re.sub(r'abiFilters\s*\.?\s*\(?[^)\n]*\)?', 'abiFilters.clear()\n            abiFilters.add("arm64-v8a")', content)
+          else:
+              content = re.sub(r'(defaultConfig\s*\{)', r'\1' + ndk_block, content, count=1)
+
+          packaging_block = """
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = false
+                  }
+              }
+          """
+          if "useLegacyPackaging" in content:
+              content = re.sub(r'useLegacyPackaging\s*=\s*(true|false)', 'useLegacyPackaging = false', content)
+          elif "packaging {" in content:
+              content = re.sub(r'(packaging\s*\{)', r'\1\n        jniLibs.useLegacyPackaging = false', content, count=1)
+          else:
+              content = re.sub(r'(android\s*\{)', r'\1\n' + packaging_block, content, count=1)
+
+          with open(gradle_path, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("Updated build.gradle.kts successfully")
+
+          manifest_path = "gen/android/app/src/main/AndroidManifest.xml"
+          if not os.path.exists(manifest_path):
+              for root, dirs, files in os.walk("."):
+                  if "AndroidManifest.xml" in files and os.path.join("gen", "android") in root:
+                      manifest_path = os.path.join(root, "AndroidManifest.xml")
+                      break
+
+          print(f"Configuring {manifest_path}...")
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              mcontent = f.read()
+
+          permissions = """
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+          """
+
+          for perm in [
+              "android.permission.INTERNET",
+              "android.permission.READ_EXTERNAL_STORAGE",
+              "android.permission.WRITE_EXTERNAL_STORAGE",
+              "android.permission.MANAGE_EXTERNAL_STORAGE"
+          ]:
+              mcontent = re.sub(rf'<uses-permission\s+android:name="{perm}"[^>]*/>\s*', '', mcontent)
+
+          mcontent = mcontent.replace("<application", permissions + "\n    <application", 1)
+
+          app_attrs = 'android:requestLegacyExternalStorage="true" android:hardwareAccelerated="true"'
+          for attr in ["android:requestLegacyExternalStorage", "android:hardwareAccelerated", "android:extractNativeLibs"]:
+              mcontent = re.sub(rf'{attr}="[^"]*"', '', mcontent)
+
+          mcontent = re.sub(r'<application\s*', f'<application {app_attrs} ', mcontent, count=1)
+
+          for attr in ["android:configChanges", "android:windowSoftInputMode"]:
+              mcontent = re.sub(rf'{attr}="[^"]*"', '', mcontent)
+
+          act_attrs = 'android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout" android:windowSoftInputMode="adjustResize"'
+          mcontent = re.sub(r'<activity\s*', f'<activity {act_attrs} ', mcontent, count=1)
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(mcontent)
+          print("Updated AndroidManifest.xml successfully")
+          PYEOF
+
+      - name: Update Dependencies
+        run: |
+          cargo update -p tauri --precise 2.3.0 || true
+          cargo update -p reqwest || true
+
+      - name: Build APK
+        run: cargo tauri android build --target aarch64-linux-android --apk
+
+      - name: Sign & Align
+        run: |
+          export PATH="$ANDROID_HOME/build-tools/35.0.0:$PATH"
+          APK_PATH=$(find gen/android/app/build/outputs/apk/ -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find . -name "*.apk" | head -n 1)
+          fi
+          echo "Found APK at: $APK_PATH"
+          zipalign -f -P 16 4 "$APK_PATH" app-aligned.apk || zipalign -f -p 4 "$APK_PATH" app-aligned.apk || cp "$APK_PATH" app-aligned.apk
+          [ -f debug.keystore ] || keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out arnis-arm64-v8a.apk app-aligned.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: arnis-arm64-v8a-apk
+          path: arnis-arm64-v8a.apk

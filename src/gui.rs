@@ -17,11 +17,14 @@ use colored::Colorize;
 use fastnbt::Value;
 use flate2::read::GzDecoder;
 use fs2::FileExt;
+#[cfg(not(target_os = "android"))]
 use log::LevelFilter;
+#[cfg(not(target_os = "android"))]
 use rfd::FileDialog;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io::Write};
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_log::{Builder as LogBuilder, Target, TargetKind};
 
 /// Manages the session.lock file for a Minecraft world directory
@@ -103,7 +106,7 @@ impl Drop for NewWorldCleanup {
 
 pub fn run_gui() -> Result<(), String> {
     // Configure thread pool with 90% CPU cap to keep system responsive
-    crate::floodfill_cache::configure_rayon_thread_pool(0.9);
+    crate::floodfill_cache::configure_rayon_thread_pool(if cfg!(target_os = "android") { 0.5 } else { 0.9 });
 
     // Clean up old cached elevation tiles on startup
     crate::elevation_data::cleanup_old_cached_tiles();
@@ -136,7 +139,10 @@ pub fn run_gui() -> Result<(), String> {
         // Note: Removed Qt WebEngine flags as they don't apply to Tauri
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    #[cfg(not(target_os = "android"))]
+    let builder = builder
         .plugin(
             LogBuilder::default()
                 .level(LevelFilter::Info)
@@ -148,7 +154,9 @@ pub fn run_gui() -> Result<(), String> {
                 ])
                 .build(),
         )
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_shell::init());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             gui_create_world,
             gui_get_default_save_path,
@@ -183,6 +191,9 @@ pub fn run_gui() -> Result<(), String> {
 /// Checks standard install paths including Flatpak on Linux.
 /// Falls back to Desktop, then current directory.
 fn detect_minecraft_saves_directory() -> PathBuf {
+    if cfg!(target_os = "android") {
+        return PathBuf::from("/storage/emulated/0/Download");
+    }
     // Try standard Minecraft saves directories per OS
     let mc_saves: Option<PathBuf> = if cfg!(target_os = "windows") {
         env::var("APPDATA")
@@ -233,6 +244,9 @@ fn gui_get_default_save_path() -> String {
 /// Returns the default directory for Bedrock .mcworld files (the Desktop).
 #[tauri::command]
 fn gui_get_default_bedrock_save_path() -> String {
+    if cfg!(target_os = "android") {
+        return "/storage/emulated/0/Download".to_string();
+    }
     crate::world_utils::get_bedrock_output_directory()
         .display()
         .to_string()
@@ -240,6 +254,9 @@ fn gui_get_default_bedrock_save_path() -> String {
 
 /// Returns the configured Bedrock output directory, or the default if it is unusable.
 fn resolve_bedrock_output_dir(configured: &str) -> PathBuf {
+    if cfg!(target_os = "android") {
+        return PathBuf::from("/storage/emulated/0/Download");
+    }
     let trimmed = configured.trim();
     if !trimmed.is_empty() {
         let configured_dir = PathBuf::from(trimmed);
@@ -300,7 +317,10 @@ fn gui_set_save_path(path: String) -> Result<String, String> {
 /// to attach to bug reports. Routing it through `log` puts it in the same
 /// LogDir target as the backend's own output.
 #[tauri::command]
-fn gui_log(level: String, message: String) {
+fn gui_log(level: String, message: String) -> Result<(), String> {
+    if cfg!(target_os = "android") {
+        return Ok(());
+    }
     // The frontend is not a trusted formatter: cap the length so a runaway
     // handler cannot fill the log file, and keep it on one line so the file
     // stays greppable.
@@ -315,19 +335,31 @@ fn gui_log(level: String, message: String) {
         "warn" => log::warn!(target: "webview", "{message}"),
         _ => log::info!(target: "webview", "{message}"),
     }
+    Ok(())
 }
 
 /// Opens a native folder-picker dialog and returns the chosen path.
 #[tauri::command]
 fn gui_pick_save_directory(start_path: String) -> Result<String, String> {
-    let start = PathBuf::from(&start_path);
-    let mut dialog = FileDialog::new();
-    if start.is_dir() {
-        dialog = dialog.set_directory(&start);
+    if cfg!(target_os = "android") {
+        return Ok("/storage/emulated/0/Download".to_string());
     }
-    match dialog.pick_folder() {
-        Some(folder) => Ok(folder.display().to_string()),
-        None => Ok(start_path),
+    #[cfg(not(target_os = "android"))]
+    {
+        let start = PathBuf::from(&start_path);
+        let mut dialog = FileDialog::new();
+        if start.is_dir() {
+            dialog = dialog.set_directory(&start);
+        }
+        match dialog.pick_folder() {
+            Some(folder) => Ok(folder.display().to_string()),
+            None => Ok(start_path),
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = start_path;
+        Ok("/storage/emulated/0/Download".to_string())
     }
 }
 
@@ -451,7 +483,10 @@ fn add_localized_world_name(
                             if encoder.write_all(&serialized_data).is_ok() {
                                 if let Ok(compressed_data) = encoder.finish() {
                                     match std::fs::write(&level_path, compressed_data) {
-                                        Ok(_) => write_succeeded = true,
+                                        Ok(_) => {
+                                            write_succeeded = true;
+                                            let _ = std::fs::copy(&level_path, world_path.join("level.dat_old"));
+                                        }
                                         Err(e) => {
                                             eprintln!(
                                                 "Failed to update level.dat with area name: {e}"
@@ -566,9 +601,10 @@ fn set_player_spawn_in_level_dat(
     };
 
     // Write the updated level.dat file
-    if let Err(e) = std::fs::write(level_path, compressed_data) {
+    if let Err(e) = std::fs::write(&level_path, compressed_data) {
         return Err(format!("Failed to write updated level.dat: {e}"));
     }
+    let _ = std::fs::copy(&level_path, PathBuf::from(world_path).join("level.dat_old"));
 
     Ok(())
 }
@@ -645,9 +681,9 @@ pub fn update_player_spawn_y_after_generation(
         let relative_z = existing_spawn_z - xzbbox.min_z();
         let terrain_point = XZPoint::new(relative_x, relative_z);
 
-        ground.level(terrain_point) + 3 // Add 3 blocks above terrain for safety
+        (ground.level(terrain_point) + 3).max(64) // Add 3 blocks above terrain for safety
     } else {
-        -61 // Default Y if no terrain
+        64 // Default Y if no terrain
     };
 
     // Update player position and world spawn point
@@ -685,9 +721,10 @@ pub fn update_player_spawn_y_after_generation(
     };
 
     // Write the updated level.dat file
-    if let Err(e) = std::fs::write(level_path, compressed_data) {
+    if let Err(e) = std::fs::write(&level_path, compressed_data) {
         return Err(format!("Failed to write updated level.dat: {e}"));
     }
+    let _ = std::fs::copy(&level_path, world_path.join("level.dat_old"));
 
     Ok(())
 }
@@ -739,13 +776,18 @@ fn gui_get_version() -> String {
 /// Latest release info from the GitHub Releases API + a comparison to the running version.
 #[tauri::command]
 fn gui_get_update_info() -> Result<version_check::UpdateInfo, String> {
+    if cfg!(target_os = "android") {
+        return Err("Updates are handled via APK".to_string());
+    }
     version_check::check_for_updates().map_err(|e| format!("Update check failed: {e}"))
 }
 
 /// Compile-time target platform: "windows" / "macos" / "linux" / "unknown".
 #[tauri::command]
 fn gui_get_platform() -> &'static str {
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "windows") {
         "windows"
     } else if cfg!(target_os = "macos") {
         "macos"
@@ -909,6 +951,9 @@ struct WorldMapData {
 /// "cannot find" error on unsynced/placeholder files. Directories always open in Explorer.
 #[tauri::command]
 fn gui_show_in_folder(path: String) -> Result<(), String> {
+    if cfg!(target_os = "android") {
+        return Ok(());
+    }
     #[cfg(target_os = "windows")]
     {
         // OneDrive files can be cloud placeholders / mid-sync that `start` can't launch
@@ -1067,6 +1112,17 @@ fn gui_start_generation(
     // level.dat to modify (the spawn point will be set when the .mcworld is created)
     if is_new_world && world_format != "bedrock" && !world_format.starts_with("luanti") {
         let prep_result: Result<(), String> = (|| -> Result<(), String> {
+            let target_world_path = if cfg!(target_os = "android") {
+                let base = PathBuf::from("/storage/emulated/0/Download");
+                let world_dir_name = Path::new(&selected_world)
+                    .file_name()
+                    .unwrap_or(std::ffi::OsStr::new("Arnis World"));
+                base.join(world_dir_name)
+            } else {
+                PathBuf::from(&selected_world)
+            };
+            let target_world_str = target_world_path.to_string_lossy();
+
             let llbbox = LLBBox::from_str(&bbox_text)
                 .map_err(|e| format!("Failed to parse bounding box: {e}"))?;
 
@@ -1094,11 +1150,11 @@ fn gui_start_generation(
                 &xzbbox,
             );
 
-            set_player_spawn_in_level_dat(&selected_world, spawn_x, spawn_z)
+            set_player_spawn_in_level_dat(&target_world_str, spawn_x, spawn_z)
                 .map_err(|e| format!("Failed to set spawn point: {e}"))?;
 
             if disable_height_limit {
-                crate::world_utils::install_tall_datapack(std::path::Path::new(&selected_world))
+                crate::world_utils::install_tall_datapack(&target_world_path)
                     .map_err(|e| format!("Failed to install tall-world datapack: {e}"))?;
             }
 
@@ -1108,7 +1164,16 @@ fn gui_start_generation(
         if let Err(error_msg) = prep_result {
             eprintln!("{error_msg}");
             emit_gui_error(&error_msg);
-            remove_new_java_world(&PathBuf::from(&selected_world));
+            let cleanup_target = if cfg!(target_os = "android") {
+                PathBuf::from("/storage/emulated/0/Download").join(
+                    Path::new(&selected_world)
+                        .file_name()
+                        .unwrap_or(std::ffi::OsStr::new("Arnis World")),
+                )
+            } else {
+                PathBuf::from(&selected_world)
+            };
+            remove_new_java_world(&cleanup_target);
             return Err(error_msg);
         }
     }
@@ -1117,8 +1182,6 @@ fn gui_start_generation(
         // Held until the worker finishes, on every path, so the globals stay this run's.
         let _generation_slot = generation_slot;
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            let world_path = PathBuf::from(&selected_world);
-
             // Determine world format from UI selection first (needed for session lock decision)
 
             let luanti_game = if world_format.starts_with("luanti") {
@@ -1133,6 +1196,16 @@ fn gui_start_generation(
                 WorldFormat::LuantiWorld
             } else {
                 WorldFormat::JavaAnvil
+            };
+
+            let world_path = if cfg!(target_os = "android") && world_format == WorldFormat::JavaAnvil {
+                let base = PathBuf::from("/storage/emulated/0/Download");
+                let world_dir_name = Path::new(&selected_world)
+                    .file_name()
+                    .unwrap_or(std::ffi::OsStr::new("Arnis World"));
+                base.join(world_dir_name)
+            } else {
+                PathBuf::from(&selected_world)
             };
 
             // Arm cleanup for freshly created Java worlds. Declared before the
@@ -1195,7 +1268,7 @@ fn gui_start_generation(
             // Acquire session lock for Java worlds only
             // Session lock prevents Minecraft from having the world open during generation
             // Bedrock worlds are generated as .mcworld files and don't need this lock
-            let _session_lock: Option<SessionLock> = if world_format == WorldFormat::JavaAnvil {
+            let _session_lock: Option<SessionLock> = if world_format == WorldFormat::JavaAnvil && !cfg!(target_os = "android") {
                 match SessionLock::acquire(&world_path) {
                     Ok(lock) => Some(lock),
                     Err(e) => {

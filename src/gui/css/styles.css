@@ -337,39 +337,15 @@ button:hover {
 }
 
 /* Connected Button Block */
-.button-block {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  gap: 0;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-  border-radius: 8px;
-}
-
-
-.format-toggle-btn {
-  flex: 1;
-  padding: 12px 8px;
-  font-size: 0.9em;
-  font-weight: 500;
-  border: none;
-  border-top: 1px solid rgba(255, 255, 255, 0.15);
-  cursor: pointer;
-  transition: all 0.25s ease;
-  margin-top: 0;
-  border-radius: 0;
-  box-shadow: none;
-  background-clip: padding-box;
-}
-
-.format-toggle-btn:first-child {
-  border-radius: 0 0 0 8px;
-}
-
-.format-toggle-btn.format-toggle-btn--rightmost {
-  border-radius: 0 0 8px 0;
-  border-left: 1px solid rgba(255, 255, 255, 0.15);
-}
+.button-block { display: flex; flex-direction: column; width: 100%; gap: 8px; box-shadow: none; border-radius: 0; background: transparent; }
+.start-action-row { display: flex; align-items: stretch; width: 100%; height: 52px; min-height: 52px; max-height: 52px; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+.start-button { flex: 1; padding: 8px 16px; border: none; border-radius: 12px 0 0 12px; font-size: 16px; font-weight: 500; cursor: pointer; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 52px; max-height: 52px; box-sizing: border-box; }
+.settings-button { width: 52px !important; min-width: 52px !important; max-width: 52px !important; height: 52px !important; min-height: 52px; max-height: 52px; border-radius: 0 12px 12px 0; display: flex; justify-content: center; align-items: center; cursor: pointer; flex-shrink: 0; border: none; border-left: 1px solid rgba(0,0,0,0.12); box-sizing: border-box; }
+.format-selection-title { font-size: 13px; margin-bottom: 2px; color: #ececec; font-weight: 500; text-align: center; }
+.format-block-row { display: flex; align-items: stretch; width: 100%; height: 42px; min-height: 42px; max-height: 42px; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+.format-toggle-btn { flex: 1; padding: 10px 8px; font-size: 0.9em; font-weight: 500; border: none; cursor: pointer; min-height: 42px; max-height: 42px; display: flex; justify-content: center; align-items: center; box-sizing: border-box; }
+.format-toggle-btn:first-child { border-radius: 12px 0 0 12px; }
+.format-toggle-btn.format-toggle-btn--rightmost { border-radius: 0 12px 12px 0; border-left: 1px solid rgba(255, 255, 255, 0.15); }
 
 .format-toggle-btn:not(.format-active) {
   background-color: #3A3A3A;
@@ -385,7 +361,6 @@ button:hover {
   background-color: var(--primary-accent);
   color: #0f0f0f;
   font-weight: 600;
-  border-top: 1px solid rgba(255, 255, 255, 0.15);
 }
 
 .format-toggle-btn.format-active:hover {
@@ -1237,46 +1212,8 @@ input[type="range"] {
   }
 }
 
-.button-block-row {
-  display: flex;
-  align-items: stretch;
-  justify-content: flex-start;
-  gap: 0;
-  width: 100%;
-}
-
-.start-button {
-  flex: 1;
-  padding: 14px 20px;
-  border: none;
-  border-radius: 8px 0 0 0;
-  font-size: 16px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background-color 0.3s;
-  margin-top: 0;
-  box-shadow: none;
-}
-
 .start-button:hover {
   background-color: #4caf50;
-}
-
-.settings-button {
-  width: 44px !important;
-  min-width: 44px;
-  height: auto;
-  align-self: stretch;
-  border-radius: 0 8px 0 0;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  cursor: pointer;
-  transition: background-color 0.3s, border-color 0.3s;
-  margin-top: 0;
-  box-shadow: none;
-  flex-shrink: 0;
-  border-left: 1px solid rgba(255, 255, 255, 0.15);
 }
 
 .settings-button svg {
@@ -1321,3 +1258,54 @@ input[type="range"] {
 .segmented-disabled {
   pointer-events: none;
 }
+
+    @media screen and (max-width: 768px), screen and (pointer: coarse) and (max-width: 1024px) {
+      .row:has(.logo), .container > .row:first-child { display: none !important; }
+      .container { padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); height: 100vh; height: 100dvh; max-height: 100dvh; box-sizing: border-box; overflow: hidden; display: flex; flex-direction: column; }
+      .flex-container { flex-direction: column; gap: 8px; margin-top: 0; min-height: 0; flex: 1; overflow: hidden; box-sizing: border-box; }
+      .map-box, .map-container, #map { width: 100% !important; height: 38vh !important; max-height: 38vh !important; min-height: 180px !important; border-radius: 16px; overflow: hidden; flex-shrink: 0; box-sizing: border-box; }
+      .controls-box { width: 100% !important; flex: 1; border-radius: 16px; min-height: 0; padding: 10px 12px !important; box-sizing: border-box; background: #575757; overflow-y: auto; overflow-x: hidden; }
+      .controls-content { display: flex; flex-direction: column; justify-content: space-between; height: 100%; min-height: 100%; gap: 6px; box-sizing: border-box; }
+      .controls-top { display: flex; flex-direction: column; flex-shrink: 0; width: 100%; gap: 4px; box-sizing: border-box; }
+      .start-action-row { height: 52px; min-height: 52px; max-height: 52px; border-radius: 12px; overflow: hidden; }
+      .start-button, #start-button { height: 100%; min-height: 52px; max-height: 52px; border-radius: 12px 0 0 12px; padding: 4px 12px; font-size: 15px; }
+      .settings-button { width: 52px !important; min-width: 52px !important; max-width: 52px !important; height: 100% !important; min-height: 52px !important; max-height: 52px !important; border-radius: 0 12px 12px 0; }
+      .world-name-label { font-size: 0.76em; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.2; margin-top: 2px; }
+      .format-block-row { height: 42px; min-height: 42px; max-height: 42px; border-radius: 12px; overflow: hidden; }
+      .format-toggle-btn { height: 100%; min-height: 42px; max-height: 42px; font-size: 0.86em; padding: 0 8px; }
+      .format-toggle-btn:first-child { border-radius: 12px 0 0 12px; }
+      .format-toggle-btn.format-toggle-btn--rightmost { border-radius: 0 12px 12px 0; }
+      .bbox-selection-text { font-size: 0.8em; line-height: 1.25em; max-height: 2.5em; min-height: 1.25em; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; margin: 4px 0 2px 0; text-align: center; word-break: break-word; }
+      .progress-section { margin-top: auto; flex-shrink: 0; width: 100%; display: flex; flex-direction: column; gap: 4px; padding-top: 2px; box-sizing: border-box; }
+      .progress-info-text { font-size: 0.8em; line-height: 1.25em; max-height: 2.5em; min-height: 1.25em; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; margin: 0 0 2px 0; text-align: center; word-break: break-word; }
+      .progress-row { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; }
+      .progress-bar-container, .progress-bar { border-radius: 10px; height: 18px; }
+      #progress-detail { font-size: 0.85em; min-width: 36px; text-align: right; }
+      /* Модальное окно настроек */
+      .modal { padding: 10px; box-sizing: border-box; }
+      .modal-content { width: 94vw; max-width: 420px; border-radius: 20px; max-height: 86vh; max-height: 86dvh; overflow: hidden; padding: 14px 14px 10px 14px; box-sizing: border-box; display: flex; flex-direction: column; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); }
+      .settings-header { display: flex; justify-content: space-between; align-items: center; position: relative; width: 100%; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.15); flex-shrink: 0; box-sizing: border-box; }
+      .settings-header h2 { font-size: 1.15em; margin: 0; color: #ffffff; font-weight: 600; }
+      .settings-header .close-button { position: static !important; font-size: 26px; line-height: 1; margin: 0; padding: 0 4px; cursor: pointer; }
+      .settings-scrollable { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 4px; margin-bottom: 6px; box-sizing: border-box; }
+      .settings-row { display: flex; flex-direction: column; align-items: stretch; gap: 4px; margin-bottom: 10px; width: 100%; box-sizing: border-box; }
+      .settings-row label { white-space: normal; font-size: 0.88em; color: #ffffff; display: flex; align-items: center; gap: 6px; margin: 0; }
+      .settings-row:has(input[type="checkbox"]) { flex-direction: row; justify-content: space-between; align-items: center; min-height: 34px; }
+      .settings-row:has(input[type="checkbox"]) label { flex: 1; }
+      .settings-row:has(input[type="checkbox"]) .settings-control { width: auto; display: flex; justify-content: flex-end; align-items: center; }
+      .modal-content input[type="checkbox"] { width: 24px !important; height: 24px !important; min-width: 24px !important; min-height: 24px !important; cursor: pointer; accent-color: var(--primary-accent); margin: 0; }
+      .modal-content input[type="text"], .modal-content input[type="number"], .modal-content select { width: 100% !important; max-width: 100% !important; height: 38px; border-radius: 8px; padding: 6px 10px; box-sizing: border-box; font-size: 14px; }
+      #max-tree-size-group { display: flex; width: 100%; border-radius: 8px; overflow: hidden; box-sizing: border-box; }
+      #max-tree-size-group .segment { flex: 1; min-width: 0; padding: 8px 2px; font-size: 11px; text-align: center; border-radius: 0; margin: 0; box-shadow: none; }
+      .save-path-control { display: flex; width: 100%; gap: 6px; box-sizing: border-box; }
+      .save-path-control input { flex: 1; min-width: 0; height: 38px; border-radius: 8px; }
+      .save-path-control button, .save-path-control .save-path-browse { width: 40px !important; min-width: 40px !important; max-width: 40px !important; height: 38px !important; border-radius: 8px; margin: 0; padding: 0; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+      .settings-control:has(input[type="range"]) { display: flex; align-items: center; gap: 8px; width: 100%; box-sizing: border-box; }
+      .settings-control input[type="range"] { flex: 1; margin: 0; }
+      .settings-reset-button, .clear-cache-button { width: 100%; height: 36px; border-radius: 8px; margin: 0; padding: 0 12px; font-size: 13px; box-sizing: border-box; }
+      .settings-footer { flex-shrink: 0; width: 100%; border-top: 1px solid rgba(255, 255, 255, 0.15); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; box-sizing: border-box; }
+      .license-button-row { display: flex; width: 100%; gap: 8px; margin: 0; box-sizing: border-box; }
+      .license-button { flex: 1; min-width: 0; max-width: none !important; height: 34px; border-radius: 8px; margin: 0; padding: 0 6px; font-size: 12px; display: flex; align-items: center; justify-content: center; box-sizing: border-box; }
+      .buymeacoffee-row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; align-items: center; margin: 2px 0 0 0; }
+      .buymeacoffee-logo, .github-logo, .discord-logo { height: 28px; width: auto; border-radius: 6px; }
+    }

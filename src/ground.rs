@@ -1026,7 +1026,7 @@ pub(crate) fn extended_max_y_for(args: &Args) -> i32 {
 /// Dimension ceiling actually declared to the engine: the tall datapack's 2031, or vanilla's
 /// 319. Gated identically to `extended_min_y_for` — chunk serialization sizes heightmaps from
 /// the span between the two, so the pair must always describe the same dimension.
-pub(crate) fn world_top_y_for(args: &Args) -> i32 {
+pub fn world_top_y_for(args: &Args) -> i32 {
     if args.disable_height_limit && !args.bedrock && !args.luanti {
         2031
     } else {
@@ -1034,7 +1034,7 @@ pub(crate) fn world_top_y_for(args: &Args) -> i32 {
     }
 }
 
-pub(crate) fn extended_min_y_for(args: &Args) -> i32 {
+pub fn extended_min_y_for(args: &Args) -> i32 {
     if args.disable_height_limit && !args.bedrock && !args.luanti {
         -2032
     } else {

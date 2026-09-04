@@ -10,13 +10,21 @@ repository = "https://github.com/louis-e/arnis"
 license = "Apache-2.0"
 readme = "README.md"
 
+[lib]
+name = "arnis_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "arnis"
+path = "src/main.rs"
+
 [profile.release]
 lto = "thin"
 overflow-checks = true
 
 [features]
 default = ["gui"]
-gui = ["tauri", "tauri-plugin-log", "tauri-plugin-shell", "tokio", "rfd", "tauri-build"]
+gui = ["tauri", "tauri-plugin-log", "tauri-plugin-shell", "tokio", "tauri-build"]
 
 [build-dependencies]
 tauri-build = {version = "2", optional = true}
@@ -47,8 +55,7 @@ once_cell = "1.21.3"
 rand = { version = "0.9.3", features = ["std", "std_rng"] }
 rand_chacha = "0.9"
 rayon = "1.10.0"
-reqwest = { version = "0.13.1", features = ["blocking", "json", "query"] }
-rfd = { version = "0.17.2", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"] }
 semver = "1.0.27"
 parquet = { version = "59", default-features = false, features = ["snap", "zstd"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -68,6 +75,9 @@ rusty-leveldb = "3"
 rusqlite = { version = "0.40", features = ["bundled"] }
 zstd = "0.13"
 quick-xml = "0.41.0"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.0", features = ["Win32_System_Console"] }

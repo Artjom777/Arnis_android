@@ -49,7 +49,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initSettings();
   // After initSettings(), so the slider label and rotation handlers exist
   // before restored values are applied. Labels get localized a few lines below.
-  initSettingsStore({ resetWorldFormat: () => setWorldFormat('java') });
+  initSettingsStore({ resetWorldFormat: () => setWorldFormat('bedrock') });
   resolveDefaultSavePath();
   initTelemetryConsent();
   initClearCacheButton();
@@ -1171,7 +1171,7 @@ function initSettings() {
 }
 
 // World format selection (Java/Bedrock/Luanti)
-let selectedWorldFormat = 'java'; // Default to Java
+let selectedWorldFormat = 'bedrock'; // Default to Bedrock
 
 const VALID_FORMATS = ['java', 'bedrock', 'luanti'];
 
@@ -1183,7 +1183,7 @@ function initWorldFormatToggle() {
     selectedWorldFormat = savedFormat;
   }
   if (selectedWorldFormat === 'luanti' && !isLuantiEnabled()) {
-    selectedWorldFormat = 'java';
+    selectedWorldFormat = 'bedrock';
   }
 
   updateFormatToggleUI(selectedWorldFormat);
@@ -1216,7 +1216,7 @@ function initLuantiExperimentalToggle() {
     localStorage.setItem('arnis-luanti-enabled', on ? 'true' : 'false');
     applyRightmost(on);
     if (!on && selectedWorldFormat === 'luanti') {
-      setWorldFormat('java');
+      setWorldFormat('bedrock');
     }
   });
 }
@@ -1242,6 +1242,9 @@ function updateFormatToggleUI(format) {
   const bedrockBtn = document.getElementById('format-bedrock');
   const luantiBtn = document.getElementById('format-luanti');
 
+  if (javaBtn) javaBtn.textContent = 'Java Edition';
+  if (bedrockBtn) bedrockBtn.textContent = 'Bedrock Edition';
+
   const heightLimitToggle = document.getElementById('disable-height-limit-toggle');
 
   // Toggle now supported on both formats (Java datapack + Bedrock BP).
@@ -1250,14 +1253,14 @@ function updateFormatToggleUI(format) {
     heightLimitToggle.parentElement.closest('.settings-row').style.opacity = '1';
   }
 
-  javaBtn.classList.remove('format-active');
-  bedrockBtn.classList.remove('format-active');
+  if (javaBtn) javaBtn.classList.remove('format-active');
+  if (bedrockBtn) bedrockBtn.classList.remove('format-active');
   if (luantiBtn) luantiBtn.classList.remove('format-active');
 
   if (format === 'java') {
-    javaBtn.classList.add('format-active');
+    if (javaBtn) javaBtn.classList.add('format-active');
   } else if (format === 'bedrock') {
-    bedrockBtn.classList.add('format-active');
+    if (bedrockBtn) bedrockBtn.classList.add('format-active');
     // Clear world path for bedrock (auto-generated)
     worldPath = "";
   } else if (format === 'luanti') {

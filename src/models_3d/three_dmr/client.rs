@@ -52,7 +52,9 @@ fn deserialize_license<'de, D: Deserializer<'de>>(de: D) -> Result<Option<String
 }
 
 pub(crate) fn cache_root() -> PathBuf {
-    if let Some(dir) = dirs::cache_dir() {
+    if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache").join(CACHE_SUBDIR)
+    } else if let Some(dir) = dirs::cache_dir() {
         dir.join(CACHE_SUBDIR)
     } else {
         PathBuf::from("./.arnis_3dmr_cache")
