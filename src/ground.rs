@@ -1069,7 +1069,7 @@ pub(crate) fn extended_max_y_for(args: &Args) -> i32 {
 /// 319. Must never sit below the ceiling the scaler aims at (`extended_max_y_for`), or the
 /// block store drops the terrain the scaler just placed. On Java it also pairs with
 /// `extended_min_y_for`: chunk serialization sizes heightmaps from the span between the two.
-pub(crate) fn world_top_y_for(args: &Args) -> i32 {
+pub fn world_top_y_for(args: &Args) -> i32 {
     if !args.disable_height_limit || args.luanti {
         crate::world_editor::DEFAULT_MAX_Y
     } else if args.bedrock {
@@ -1079,7 +1079,7 @@ pub(crate) fn world_top_y_for(args: &Args) -> i32 {
     }
 }
 
-pub(crate) fn extended_min_y_for(args: &Args) -> i32 {
+pub fn extended_min_y_for(args: &Args) -> i32 {
     if args.disable_height_limit && !args.bedrock && !args.luanti {
         -2032
     } else {

@@ -1500,3 +1500,99 @@ input[type="range"] {
 .segmented-disabled {
   pointer-events: none;
 }
+
+/* 16px border-radius on all buttons and map container */
+button,
+.start-button,
+.format-toggle-btn,
+.settings-button,
+.world-name-edit-button,
+.map-container,
+.map-box,
+iframe.map-container {
+  border-radius: 16px !important;
+}
+
+/* Mobile Vertical Interface */
+@media (max-width: 900px), (pointer: coarse), (orientation: portrait) {
+  .row:has(.logo), .row {
+    display: none !important;
+  }
+  .container {
+    height: 100vh !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+  }
+  .flex-container {
+    flex-direction: column !important;
+    height: 100vh !important;
+    margin-top: 0 !important;
+    gap: 8px !important;
+    padding: 8px !important;
+    box-sizing: border-box !important;
+  }
+  .map-box {
+    width: 100% !important;
+    height: 46vh !important;
+    min-height: 200px !important;
+    flex: 0 0 46vh !important;
+    border-radius: 16px !important;
+    overflow: hidden !important;
+  }
+  .map-container {
+    border-radius: 16px !important;
+  }
+  .controls-box {
+    width: 100% !important;
+    flex: 1 1 auto !important;
+    padding: 12px !important;
+    border-radius: 16px !important;
+    overflow-y: auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: space-between !important;
+  }
+  .controls-content {
+    display: flex !important;
+    flex-direction: column !important;
+    height: 100% !important;
+    justify-content: space-between !important;
+  }
+  .button-block {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+  .format-toggle-btn {
+    min-height: 46px !important;
+    font-size: 15px !important;
+    font-weight: 600 !important;
+  }
+  .start-button {
+    min-height: 50px !important;
+    font-size: 16px !important;
+  }
+  /* Settings: place action buttons below descriptions with full vertical scroll support */
+  .modal-content {
+    max-height: 90vh !important;
+    border-radius: 16px !important;
+  }
+  .settings-scrollable {
+    max-height: 75vh !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+  }
+  .settings-row {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 8px !important;
+  }
+  .settings-control {
+    width: 100% !important;
+    margin-top: 4px !important;
+  }
+  .settings-control button,
+  .settings-control .button-secondary {
+    width: 100% !important;
+  }
+}

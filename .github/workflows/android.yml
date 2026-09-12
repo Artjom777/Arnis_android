@@ -1,0 +1,184 @@
+name: Build Android
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Android Apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Android SDK & NDK
+        run: |
+          SDK_DIR="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK_DIR" >> $GITHUB_ENV
+          SDKMANAGER=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1)
+          if [ -n "$SDKMANAGER" ]; then
+            SDKMANAGER_DIR=$(dirname "$SDKMANAGER")
+            echo "$SDKMANAGER_DIR" >> $GITHUB_PATH
+            export PATH="$SDKMANAGER_DIR:$PATH"
+          fi
+          yes | sdkmanager --licenses || true
+          sdkmanager --install "build-tools;35.0.0" "ndk;27.1.12297006" "platforms;android-35" || sdkmanager --install "build-tools;35.0.0" "platforms;android-35" || true
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Environment
+        run: |
+          ANDROID_NDK_HOME=$(find ${ANDROID_HOME}/ndk -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> $GITHUB_ENV
+
+      - name: Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Tauri Init
+        run: cargo tauri android init
+
+      - name: Configure Android
+        run: |
+          python3 - << 'PYEOF'
+          import os, re, shutil
+          from PIL import Image, ImageDraw
+
+          manifest_path = "gen/android/app/src/main/AndroidManifest.xml"
+          if os.path.exists(manifest_path):
+              with open(manifest_path, "r", encoding="utf-8") as f:
+                  manifest = f.read()
+
+              permissions = (
+                  '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n'
+                  '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />\n'
+                  '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />\n'
+              )
+              if "MANAGE_EXTERNAL_STORAGE" not in manifest:
+                  manifest = manifest.replace("<application", f"{permissions}    <application", 1)
+
+              if 'android:requestLegacyExternalStorage="true"' not in manifest:
+                  manifest = manifest.replace("<application", '<application\n        android:requestLegacyExternalStorage="true"', 1)
+
+              with open(manifest_path, "w", encoding="utf-8") as f:
+                  f.write(manifest)
+              print("AndroidManifest.xml configured.")
+
+          gradle_path = "gen/android/app/build.gradle.kts"
+          if os.path.exists(gradle_path):
+              with open(gradle_path, "r", encoding="utf-8") as f:
+                  gradle = f.read()
+
+              if 'abiFilters.add("arm64-v8a")' not in gradle:
+                  gradle = gradle.replace(
+                      "defaultConfig {",
+                      'defaultConfig {\n        ndk {\n            abiFilters.clear()\n            abiFilters.add("arm64-v8a")\n        }',
+                      1
+                  )
+
+              if 'useLegacyPackaging = false' not in gradle:
+                  gradle = gradle.replace(
+                      "android {",
+                      'android {\n    packaging {\n        jniLibs {\n            useLegacyPackaging = false\n        }\n    }',
+                      1
+                  )
+
+              with open(gradle_path, "w", encoding="utf-8") as f:
+                  f.write(gradle)
+              print("build.gradle.kts configured.")
+
+          # Ensure icons exist and copy to res
+          res_dir = "gen/android/app/src/main/res"
+          icons_src = "assets/icons/android"
+          icon_png = "assets/icons/icon.png"
+
+          densities = {
+              "mipmap-mdpi": (48, 108),
+              "mipmap-hdpi": (72, 162),
+              "mipmap-xhdpi": (96, 216),
+              "mipmap-xxhdpi": (144, 324),
+              "mipmap-xxxhdpi": (192, 432),
+          }
+
+          if os.path.exists(icon_png):
+              img = Image.open(icon_png).convert("RGBA")
+              for density, (size, fg_size) in densities.items():
+                  src_d = os.path.join(icons_src, density)
+                  os.makedirs(src_d, exist_ok=True)
+                  dst_d = os.path.join(res_dir, density)
+                  os.makedirs(dst_d, exist_ok=True)
+
+                  p_launcher = os.path.join(src_d, "ic_launcher.png")
+                  if not os.path.exists(p_launcher):
+                      launcher = img.resize((size, size), Image.Resampling.LANCZOS)
+                      launcher.save(p_launcher)
+
+                  p_round = os.path.join(src_d, "ic_launcher_round.png")
+                  if not os.path.exists(p_round):
+                      launcher = Image.open(p_launcher).convert("RGBA")
+                      mask = Image.new("L", (size, size), 0)
+                      draw = ImageDraw.Draw(mask)
+                      draw.ellipse((0, 0, size - 1, size - 1), fill=255)
+                      round_launcher = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                      round_launcher.paste(launcher, (0, 0), mask=mask)
+                      round_launcher.save(p_round)
+
+                  p_fg = os.path.join(src_d, "ic_launcher_foreground.png")
+                  if not os.path.exists(p_fg):
+                      fg = Image.new("RGBA", (fg_size, fg_size), (0, 0, 0, 0))
+                      icon_inner_size = int(fg_size * 0.72)
+                      inner_icon = img.resize((icon_inner_size, icon_inner_size), Image.Resampling.LANCZOS)
+                      offset = (fg_size - icon_inner_size) // 2
+                      fg.paste(inner_icon, (offset, offset))
+                      fg.save(p_fg)
+
+                  for item in ["ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"]:
+                      shutil.copy2(os.path.join(src_d, item), os.path.join(dst_d, item))
+              print("Icons copied to res directories.")
+          PYEOF
+
+      - name: Update Dependencies
+        run: cargo update -p reqwest || true
+
+      - name: Build APK
+        run: cargo tauri android build --apk --target aarch64
+
+      - name: Sign & Align
+        run: |
+          ZIPALIGN=$(find "${ANDROID_HOME}/build-tools" -name zipalign | sort -V | tail -n 1)
+          APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name apksigner | sort -V | tail -n 1)
+          echo "Found zipalign: $ZIPALIGN"
+          echo "Found apksigner: $APKSIGNER"
+
+          UNSIGNED_APK=$(find gen/android/app/build/outputs/apk -name "*unsigned.apk" -o -name "*.apk" | head -n 1)
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "Error: No APK found to sign"
+            exit 1
+          fi
+          echo "Found APK: $UNSIGNED_APK"
+
+          keytool -genkeypair -v -keystore release.keystore -storepass android -alias androidreleasekey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Arnis, OU=Arnis, O=Arnis, L=Unknown, ST=Unknown, C=US"
+
+          $ZIPALIGN -f -P 16 4 "$UNSIGNED_APK" aligned.apk || $ZIPALIGN -f -p 4 "$UNSIGNED_APK" aligned.apk
+
+          $APKSIGNER sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --ks-key-alias androidreleasekey --out arnis-arm64-v8a.apk aligned.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: arnis-android-arm64-v8a-apk
+          path: arnis-arm64-v8a.apk

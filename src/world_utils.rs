@@ -33,6 +33,11 @@ pub fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> 
 /// Returns the Desktop directory for Bedrock .mcworld file output.
 /// Falls back to home directory, then current directory.
 pub fn get_bedrock_output_directory() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        return PathBuf::from("/storage/emulated/0/Download");
+    }
+    #[cfg(not(target_os = "android"))]
     dirs::desktop_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -163,6 +168,8 @@ pub fn sanitize_for_filename(name: &str) -> String {
 /// Builds the Bedrock output path and level name for a given bounding box.
 /// Combines area name lookup, sanitization, and path construction.
 pub fn build_bedrock_output(bbox: &LLBBox, output_dir: PathBuf) -> (PathBuf, String) {
+    #[cfg(target_os = "android")]
+    let output_dir = PathBuf::from("/storage/emulated/0/Download");
     let area_name = get_area_name_for_bedrock(bbox);
     let safe_name = sanitize_for_filename(&area_name);
     let filename = format!("Arnis {safe_name}.mcworld");

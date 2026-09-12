@@ -134,6 +134,7 @@ impl From<&BedrockBlockStateValue> for BedrockNbtValue {
 pub struct BedrockWriter {
     output_dir: PathBuf,
     mcworld_path: PathBuf,
+    target_mcworld_path: Option<PathBuf>,
     level_name: String,
     spawn_point: Option<(i32, i32)>,
     ground: Option<Arc<Ground>>,
@@ -160,19 +161,38 @@ impl BedrockWriter {
         world_time: i64,
         start_with_map: bool,
     ) -> Self {
-        // If the path ends with .mcworld, use it as the final archive path
-        // and create a temp directory without that extension for working files
-        let (output_dir, mcworld_path) =
+        #[cfg(target_os = "android")]
+        let (output_dir, mcworld_path, target_mcworld_path) = {
+            let filename = output_path
+                .file_name()
+                .map(|f| f.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from("Arnis_World.mcworld"));
+            let mut target = PathBuf::from("/storage/emulated/0/Download").join(filename);
+            if target.extension().is_none() || target.extension().unwrap() != "mcworld" {
+                target = append_mcworld_extension(&target);
+            }
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let staging_dir = std::env::temp_dir().join(format!("arnis_bedrock_staging_{}_{}", std::process::id(), timestamp));
+            let staging_mcworld = staging_dir.with_extension("mcworld");
+            (staging_dir, staging_mcworld, Some(target))
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let (output_dir, mcworld_path, target_mcworld_path) =
             if output_path.extension().is_some_and(|ext| ext == "mcworld") {
-                (output_path.with_extension(""), output_path)
+                (output_path.with_extension(""), output_path, None)
             } else {
                 let mcworld_path = append_mcworld_extension(&output_path);
-                (output_path, mcworld_path)
+                (output_path, mcworld_path, None)
             };
 
         Self {
             output_dir,
             mcworld_path,
+            target_mcworld_path,
             level_name,
             spawn_point,
             ground,
@@ -206,6 +226,16 @@ impl BedrockWriter {
 
         emit_gui_progress_update(98.0, "Saving Bedrock world...");
         self.package_mcworld()?;
+
+        if let Some(target) = &self.target_mcworld_path {
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::rename(&self.mcworld_path, target).is_err() {
+                fs::copy(&self.mcworld_path, target)?;
+                let _ = fs::remove_file(&self.mcworld_path);
+            }
+        }
 
         emit_gui_progress_update(99.0, "Saving Bedrock world...");
         self.cleanup_temp_dir()?;
@@ -264,7 +294,8 @@ impl BedrockWriter {
                 let rel_x = spawn_x - xzbbox.min_x();
                 let rel_z = spawn_z - xzbbox.min_z();
                 let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
-                ground.level(coord) + 3 // Add 3 blocks above ground for safety
+                let lvl = ground.level(coord);
+                (lvl + 3).max(64)
             })
             .unwrap_or(64);
 
@@ -452,6 +483,12 @@ impl BedrockWriter {
         // Length of NBT data
         file.write_u32::<LittleEndian>(nbt_bytes.len() as u32)?;
         file.write_all(&nbt_bytes)?;
+
+        // Write level.dat_old alongside level.dat
+        let mut file_old = File::create(self.output_dir.join("level.dat_old"))?;
+        file_old.write_u32::<LittleEndian>(10)?;
+        file_old.write_u32::<LittleEndian>(nbt_bytes.len() as u32)?;
+        file_old.write_all(&nbt_bytes)?;
 
         Ok(())
     }
@@ -792,7 +829,7 @@ impl BedrockWriter {
         let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
 
         // Add top-level files
-        for file_name in ["levelname.txt", "metadata.json", "level.dat"] {
+        for file_name in ["levelname.txt", "metadata.json", "level.dat", "level.dat_old"] {
             let path = self.output_dir.join(file_name);
             if path.exists() {
                 writer.start_file(file_name, options)?;
