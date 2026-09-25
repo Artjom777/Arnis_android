@@ -12,20 +12,34 @@ const TILE_CACHE_MAX_AGE_DAYS: u64 = 30;
 /// Uses the OS-standard cache directory (e.g. AppData/Local on Windows, ~/.cache on Linux).
 /// Falls back to ./arnis-tile-cache if the OS cache directory is unavailable.
 pub fn get_cache_dir(provider_name: &str) -> PathBuf {
-    let base = if let Some(cache_dir) = dirs::cache_dir() {
-        cache_dir.join(TILE_CACHE_DIR_NAME)
-    } else {
-        PathBuf::from(format!("./{TILE_CACHE_DIR_NAME}"))
-    };
-    base.join(provider_name)
+    #[cfg(target_os = "android")]
+    {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache/elevation").join(provider_name)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let base = if let Some(cache_dir) = dirs::cache_dir() {
+            cache_dir.join(TILE_CACHE_DIR_NAME)
+        } else {
+            PathBuf::from(format!("./{TILE_CACHE_DIR_NAME}"))
+        };
+        base.join(provider_name)
+    }
 }
 
 /// Returns the base tile cache directory path (without provider subdirectory).
 pub fn get_base_cache_dir() -> PathBuf {
-    if let Some(cache_dir) = dirs::cache_dir() {
-        cache_dir.join(TILE_CACHE_DIR_NAME)
-    } else {
-        PathBuf::from(format!("./{TILE_CACHE_DIR_NAME}"))
+    #[cfg(target_os = "android")]
+    {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache/elevation")
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Some(cache_dir) = dirs::cache_dir() {
+            cache_dir.join(TILE_CACHE_DIR_NAME)
+        } else {
+            PathBuf::from(format!("./{TILE_CACHE_DIR_NAME}"))
+        }
     }
 }
 

@@ -1500,3 +1500,150 @@ input[type="range"] {
 .segmented-disabled {
   pointer-events: none;
 }
+
+/* 16px border radius on all interface buttons and map */
+button,
+.format-toggle-btn,
+.start-button,
+.start-button-wrap,
+.settings-button,
+.save-path-browse,
+.clear-cache-button,
+.settings-reset-button,
+.modal-actions button,
+.map-box,
+.map-container,
+iframe.map-container,
+.modal-content {
+  border-radius: 16px !important;
+}
+
+.format-selection-title {
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  text-align: center;
+}
+
+.format-toggle-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.start-settings-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  align-items: stretch;
+}
+
+/* Mobile responsive layout */
+@media (max-width: 850px), (pointer: coarse) {
+  .row:has(.logo), .row {
+    display: none !important;
+  }
+
+  .container {
+    padding: 8px 10px;
+    height: 100vh;
+    overflow-y: auto;
+  }
+
+  .flex-container {
+    flex-direction: column !important;
+    gap: 10px !important;
+    min-height: 0 !important;
+    height: auto !important;
+    flex: 1 !important;
+  }
+
+  .map-box {
+    width: 100% !important;
+    height: 46vh !important;
+    min-height: 240px !important;
+    flex-shrink: 0 !important;
+    border-radius: 16px !important;
+    overflow: hidden !important;
+  }
+
+  .controls-box {
+    width: 100% !important;
+    flex: 1 !important;
+  }
+
+  .controls-content {
+    justify-content: flex-start !important;
+    gap: 10px !important;
+  }
+
+  .format-toggle-btn {
+    min-height: 48px !important;
+    font-size: 15px !important;
+    border-radius: 16px !important;
+    padding: 12px 10px !important;
+  }
+
+  .start-button-wrap {
+    border-radius: 16px !important;
+    min-height: 48px !important;
+  }
+
+  .settings-button {
+    width: 52px !important;
+    min-width: 52px !important;
+    min-height: 48px !important;
+    border-radius: 16px !important;
+  }
+
+  .modal-content {
+    width: 94% !important;
+    max-width: 480px !important;
+    max-height: 85vh !important;
+    border-radius: 16px !important;
+    padding: 16px !important;
+  }
+
+  /* In settings, button is placed under the action description */
+  .settings-row {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 8px !important;
+    margin-bottom: 16px !important;
+    text-align: left !important;
+  }
+
+  .settings-row label {
+    white-space: normal !important;
+    font-size: 15px !important;
+    line-height: 1.4 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+  }
+
+  .settings-control {
+    width: 100% !important;
+    display: flex !important;
+    justify-content: flex-start !important;
+    margin-top: 4px !important;
+  }
+
+  .settings-control input[type="checkbox"] {
+    width: 28px !important;
+    height: 28px !important;
+    accent-color: var(--primary-accent) !important;
+    cursor: pointer !important;
+  }
+
+  .settings-control select,
+  .settings-control input[type="text"],
+  .settings-control input[type="range"] {
+    font-size: 16px !important;
+    min-height: 40px !important;
+    border-radius: 16px !important;
+  }
+}

@@ -1,0 +1,152 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "Build Android Apk"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Android SDK & NDK
+        run: |
+          SDK_DIR=${ANDROID_HOME:-$ANDROID_SDK_ROOT}
+          CMDLINE_TOOLS=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1)
+          if [ -n "$CMDLINE_TOOLS" ]; then
+            CMDLINE_DIR=$(dirname "$CMDLINE_TOOLS")
+            echo "$CMDLINE_DIR" >> $GITHUB_PATH
+            export PATH="$CMDLINE_DIR:$PATH"
+          fi
+          yes | sdkmanager --licenses || true
+          sdkmanager --install "build-tools;35.0.0" "ndk;27.1.12297006" "platform-tools" "platforms;android-34"
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Environment
+        run: |
+          ANDROID_NDK_HOME=$(find ${ANDROID_HOME}/ndk -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo 'RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"' >> $GITHUB_ENV
+
+      - name: Tauri CLI
+        run: |
+          cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Tauri Init
+        run: |
+          cargo tauri android init
+
+      - name: Configure Android
+        run: |
+          python3 - << 'EOF'
+          import os
+
+          # 1. Update AndroidManifest.xml
+          manifest_path = "gen/android/app/src/main/AndroidManifest.xml"
+          if os.path.exists(manifest_path):
+              with open(manifest_path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              permissions = (
+                  '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n'
+                  '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />\n'
+                  '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />\n'
+              )
+              if "MANAGE_EXTERNAL_STORAGE" not in content:
+                  content = content.replace("<application", permissions + "    <application", 1)
+
+              if 'android:requestLegacyExternalStorage="true"' not in content:
+                  content = content.replace("<application", '<application\n        android:requestLegacyExternalStorage="true"\n        android:largeHeap="true"', 1)
+
+              with open(manifest_path, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print("AndroidManifest.xml updated successfully")
+
+          # 2. Update build.gradle.kts
+          gradle_path = "gen/android/app/build.gradle.kts"
+          if os.path.exists(gradle_path):
+              with open(gradle_path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              # Add ndk abiFilters to defaultConfig
+              ndk_block = '''defaultConfig {
+                  ndk {
+                      abiFilters.clear()
+                      abiFilters.add("arm64-v8a")
+                  }'''
+              if 'abiFilters.add("arm64-v8a")' not in content:
+                  content = content.replace("defaultConfig {", ndk_block, 1)
+
+              # Add packaging to android root block
+              packaging_block = '''android {
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = false
+                  }
+              }'''
+              if 'useLegacyPackaging = false' not in content:
+                  content = content.replace("android {", packaging_block, 1)
+
+              with open(gradle_path, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print("build.gradle.kts updated successfully")
+          EOF
+
+          if [ -d "assets/icons/android" ]; then
+            cp -r assets/icons/android/* gen/android/app/src/main/res/ 2>/dev/null || true
+          fi
+
+      - name: Update Dependencies
+        run: |
+          cargo update -p reqwest || true
+
+      - name: Build APK
+        run: |
+          cargo tauri android build --apk --target aarch64
+
+      - name: Sign & Align
+        run: |
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+
+          RAW_APK=$(find gen/android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -n 1)
+          if [ -z "$RAW_APK" ]; then
+            echo "Error: No APK found in gen/android/app/build/outputs/apk"
+            exit 1
+          fi
+          echo "Found APK: $RAW_APK"
+
+          keytool -genkeypair -v -keystore release.keystore -alias androidkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=Android,C=US"
+
+          if ! "$ZIPALIGN" -f -P 16 4 "$RAW_APK" aligned.apk 2>/dev/null; then
+            if ! "$ZIPALIGN" -f -p 4 "$RAW_APK" aligned.apk 2>/dev/null; then
+              cp "$RAW_APK" aligned.apk
+            fi
+          fi
+
+          "$APKSIGNER" sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out arnis-arm64-v8a.apk aligned.apk
+          echo "APK successfully signed: arnis-arm64-v8a.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: arnis-arm64-v8a
+          path: arnis-arm64-v8a.apk

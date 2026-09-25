@@ -51,7 +51,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   refreshHeightLimitRow();
   // After initSettings(), so the slider label and rotation handlers exist
   // before restored values are applied. Labels get localized a few lines below.
-  initSettingsStore({ resetWorldFormat: () => setWorldFormat('java') });
+  initSettingsStore({ resetWorldFormat: () => setWorldFormat('bedrock') });
   resolveDefaultSavePath();
   initTelemetryConsent();
   initClearCacheButton();
@@ -1483,7 +1483,7 @@ function initSettings() {
 }
 
 // World format selection (Java/Bedrock/Luanti)
-let selectedWorldFormat = 'java'; // Default to Java
+let selectedWorldFormat = 'bedrock'; // Default to Bedrock
 
 const VALID_FORMATS = ['java', 'bedrock', 'luanti'];
 

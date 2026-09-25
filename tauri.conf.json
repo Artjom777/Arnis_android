@@ -11,15 +11,10 @@
     "windows": [
       {
         "title": "Arnis",
-        "width": 1000,
-        "height": 650,
-        "minWidth": 1000,
-        "minHeight": 650,
         "resizable": true,
         "transparent": false,
         "center": true,
-        "theme": "Dark",
-        "additionalBrowserArgs": "--disable-features=VizDisplayCompositor"
+        "theme": "Dark"
       }
     ],
     "security": {

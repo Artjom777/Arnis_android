@@ -17,12 +17,15 @@ use colored::Colorize;
 use fastnbt::Value;
 use flate2::read::GzDecoder;
 use fs2::FileExt;
+#[cfg(not(target_os = "android"))]
 use log::LevelFilter;
+#[cfg(not(target_os = "android"))]
 use rfd::FileDialog;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs, io::Write};
+#[cfg(not(target_os = "android"))]
 use tauri_plugin_log::{Builder as LogBuilder, Target, TargetKind};
 
 /// Manages the session.lock file for a Minecraft world directory
@@ -103,7 +106,10 @@ impl Drop for NewWorldCleanup {
 }
 
 pub fn run_gui() -> Result<(), String> {
-    // Configure thread pool with 90% CPU cap to keep system responsive
+    // Configure thread pool: limit to 50% cores on Android to prevent throttling/OOM, 90% on desktop
+    #[cfg(target_os = "android")]
+    crate::floodfill_cache::configure_rayon_thread_pool(0.5);
+    #[cfg(not(target_os = "android"))]
     crate::floodfill_cache::configure_rayon_thread_pool(0.9);
 
     // Clean up old cached elevation tiles on startup
@@ -137,7 +143,10 @@ pub fn run_gui() -> Result<(), String> {
         // Note: Removed Qt WebEngine flags as they don't apply to Tauri
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    #[cfg(not(target_os = "android"))]
+    let builder = builder
         .plugin(
             LogBuilder::default()
                 .level(LevelFilter::Info)
@@ -149,7 +158,9 @@ pub fn run_gui() -> Result<(), String> {
                 ])
                 .build(),
         )
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_shell::init());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             gui_create_world,
             gui_rename_world,
@@ -191,51 +202,65 @@ pub fn run_gui() -> Result<(), String> {
 /// Checks standard install paths including Flatpak on Linux.
 /// Falls back to Desktop, then current directory.
 fn detect_minecraft_saves_directory() -> PathBuf {
-    // Try standard Minecraft saves directories per OS
-    let mc_saves: Option<PathBuf> = if cfg!(target_os = "windows") {
-        env::var("APPDATA")
-            .ok()
-            .map(|appdata| PathBuf::from(appdata).join(".minecraft").join("saves"))
-    } else if cfg!(target_os = "macos") {
-        dirs::home_dir().map(|home| {
-            home.join("Library/Application Support/minecraft")
-                .join("saves")
-        })
-    } else if cfg!(target_os = "linux") {
-        dirs::home_dir().map(|home| {
-            let flatpak_path = home.join(".var/app/com.mojang.Minecraft/.minecraft/saves");
-            if flatpak_path.exists() {
-                flatpak_path
-            } else {
-                home.join(".minecraft/saves")
+    #[cfg(target_os = "android")]
+    {
+        return PathBuf::from("/storage/emulated/0/Download");
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        // Try standard Minecraft saves directories per OS
+        let mc_saves: Option<PathBuf> = if cfg!(target_os = "windows") {
+            env::var("APPDATA")
+                .ok()
+                .map(|appdata| PathBuf::from(appdata).join(".minecraft").join("saves"))
+        } else if cfg!(target_os = "macos") {
+            dirs::home_dir().map(|home| {
+                home.join("Library/Application Support/minecraft")
+                    .join("saves")
+            })
+        } else if cfg!(target_os = "linux") {
+            dirs::home_dir().map(|home| {
+                let flatpak_path = home.join(".var/app/com.mojang.Minecraft/.minecraft/saves");
+                if flatpak_path.exists() {
+                    flatpak_path
+                } else {
+                    home.join(".minecraft/saves")
+                }
+            })
+        } else {
+            None
+        };
+
+        if let Some(saves_dir) = mc_saves {
+            if saves_dir.exists() {
+                return saves_dir;
             }
-        })
-    } else {
-        None
-    };
-
-    if let Some(saves_dir) = mc_saves {
-        if saves_dir.exists() {
-            return saves_dir;
         }
-    }
 
-    // Fallback to Desktop
-    if let Some(desktop) = dirs::desktop_dir() {
-        if desktop.exists() {
-            return desktop;
+        // Fallback to Desktop
+        if let Some(desktop) = dirs::desktop_dir() {
+            if desktop.exists() {
+                return desktop;
+            }
         }
-    }
 
-    // Last resort: current directory
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        // Last resort: current directory
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
 }
 
 /// Returns the default save path (auto-detected on first run).
 /// The frontend stores/retrieves this via localStorage and passes it here for validation.
 #[tauri::command]
 fn gui_get_default_save_path() -> String {
-    detect_minecraft_saves_directory().display().to_string()
+    #[cfg(target_os = "android")]
+    {
+        "/storage/emulated/0/Download".to_string()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        detect_minecraft_saves_directory().display().to_string()
+    }
 }
 
 /// Returns the default directory for Bedrock .mcworld files (the Desktop).
@@ -248,17 +273,25 @@ fn gui_get_default_bedrock_save_path() -> String {
 
 /// Returns the configured Bedrock output directory, or the default if it is unusable.
 fn resolve_bedrock_output_dir(configured: &str) -> PathBuf {
-    let trimmed = configured.trim();
-    if !trimmed.is_empty() {
-        let configured_dir = PathBuf::from(trimmed);
-        if configured_dir.is_dir() {
-            return configured_dir;
-        }
-        eprintln!(
-            "Warning: Bedrock save path '{trimmed}' is not a directory, using the default instead."
-        );
+    #[cfg(target_os = "android")]
+    {
+        let _ = configured;
+        PathBuf::from("/storage/emulated/0/Download")
     }
-    crate::world_utils::get_bedrock_output_directory()
+    #[cfg(not(target_os = "android"))]
+    {
+        let trimmed = configured.trim();
+        if !trimmed.is_empty() {
+            let configured_dir = PathBuf::from(trimmed);
+            if configured_dir.is_dir() {
+                return configured_dir;
+            }
+            eprintln!(
+                "Warning: Bedrock save path '{trimmed}' is not a directory, using the default instead."
+            );
+        }
+        crate::world_utils::get_bedrock_output_directory()
+    }
 }
 
 /// Returns the default directory for Luanti/Minetest worlds.
@@ -332,33 +365,48 @@ fn gui_set_save_path(path: String) -> Result<String, String> {
 /// LogDir target as the backend's own output.
 #[tauri::command]
 fn gui_log(level: String, message: String) {
-    // The frontend is not a trusted formatter: cap the length so a runaway
-    // handler cannot fill the log file, and keep it on one line so the file
-    // stays greppable.
-    const MAX_LEN: usize = 2000;
-    let mut message: String = message.replace(['\n', '\r'], " ");
-    if message.chars().count() > MAX_LEN {
-        message = message.chars().take(MAX_LEN).collect::<String>() + "...[truncated]";
+    #[cfg(target_os = "android")]
+    {
+        let _ = (level, message);
     }
+    #[cfg(not(target_os = "android"))]
+    {
+        // The frontend is not a trusted formatter: cap the length so a runaway
+        // handler cannot fill the log file, and keep it on one line so the file
+        // stays greppable.
+        const MAX_LEN: usize = 2000;
+        let mut message: String = message.replace(['\n', '\r'], " ");
+        if message.chars().count() > MAX_LEN {
+            message = message.chars().take(MAX_LEN).collect::<String>() + "...[truncated]";
+        }
 
-    match level.as_str() {
-        "error" => log::error!(target: "webview", "{message}"),
-        "warn" => log::warn!(target: "webview", "{message}"),
-        _ => log::info!(target: "webview", "{message}"),
+        match level.as_str() {
+            "error" => log::error!(target: "webview", "{message}"),
+            "warn" => log::warn!(target: "webview", "{message}"),
+            _ => log::info!(target: "webview", "{message}"),
+        }
     }
 }
 
 /// Opens a native folder-picker dialog and returns the chosen path.
 #[tauri::command]
 fn gui_pick_save_directory(start_path: String) -> Result<String, String> {
-    let start = PathBuf::from(&start_path);
-    let mut dialog = FileDialog::new();
-    if start.is_dir() {
-        dialog = dialog.set_directory(&start);
+    #[cfg(target_os = "android")]
+    {
+        let _ = start_path;
+        Ok("/storage/emulated/0/Download".into())
     }
-    match dialog.pick_folder() {
-        Some(folder) => Ok(folder.display().to_string()),
-        None => Ok(start_path),
+    #[cfg(not(target_os = "android"))]
+    {
+        let start = PathBuf::from(&start_path);
+        let mut dialog = FileDialog::new();
+        if start.is_dir() {
+            dialog = dialog.set_directory(&start);
+        }
+        match dialog.pick_folder() {
+            Some(folder) => Ok(folder.display().to_string()),
+            None => Ok(start_path),
+        }
     }
 }
 
@@ -374,14 +422,20 @@ fn gui_pick_save_directory(start_path: String) -> Result<String, String> {
 // looking at a button that has just gone grey.
 #[tauri::command(async)]
 fn gui_create_world(save_path: String, world_name: Option<String>) -> Result<String, i32> {
-    let trimmed = save_path.trim();
-    if trimmed.is_empty() {
-        return Err(3);
-    }
-    let base = PathBuf::from(trimmed);
-    if !base.is_dir() {
-        return Err(3); // Error code 3: Failed to create new world
-    }
+    #[cfg(target_os = "android")]
+    let base = PathBuf::from("/storage/emulated/0/Download");
+    #[cfg(not(target_os = "android"))]
+    let base = {
+        let trimmed = save_path.trim();
+        if trimmed.is_empty() {
+            return Err(3);
+        }
+        let base = PathBuf::from(trimmed);
+        if !base.is_dir() {
+            return Err(3); // Error code 3: Failed to create new world
+        }
+        base
+    };
     create_new_world(&base, world_name.as_deref()).map_err(|_| 3)
 }
 
@@ -822,17 +876,26 @@ fn gui_get_version() -> String {
 /// window not repainting.
 #[tauri::command]
 async fn gui_get_update_info() -> Result<version_check::UpdateInfo, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        version_check::check_for_updates().map_err(|e| format!("Update check failed: {e}"))
-    })
-    .await
-    .map_err(|e| format!("Update check task failed: {e}"))?
+    #[cfg(target_os = "android")]
+    {
+        Err("Update check disabled on Android".to_string())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        tauri::async_runtime::spawn_blocking(|| {
+            version_check::check_for_updates().map_err(|e| format!("Update check failed: {e}"))
+        })
+        .await
+        .map_err(|e| format!("Update check task failed: {e}"))?
+    }
 }
 
-/// Compile-time target platform: "windows" / "macos" / "linux" / "unknown".
+/// Compile-time target platform: "android" / "windows" / "macos" / "linux" / "unknown".
 #[tauri::command]
 fn gui_get_platform() -> &'static str {
-    if cfg!(target_os = "windows") {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "windows") {
         "windows"
     } else if cfg!(target_os = "macos") {
         "macos"
@@ -1078,6 +1141,12 @@ struct WorldMapData {
 /// "cannot find" error on unsynced/placeholder files. Directories always open in Explorer.
 #[tauri::command]
 fn gui_show_in_folder(path: String) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = path;
+        return Ok(());
+    }
+
     #[cfg(target_os = "windows")]
     {
         // OneDrive files can be cloud placeholders / mid-sync that `start` can't launch
@@ -1515,7 +1584,9 @@ fn gui_start_generation(
 
             // Acquire session lock for Java worlds only
             // Session lock prevents Minecraft from having the world open during generation
-            // Bedrock worlds are generated as .mcworld files and don't need this lock
+            // Bedrock worlds are generated as .mcworld files and don't need this lock.
+            // On Android, FUSE filesystem blocks flock/SessionLock, so disable it completely.
+            #[cfg(not(target_os = "android"))]
             let _session_lock: Option<SessionLock> = if world_format == WorldFormat::JavaAnvil {
                 match SessionLock::acquire(&world_path) {
                     Ok(lock) => Some(lock),
@@ -1529,6 +1600,8 @@ fn gui_start_generation(
             } else {
                 None
             };
+            #[cfg(target_os = "android")]
+            let _session_lock: Option<SessionLock> = None;
 
             // Parse the bounding box from the text with proper error handling
             let bbox = match LLBBox::from_str(&bbox_text) {

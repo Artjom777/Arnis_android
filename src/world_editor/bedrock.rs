@@ -160,8 +160,22 @@ impl BedrockWriter {
         world_time: i64,
         start_with_map: bool,
     ) -> Self {
-        // If the path ends with .mcworld, use it as the final archive path
-        // and create a temp directory without that extension for working files
+        #[cfg(target_os = "android")]
+        let (output_dir, mcworld_path) = {
+            let file_name = output_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Arnis_world.mcworld".to_string());
+            let final_filename = if file_name.ends_with(".mcworld") {
+                file_name
+            } else {
+                format!("{file_name}.mcworld")
+            };
+            let mcworld_path = PathBuf::from("/storage/emulated/0/Download").join(final_filename);
+            let staging_dir = std::env::temp_dir().join(format!("arnis_bedrock_staging_{}", std::process::id()));
+            (staging_dir, mcworld_path)
+        };
+        #[cfg(not(target_os = "android"))]
         let (output_dir, mcworld_path) =
             if output_path.extension().is_some_and(|ext| ext == "mcworld") {
                 (output_path.with_extension(""), output_path)
@@ -264,7 +278,8 @@ impl BedrockWriter {
                 let rel_x = spawn_x - xzbbox.min_x();
                 let rel_z = spawn_z - xzbbox.min_z();
                 let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
-                ground.level(coord) + 3 // Add 3 blocks above ground for safety
+                let lvl = ground.level(coord);
+                (lvl + 3).max(64) // Add 3 blocks above ground for safety, at least 64
             })
             .unwrap_or(64);
 
@@ -452,6 +467,10 @@ impl BedrockWriter {
         // Length of NBT data
         file.write_u32::<LittleEndian>(nbt_bytes.len() as u32)?;
         file.write_all(&nbt_bytes)?;
+        drop(file);
+
+        // Duplicate level.dat_old next to level.dat
+        let _ = fs::copy(self.output_dir.join("level.dat"), self.output_dir.join("level.dat_old"));
 
         Ok(())
     }
@@ -787,12 +806,18 @@ impl BedrockWriter {
     }
 
     fn package_mcworld(&self) -> Result<(), BedrockSaveError> {
+        #[cfg(target_os = "android")]
+        let temp_mcworld = std::env::temp_dir().join(format!("arnis_export_{}.mcworld", std::process::id()));
+        #[cfg(target_os = "android")]
+        let file = File::create(&temp_mcworld)?;
+        #[cfg(not(target_os = "android"))]
         let file = File::create(&self.mcworld_path)?;
+
         let mut writer = ZipWriter::new(file);
         let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
 
         // Add top-level files
-        for file_name in ["levelname.txt", "metadata.json", "level.dat"] {
+        for file_name in ["levelname.txt", "metadata.json", "level.dat", "level.dat_old"] {
             let path = self.output_dir.join(file_name);
             if path.exists() {
                 writer.start_file(file_name, options)?;
@@ -840,6 +865,19 @@ impl BedrockWriter {
         }
 
         writer.finish()?;
+
+        #[cfg(target_os = "android")]
+        {
+            if let Some(parent) = self.mcworld_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::copy(&temp_mcworld, &self.mcworld_path).is_err() {
+                let _ = fs::rename(&temp_mcworld, &self.mcworld_path);
+            } else {
+                let _ = fs::remove_file(&temp_mcworld);
+            }
+        }
+
         Ok(())
     }
 
