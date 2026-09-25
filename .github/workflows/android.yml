@@ -46,8 +46,30 @@ jobs:
           fi
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
           echo "NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
-          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> $GITHUB_ENV
-          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> $GITHUB_ENV
+
+          mkdir -p /tmp/fake-libgcc
+          AARCH64_LIBUNWIND=$(find "$ANDROID_NDK_HOME" -name "libunwind.a" 2>/dev/null | grep -E "aarch64|arm64" | head -n 1)
+          if [ -n "$AARCH64_LIBUNWIND" ]; then
+            cp "$AARCH64_LIBUNWIND" /tmp/fake-libgcc/libgcc.a
+            cp "$AARCH64_LIBUNWIND" /tmp/fake-libgcc/libunwind.a
+          else
+            echo "INPUT(-lunwind)" > /tmp/fake-libgcc/libgcc.a
+          fi
+
+          for ndk_dir in $(find "${ANDROID_HOME}/ndk" -maxdepth 1 -mindepth 1 2>/dev/null); do
+            for unwind in $(find "$ndk_dir" -name 'libunwind.a' 2>/dev/null); do
+              dir=$(dirname "$unwind")
+              cp "$unwind" "$dir/libgcc.a" 2>/dev/null || echo "INPUT(-lunwind)" > "$dir/libgcc.a"
+            done
+            for arch_dir in $(find "$ndk_dir" -type d \( -name "*aarch64*" -o -name "*arm64*" \) 2>/dev/null); do
+              if [ ! -f "$arch_dir/libgcc.a" ]; then
+                echo "INPUT(-lunwind)" > "$arch_dir/libgcc.a" 2>/dev/null || true
+              fi
+            done
+          done
+
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384 -L /tmp/fake-libgcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384 -L /tmp/fake-libgcc" >> $GITHUB_ENV
 
       - name: Tauri CLI
         run: |
