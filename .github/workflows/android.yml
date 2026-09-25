@@ -40,14 +40,21 @@ jobs:
 
       - name: Environment
         run: |
-          ANDROID_NDK_HOME=$(find ${ANDROID_HOME}/ndk -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          ANDROID_NDK_HOME=$(find ${ANDROID_HOME}/ndk -maxdepth 1 -mindepth 1 -name "27.*" 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$ANDROID_NDK_HOME" ]; then
+            ANDROID_NDK_HOME=$(find ${ANDROID_HOME}/ndk -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          fi
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
           echo "NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
-          echo 'RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"' >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> $GITHUB_ENV
 
       - name: Tauri CLI
         run: |
-          cargo install tauri-cli --version "^2.0.0" --locked
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          cargo binstall -y --force tauri-cli@^2.0.0 || cargo install tauri-cli --version "^2.0.0"
 
       - name: Tauri Init
         run: |
@@ -55,6 +62,9 @@ jobs:
 
       - name: Configure Android
         run: |
+          if [ -f "gen/android/gradlew" ]; then
+            chmod +x gen/android/gradlew
+          fi
           python3 - << 'EOF'
           import os
 
