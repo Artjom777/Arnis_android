@@ -3,9 +3,10 @@ use crate::telemetry::{send_log, LogLevel};
 use once_cell::sync::OnceCell;
 use serde_json::json;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tauri::{Emitter, WebviewWindow};
+use tauri::{AppHandle, Emitter, WebviewWindow};
 
 pub static MAIN_WINDOW: OnceCell<WebviewWindow> = OnceCell::new();
+pub static APP_HANDLE: OnceCell<AppHandle> = OnceCell::new();
 
 // Highest progress emitted so far (percent * 100), keeps the bar monotonic.
 static PROGRESS_FLOOR: AtomicU32 = AtomicU32::new(0);
@@ -61,14 +62,40 @@ pub fn set_main_window(window: WebviewWindow) {
     MAIN_WINDOW.set(window).ok();
 }
 
+pub fn set_app_handle(handle: AppHandle) {
+    APP_HANDLE.set(handle).ok();
+}
+
 pub fn get_main_window() -> Option<&'static WebviewWindow> {
     MAIN_WINDOW.get()
 }
 
+pub fn get_app_handle() -> Option<&'static AppHandle> {
+    APP_HANDLE.get()
+}
+
 /// This function checks if the program is running with a GUI window.
-/// Returns `true` if a GUI window is initialized, `false` otherwise.
+/// Returns `true` if a GUI window or app handle is initialized, `false` otherwise.
 pub fn is_running_with_gui() -> bool {
-    get_main_window().is_some()
+    get_main_window().is_some() || get_app_handle().is_some()
+}
+
+fn emit_to_gui<S: serde::Serialize + Clone>(event: &str, payload: S) {
+    if let Some(window) = get_main_window() {
+        if let Err(e) = window.emit(event, payload.clone()) {
+            let error_msg = format!("Failed to emit {event} event: {e}");
+            eprintln!("{error_msg}");
+            #[cfg(feature = "gui")]
+            send_log(LogLevel::Warning, &error_msg);
+        }
+    } else if let Some(handle) = get_app_handle() {
+        if let Err(e) = handle.emit(event, payload) {
+            let error_msg = format!("Failed to emit {event} event: {e}");
+            eprintln!("{error_msg}");
+            #[cfg(feature = "gui")]
+            send_log(LogLevel::Warning, &error_msg);
+        }
+    }
 }
 
 /// This code manages a multi-step process with a progress bar indicating the overall completion.
@@ -90,19 +117,11 @@ pub fn emit_gui_progress_update(progress: f64, message: &str) {
     if emits_suppressed(progress, message) {
         return;
     }
-    if let Some(window) = get_main_window() {
-        let payload = json!({
-            "progress": clamp_progress(progress),
-            "message": message
-        });
-
-        if let Err(e) = window.emit("progress-update", payload) {
-            let error_msg = format!("Failed to emit progress event: {}", e);
-            eprintln!("{}", error_msg);
-            #[cfg(feature = "gui")]
-            send_log(LogLevel::Warning, &error_msg);
-        }
-    }
+    let payload = json!({
+        "progress": clamp_progress(progress),
+        "message": message
+    });
+    emit_to_gui("progress-update", payload);
 }
 
 /// Like `emit_gui_progress_update` but also carries the stream-to-disk regime so
@@ -113,19 +132,12 @@ pub fn emit_gui_progress_update_ex(progress: f64, message: &str, streaming: bool
     if emits_suppressed(progress, message) {
         return;
     }
-    if let Some(window) = get_main_window() {
-        let payload = json!({
-            "progress": clamp_progress(progress),
-            "message": message,
-            "streaming": streaming
-        });
-        if let Err(e) = window.emit("progress-update", payload) {
-            let error_msg = format!("Failed to emit progress event: {}", e);
-            eprintln!("{}", error_msg);
-            #[cfg(feature = "gui")]
-            send_log(LogLevel::Warning, &error_msg);
-        }
-    }
+    let payload = json!({
+        "progress": clamp_progress(progress),
+        "message": message,
+        "streaming": streaming
+    });
+    emit_to_gui("progress-update", payload);
 }
 
 pub fn emit_gui_error(message: &str) {
@@ -141,27 +153,15 @@ pub fn emit_gui_error(message: &str) {
 /// Emits the final in-game level name (including localized area suffix for Java,
 /// or the location-based name for Bedrock) so the GUI can display it.
 pub fn emit_world_name_update(name: &str) {
-    if let Some(window) = get_main_window() {
-        if let Err(e) = window.emit("world-name-update", name) {
-            eprintln!("Failed to emit world-name-update event: {e}");
-        }
-    }
+    emit_to_gui("world-name-update", name);
 }
 
 /// Emits an event when the world map preview is ready
 pub fn emit_map_preview_ready() {
-    if let Some(window) = get_main_window() {
-        if let Err(e) = window.emit("map-preview-ready", ()) {
-            eprintln!("Failed to emit map-preview-ready event: {}", e);
-        }
-    }
+    emit_to_gui("map-preview-ready", ());
 }
 
 /// Emits an event to reveal a file or folder in the system file explorer
 pub fn emit_show_in_folder(path: &str) {
-    if let Some(window) = get_main_window() {
-        if let Err(e) = window.emit("show-in-folder", path) {
-            eprintln!("Failed to emit show-in-folder event: {}", e);
-        }
-    }
+    emit_to_gui("show-in-folder", path);
 }

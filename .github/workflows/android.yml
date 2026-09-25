@@ -105,7 +105,7 @@ jobs:
                   content = content.replace("<application", permissions + "    <application", 1)
 
               if 'android:requestLegacyExternalStorage="true"' not in content:
-                  content = content.replace("<application", '<application\n        android:requestLegacyExternalStorage="true"\n        android:largeHeap="true"', 1)
+                  content = content.replace("<application", '<application\n        android:requestLegacyExternalStorage="true"\n        android:extractNativeLibs="true"\n        android:largeHeap="true"', 1)
 
               with open(manifest_path, "w", encoding="utf-8") as f:
                   f.write(content)
@@ -130,10 +130,10 @@ jobs:
               packaging_block = '''android {
               packaging {
                   jniLibs {
-                      useLegacyPackaging = false
+                      useLegacyPackaging = true
                   }
               }'''
-              if 'useLegacyPackaging = false' not in content:
+              if 'useLegacyPackaging = true' not in content:
                   content = content.replace("android {", packaging_block, 1)
 
               with open(gradle_path, "w", encoding="utf-8") as f:
@@ -168,11 +168,19 @@ jobs:
 
           keytool -genkeypair -v -keystore release.keystore -alias androidkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android,O=Android,C=US"
 
-          if ! "$ZIPALIGN" -f -P 16 4 "$RAW_APK" aligned.apk 2>/dev/null; then
-            if ! "$ZIPALIGN" -f -p 4 "$RAW_APK" aligned.apk 2>/dev/null; then
-              cp "$RAW_APK" aligned.apk
-            fi
+          rm -f aligned.apk
+          if "$ZIPALIGN" -f -P 16 -v 4 "$RAW_APK" aligned.apk; then
+            echo "zipalign with -P 16 succeeded"
+          elif "$ZIPALIGN" -f -p -v 4 "$RAW_APK" aligned.apk; then
+            echo "zipalign with -p succeeded"
+          elif "$ZIPALIGN" -f -v 4 "$RAW_APK" aligned.apk; then
+            echo "zipalign 4 succeeded"
+          else
+            echo "zipalign failed, copying raw apk"
+            cp "$RAW_APK" aligned.apk
           fi
+
+          "$ZIPALIGN" -c -v 4 aligned.apk || true
 
           "$APKSIGNER" sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out arnis-arm64-v8a.apk aligned.apk
           echo "APK successfully signed: arnis-arm64-v8a.apk"

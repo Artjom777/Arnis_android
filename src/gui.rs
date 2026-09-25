@@ -188,10 +188,11 @@ pub fn run_gui() -> Result<(), String> {
             gui_log
         ])
         .setup(|app| {
-            let app_handle = app.handle();
-            let main_window = tauri::Manager::get_webview_window(app_handle, "main")
-                .ok_or_else(|| std::io::Error::other("Failed to get main window"))?;
-            progress::set_main_window(main_window);
+            let app_handle = app.handle().clone();
+            progress::set_app_handle(app_handle.clone());
+            if let Some(main_window) = tauri::Manager::get_webview_window(&app_handle, "main") {
+                progress::set_main_window(main_window);
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
