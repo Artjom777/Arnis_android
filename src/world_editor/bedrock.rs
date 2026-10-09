@@ -253,9 +253,29 @@ impl BedrockWriter {
         // and create a temp directory without that extension for working files
         let (output_dir, mcworld_path) =
             if output_path.extension().is_some_and(|ext| ext == "mcworld") {
+                #[cfg(target_os = "android")]
+                {
+                    let file_stem = output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("arnis_world");
+                    let staging_dir = std::env::temp_dir().join(format!("arnis_staging_{}", file_stem));
+                    let final_path = PathBuf::from("/storage/emulated/0/Download").join(
+                        output_path.file_name().unwrap_or_default()
+                    );
+                    (staging_dir, final_path)
+                }
+                #[cfg(not(target_os = "android"))]
                 (output_path.with_extension(""), output_path)
             } else {
                 let mcworld_path = append_mcworld_extension(&output_path);
+                #[cfg(target_os = "android")]
+                {
+                    let file_stem = output_path.file_name().and_then(|s| s.to_str()).unwrap_or("arnis_world");
+                    let staging_dir = std::env::temp_dir().join(format!("arnis_staging_{}", file_stem));
+                    let final_path = PathBuf::from("/storage/emulated/0/Download").join(
+                        mcworld_path.file_name().unwrap_or_default()
+                    );
+                    (staging_dir, final_path)
+                }
+                #[cfg(not(target_os = "android"))]
                 (output_path, mcworld_path)
             };
 
@@ -353,7 +373,8 @@ impl BedrockWriter {
                 let rel_x = spawn_x - xzbbox.min_x();
                 let rel_z = spawn_z - xzbbox.min_z();
                 let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
-                ground.level(coord) + 3 // Add 3 blocks above ground for safety
+                let lvl = ground.level(coord);
+                (lvl + 3).max(64)
             })
             .unwrap_or(64);
 
@@ -541,6 +562,9 @@ impl BedrockWriter {
         // Length of NBT data
         file.write_u32::<LittleEndian>(nbt_bytes.len() as u32)?;
         file.write_all(&nbt_bytes)?;
+
+        // Duplicate level.dat_old alongside level.dat
+        let _ = fs::copy(self.output_dir.join("level.dat"), self.output_dir.join("level.dat_old"));
 
         Ok(())
     }
@@ -881,7 +905,7 @@ impl BedrockWriter {
         let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
 
         // Add top-level files
-        for file_name in ["levelname.txt", "metadata.json", "level.dat"] {
+        for file_name in ["levelname.txt", "metadata.json", "level.dat", "level.dat_old"] {
             let path = self.output_dir.join(file_name);
             if path.exists() {
                 writer.start_file(file_name, options)?;

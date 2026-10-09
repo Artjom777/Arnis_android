@@ -33,6 +33,9 @@ pub fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> 
 /// Returns the Desktop directory for Bedrock .mcworld file output.
 /// Falls back to home directory, then current directory.
 pub fn get_bedrock_output_directory() -> PathBuf {
+    if cfg!(target_os = "android") {
+        return PathBuf::from("/storage/emulated/0/Download");
+    }
     dirs::desktop_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -167,6 +170,11 @@ pub fn sanitize_for_filename(name: &str) -> String {
 /// Builds the Bedrock output path and level name for a given bounding box.
 /// Combines area name lookup, sanitization, and path construction.
 pub fn build_bedrock_output(bbox: &LLBBox, output_dir: PathBuf) -> (PathBuf, String) {
+    let output_dir = if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download")
+    } else {
+        output_dir
+    };
     let area_name = get_area_name_for_bedrock(bbox);
     let safe_name = sanitize_for_filename(&area_name);
     let filename = format!("Arnis {safe_name}.mcworld");
@@ -317,8 +325,9 @@ pub fn write_world_skeleton(
         .map_err(|e| format!("Failed to finalize compression for level.dat: {e}"))?;
 
     // Write the level.dat file
-    fs::write(new_world_path.join("level.dat"), compressed_level_data)
+    fs::write(new_world_path.join("level.dat"), &compressed_level_data)
         .map_err(|e| format!("Failed to create level.dat file: {e}"))?;
+    let _ = fs::write(new_world_path.join("level.dat_old"), &compressed_level_data);
 
     // Add the icon.png file
     const ICON_TEMPLATE: &[u8] = include_bytes!("../assets/minecraft/icon.png");
@@ -1065,6 +1074,7 @@ pub fn set_spawn_in_level_dat(
 
     replace_file_atomically(&level_path, &compressed_data)
         .map_err(|e| format!("Failed to write updated level.dat: {e}"))?;
+    let _ = fs::write(world_path.join("level.dat_old"), &compressed_data);
 
     if let Some(path) = player_file.filter(|p| p.is_file()) {
         let mut player = read_gzip_nbt(&path)?;

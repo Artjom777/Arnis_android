@@ -1,85 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod args;
-mod bedrock_block_map;
-mod bench;
-mod biome;
-mod block_definitions;
-mod block_palette;
-mod bresenham;
-mod building_facades;
-mod canopy;
-mod caves;
-mod celestial;
-mod climate;
-mod clipping;
-mod colors;
-mod coordinate_system;
-mod data_processing;
-mod decals;
-mod deterministic_rng;
-mod ecoregion;
-mod element_processing;
-mod elevation;
-mod elevation_data;
-mod floodfill;
-mod floodfill_cache;
-mod geo_grid;
-mod grid_ops;
-mod ground;
-mod ground_decoration;
-mod ground_generation;
-mod land_cover;
-mod landmarks;
-mod luanti_block_map;
-mod map_item;
-mod map_item_palette;
-mod map_preview;
-mod map_renderer;
-mod map_transformation;
-mod mapillary;
-mod models_3d;
-mod net;
-mod one_world;
-mod ore_generation;
-mod osm_parser;
-mod osm_tiles;
-mod overture;
-#[cfg(feature = "gui")]
-mod preview_3d;
-#[cfg(feature = "gui")]
-mod progress;
-mod projection;
-mod retrieve_data;
-mod structures;
-#[cfg(feature = "gui")]
-mod telemetry;
-mod terrain_surface;
-#[cfg(test)]
-mod test_utilities;
-mod tile;
-mod trees;
-mod version_check;
-mod voxy;
-mod water_depth;
-mod world_editor;
-mod world_utils;
-
-use args::Args;
+use arnis_lib::*;
 use clap::Parser;
 use colored::*;
 use std::path::PathBuf;
 #[cfg(all(feature = "gui", target_os = "linux"))]
 use std::process::Command;
 use std::{env, fs, io::Write};
-
-// mimalloc scales far better than the system allocator under the concurrent
-// 4 KiB section-vec / hashmap churn of tile-parallel processing.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(feature = "gui")]
-mod gui;
 
 // If the user does not want the GUI, it's easiest to just mock the progress module to do nothing
 #[cfg(not(feature = "gui"))]
@@ -711,7 +638,8 @@ fn run_cli() {
     let spawn_y_for_java = java_spawn.map(|(sx, sz)| {
         use coordinate_system::cartesian::XZPoint;
         let rel = XZPoint::new(sx - xzbbox.min_x(), sz - xzbbox.min_z());
-        ground.level(rel) + 3
+        let lvl = ground.level(rel);
+        (lvl + 3).max(64)
     });
 
     // Build generation options
@@ -815,28 +743,7 @@ fn main() {
     {
         let gui_mode = std::env::args().len() == 1; // Just "arnis" with no args
         if gui_mode {
-            #[cfg(target_os = "linux")]
-            let user_rendering_override = has_user_rendering_override();
-
-            if let Err(e) = gui::run_gui() {
-                #[cfg(target_os = "linux")]
-                {
-                    let already_retried = env::var_os(EGL_ZINK_RETRY_MARKER).is_some();
-                    if !already_retried && !user_rendering_override && is_egl_startup_failure(&e) {
-                        eprintln!(
-                            "{} Linux EGL initialization failed; retrying once with zink.",
-                            "Warning:".yellow().bold()
-                        );
-                        if let Err(retry_error) = retry_gui_with_zink() {
-                            eprintln!("{} {}", "Error:".red().bold(), retry_error);
-                        }
-                    }
-                }
-
-                eprintln!("{} {}", "Error:".red().bold(), e);
-                std::process::exit(1);
-            }
-
+            arnis_lib::run();
             return;
         }
     }

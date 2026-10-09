@@ -851,3 +851,116 @@ input[type="range"] {
     opacity: 1;
   }
 }
+
+/* ─── Mobile Vertical Layout & Android Adaptations ─── */
+.format-selection-title {
+  font-size: 0.88em;
+  font-weight: 600;
+  color: var(--primary-accent);
+  margin-top: 4px;
+  margin-bottom: 6px;
+  text-align: center;
+}
+
+/* 16px border-radius for buttons and map per specification */
+button,
+.start-button,
+.start-button-wrap,
+.settings-button,
+.format-toggle-btn,
+.map-box,
+.map-container {
+  border-radius: 16px !important;
+}
+
+.button-block {
+  border-radius: 16px;
+  gap: 8px;
+  box-shadow: none;
+}
+
+.button-block-row {
+  gap: 8px;
+}
+
+.format-buttons-row {
+  display: flex;
+  gap: 8px;
+}
+
+.format-toggle-btn {
+  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+  border-radius: 16px !important;
+  min-height: 44px;
+}
+
+.settings-button {
+  border-radius: 16px !important;
+  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+}
+
+@media (max-width: 850px), (orientation: portrait) {
+  /* Hide desktop logo row */
+  .row:has(.logo),
+  .row:has(#arnis-logo),
+  .container > .row:first-child {
+    display: none !important;
+  }
+
+  .container {
+    padding: 8px !important;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .flex-container {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 10px !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    flex: 1 !important;
+  }
+
+  /* Map takes upper half of screen */
+  .map-box {
+    width: 100% !important;
+    flex: 1 1 48% !important;
+    min-height: 200px !important;
+    max-height: 50vh !important;
+    border-radius: 16px !important;
+    overflow: hidden !important;
+  }
+
+  /* Controls in the lower half */
+  .controls-box {
+    width: 100% !important;
+    flex: 1 1 52% !important;
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: space-between !important;
+    overflow-y: auto !important;
+  }
+
+  .controls-content {
+    display: flex !important;
+    flex-direction: column !important;
+    justify-content: space-between !important;
+    height: 100% !important;
+    gap: 10px !important;
+  }
+
+  .controls-top {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+
+  .progress-section {
+    margin-top: auto !important;
+    padding-top: 6px !important;
+  }
+}
+

@@ -12,9 +12,13 @@ const REQUEST_TIMEOUT_SECS: u64 = 20;
 const MAX_GLB_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(crate) fn cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .map(|d| d.join(CACHE_SUBDIR))
-        .unwrap_or_else(|| PathBuf::from("./.arnis_custom_cache"))
+    if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache").join(CACHE_SUBDIR)
+    } else {
+        dirs::cache_dir()
+            .map(|d| d.join(CACHE_SUBDIR))
+            .unwrap_or_else(|| PathBuf::from("./.arnis_custom_cache"))
+    }
 }
 
 /// Shared because model fetches fan out across the global Rayon pool, and every

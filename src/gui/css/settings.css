@@ -960,3 +960,98 @@ label[for].setting-label {
     transition: none !important;
   }
 }
+
+/* ─── Mobile Settings Vertical Mode & Button Under Description ─── */
+@media (max-width: 850px), (orientation: portrait) {
+  .settings-page {
+    flex-direction: column !important;
+  }
+
+  .settings-sidebar {
+    width: 100% !important;
+    max-height: 140px !important;
+    padding: 10px !important;
+    border-right: none !important;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.25) !important;
+  }
+
+  .settings-nav {
+    flex-direction: row !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    gap: 8px !important;
+  }
+
+  .settings-page .settings-nav-item {
+    min-width: 130px !important;
+    padding: 8px !important;
+  }
+
+  .settings-brand {
+    display: none !important;
+  }
+
+  .settings-reset-button {
+    display: none !important;
+  }
+
+  .settings-main {
+    flex: 1 !important;
+    overflow-y: auto !important;
+  }
+
+  .settings-content {
+    padding: 12px !important;
+    gap: 12px !important;
+  }
+
+  .setting-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* В настройках кнопка должна быть под описанием действия */
+  .settings-page .setting-tile {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 12px !important;
+    padding: 14px !important;
+    min-height: auto !important;
+  }
+
+  .settings-page .setting-label {
+    width: 100% !important;
+  }
+
+  .settings-page .settings-control {
+    width: 100% !important;
+    justify-content: flex-start !important;
+    margin-top: 4px !important;
+  }
+
+  /* Large touch switches and buttons */
+  input.switch {
+    width: 52px !important;
+    height: 30px !important;
+  }
+
+  input.switch::before {
+    width: 24px !important;
+    height: 24px !important;
+  }
+
+  input.switch:checked::before {
+    transform: translateX(22px) !important;
+  }
+
+  .settings-action-button {
+    width: 100% !important;
+    justify-content: center !important;
+    min-height: 44px !important;
+    border-radius: 16px !important;
+  }
+
+  button {
+    border-radius: 16px !important;
+  }
+}
+

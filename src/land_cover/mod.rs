@@ -337,7 +337,9 @@ pub fn fetch_land_cover_data(
 // ─── Cache helpers ────────────────────────────────────────────────────────
 
 fn get_cache_dir() -> PathBuf {
-    if let Some(cache_dir) = dirs::cache_dir() {
+    if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache/land_cover")
+    } else if let Some(cache_dir) = dirs::cache_dir() {
         cache_dir.join(LAND_COVER_CACHE_DIR)
     } else {
         PathBuf::from(format!("./{LAND_COVER_CACHE_DIR}"))

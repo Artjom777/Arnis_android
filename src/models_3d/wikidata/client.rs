@@ -14,7 +14,9 @@ const MAX_MODEL_BYTES: u64 = 128 * 1024 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) fn cache_root() -> PathBuf {
-    if let Some(dir) = dirs::cache_dir() {
+    if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache").join(CACHE_SUBDIR)
+    } else if let Some(dir) = dirs::cache_dir() {
         dir.join(CACHE_SUBDIR)
     } else {
         PathBuf::from("./.arnis_wikidata_cache")

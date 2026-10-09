@@ -1601,7 +1601,7 @@ function initSettings() {
 }
 
 // World format selection (Java/Bedrock/Luanti)
-let selectedWorldFormat = 'java'; // Default to Java
+let selectedWorldFormat = 'bedrock'; // Default to Bedrock on Android/mobile
 
 const VALID_FORMATS = ['java', 'bedrock', 'luanti'];
 
@@ -1657,9 +1657,11 @@ function initWorldFormatToggle() {
   const savedFormat = localStorage.getItem('arnis-world-format');
   if (savedFormat && VALID_FORMATS.includes(savedFormat)) {
     selectedWorldFormat = savedFormat;
+  } else {
+    selectedWorldFormat = 'bedrock';
   }
   if (selectedWorldFormat === 'luanti' && !isLuantiEnabled()) {
-    selectedWorldFormat = 'java';
+    selectedWorldFormat = 'bedrock';
   }
 
   updateFormatToggleUI(selectedWorldFormat);

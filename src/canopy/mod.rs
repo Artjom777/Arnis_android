@@ -156,9 +156,13 @@ fn quadkey_of(xt: i64, yt: i64) -> String {
 }
 
 fn cache_dir() -> PathBuf {
-    match dirs::cache_dir() {
-        Some(d) => d.join(CACHE_DIR),
-        None => PathBuf::from(format!("./{CACHE_DIR}")),
+    if cfg!(target_os = "android") {
+        PathBuf::from("/storage/emulated/0/Download/.arnis_cache/canopy")
+    } else {
+        match dirs::cache_dir() {
+            Some(d) => d.join(CACHE_DIR),
+            None => PathBuf::from(format!("./{CACHE_DIR}")),
+        }
     }
 }
 
