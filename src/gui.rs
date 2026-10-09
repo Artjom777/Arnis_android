@@ -18,7 +18,9 @@ use fastnbt::Value;
 use flate2::read::GzDecoder;
 #[cfg(not(target_os = "android"))]
 use rfd::FileDialog;
-use std::io::Read;
+use std::env;
+use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(target_os = "android"))]
@@ -104,6 +106,7 @@ pub fn run_gui() -> Result<(), String> {
         // Note: Removed Qt WebEngine flags as they don't apply to Tauri
     }
 
+    #[allow(unused_mut)]
     let mut builder = tauri::Builder::default();
 
     #[cfg(not(target_os = "android"))]
@@ -1199,7 +1202,6 @@ fn gui_show_in_folder(path: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
         let _ = path;
-        return Ok(());
     }
     #[cfg(target_os = "windows")]
     {
