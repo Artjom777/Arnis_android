@@ -71,6 +71,24 @@ pub fn run_gui() -> Result<(), String> {
     // Configure thread pool: 50% on Android to prevent thermal throttling and OOM, 90% on desktop
     if cfg!(target_os = "android") {
         crate::floodfill_cache::configure_rayon_thread_pool(0.5);
+        #[cfg(target_os = "android")]
+        {
+            if env::var("TMPDIR").is_err() {
+                let candidate_dirs = [
+                    PathBuf::from("/data/data/com.louisdev.arnis/cache"),
+                    PathBuf::from("/data/user/0/com.louisdev.arnis/cache"),
+                    PathBuf::from("/storage/emulated/0/Download/.arnis_tmp"),
+                ];
+                for dir in &candidate_dirs {
+                    if fs::create_dir_all(dir).is_ok() {
+                        unsafe {
+                            env::set_var("TMPDIR", dir);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     } else {
         crate::floodfill_cache::configure_rayon_thread_pool(0.9);
     }
@@ -1699,8 +1717,13 @@ fn gui_start_generation(
                 }
                 WorldFormat::BedrockMcWorld => {
                     // Bedrock: generate .mcworld in the configured directory
+                    let custom_name = if !selected_world.trim().is_empty() {
+                        Some(selected_world.as_str())
+                    } else {
+                        None
+                    };
                     let (output_path, lvl_name) =
-                        crate::world_utils::build_bedrock_output(&bbox, bedrock_output_dir);
+                        crate::world_utils::build_bedrock_output_with_name(&bbox, bedrock_output_dir, custom_name);
                     progress::emit_world_name_update(&lvl_name);
                     (output_path, Some(lvl_name))
                 }

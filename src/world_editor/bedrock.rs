@@ -256,8 +256,19 @@ impl BedrockWriter {
                 #[cfg(target_os = "android")]
                 {
                     let file_stem = output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("arnis_world");
-                    let staging_dir = std::env::temp_dir().join(format!("arnis_staging_{}", file_stem));
-                    let final_path = PathBuf::from("/storage/emulated/0/Download").join(
+                    let staging_base = std::env::var_os("TMPDIR")
+                        .map(PathBuf::from)
+                        .or_else(|| dirs::cache_dir())
+                        .filter(|p| fs::create_dir_all(p).is_ok())
+                        .unwrap_or_else(|| {
+                            let fallback = PathBuf::from("/storage/emulated/0/Download/.arnis_staging");
+                            let _ = fs::create_dir_all(&fallback);
+                            fallback
+                        });
+                    let staging_dir = staging_base.join(format!("arnis_staging_{}", file_stem));
+                    let download_dir = PathBuf::from("/storage/emulated/0/Download");
+                    let _ = fs::create_dir_all(&download_dir);
+                    let final_path = download_dir.join(
                         output_path.file_name().unwrap_or_default()
                     );
                     (staging_dir, final_path)
@@ -269,8 +280,19 @@ impl BedrockWriter {
                 #[cfg(target_os = "android")]
                 {
                     let file_stem = output_path.file_name().and_then(|s| s.to_str()).unwrap_or("arnis_world");
-                    let staging_dir = std::env::temp_dir().join(format!("arnis_staging_{}", file_stem));
-                    let final_path = PathBuf::from("/storage/emulated/0/Download").join(
+                    let staging_base = std::env::var_os("TMPDIR")
+                        .map(PathBuf::from)
+                        .or_else(|| dirs::cache_dir())
+                        .filter(|p| fs::create_dir_all(p).is_ok())
+                        .unwrap_or_else(|| {
+                            let fallback = PathBuf::from("/storage/emulated/0/Download/.arnis_staging");
+                            let _ = fs::create_dir_all(&fallback);
+                            fallback
+                        });
+                    let staging_dir = staging_base.join(format!("arnis_staging_{}", file_stem));
+                    let download_dir = PathBuf::from("/storage/emulated/0/Download");
+                    let _ = fs::create_dir_all(&download_dir);
+                    let final_path = download_dir.join(
                         mcworld_path.file_name().unwrap_or_default()
                     );
                     (staging_dir, final_path)
@@ -278,6 +300,30 @@ impl BedrockWriter {
                 #[cfg(not(target_os = "android"))]
                 (output_path, mcworld_path)
             };
+
+        // If a world with this filename already exists, rename it with (2), (3), etc.
+        // rather than replacing/overwriting it.
+        let (mcworld_path, level_name) = if mcworld_path.exists() {
+            let parent = mcworld_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let stem = mcworld_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("arnis_world")
+                .to_string();
+            let mut counter = 2;
+            loop {
+                let candidate = parent.join(format!("{stem} ({counter}).mcworld"));
+                if !candidate.exists() {
+                    break (candidate, format!("{level_name} ({counter})"));
+                }
+                counter += 1;
+            }
+        } else {
+            (mcworld_path, level_name)
+        };
 
         Self {
             output_dir,
@@ -337,7 +383,7 @@ impl BedrockWriter {
             fs::remove_dir_all(&self.output_dir)?;
         }
         if self.mcworld_path.exists() {
-            fs::remove_file(&self.mcworld_path)?;
+            let _ = fs::remove_file(&self.mcworld_path);
         }
 
         fs::create_dir_all(&self.output_dir)?;
@@ -900,6 +946,9 @@ impl BedrockWriter {
     }
 
     fn package_mcworld(&self) -> Result<(), BedrockSaveError> {
+        if let Some(parent) = self.mcworld_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
         let file = File::create(&self.mcworld_path)?;
         let mut writer = ZipWriter::new(file);
         let options = FileOptions::default().compression_method(CompressionMethod::Deflated);

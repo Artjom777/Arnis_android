@@ -170,16 +170,54 @@ pub fn sanitize_for_filename(name: &str) -> String {
 /// Builds the Bedrock output path and level name for a given bounding box.
 /// Combines area name lookup, sanitization, and path construction.
 pub fn build_bedrock_output(bbox: &LLBBox, output_dir: PathBuf) -> (PathBuf, String) {
+    build_bedrock_output_with_name(bbox, output_dir, None)
+}
+
+/// Builds the Bedrock output path and level name for a given bounding box with optional custom name.
+/// If a world with this name already exists, automatically de-duplicates by appending " (2)", " (3)", etc.
+pub fn build_bedrock_output_with_name(
+    bbox: &LLBBox,
+    output_dir: PathBuf,
+    custom_name: Option<&str>,
+) -> (PathBuf, String) {
     let output_dir = if cfg!(target_os = "android") {
         PathBuf::from("/storage/emulated/0/Download")
     } else {
         output_dir
     };
-    let area_name = get_area_name_for_bedrock(bbox);
-    let safe_name = sanitize_for_filename(&area_name);
-    let filename = format!("Arnis {safe_name}.mcworld");
-    let lvl_name = format!("Arnis World: {safe_name}");
-    (output_dir.join(&filename), lvl_name)
+    let _ = fs::create_dir_all(&output_dir);
+
+    let (base_filename, base_level_name) = match custom_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(custom) => {
+            let safe_name = sanitize_custom_world_name(custom);
+            let name = if safe_name.is_empty() {
+                "Arnis World".to_string()
+            } else {
+                safe_name
+            };
+            (name.clone(), name)
+        }
+        None => {
+            let area_name = get_area_name_for_bedrock(bbox);
+            let safe_name = sanitize_for_filename(&area_name);
+            (format!("Arnis {safe_name}"), format!("Arnis World: {safe_name}"))
+        }
+    };
+
+    let first_candidate = format!("{base_filename}.mcworld");
+    if !output_dir.join(&first_candidate).exists() {
+        return (output_dir.join(first_candidate), base_level_name);
+    }
+
+    let mut counter = 2;
+    loop {
+        let candidate_filename = format!("{base_filename} ({counter}).mcworld");
+        if !output_dir.join(&candidate_filename).exists() {
+            let level_name = format!("{base_level_name} ({counter})");
+            return (output_dir.join(candidate_filename), level_name);
+        }
+        counter += 1;
+    }
 }
 
 /// Creates a new Java Edition world in the given base directory.

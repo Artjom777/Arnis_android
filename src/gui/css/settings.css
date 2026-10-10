@@ -998,15 +998,23 @@ label[for].setting-label {
   .settings-main {
     flex: 1 !important;
     overflow-y: auto !important;
+    overflow-x: hidden !important;
+    max-width: 100vw !important;
+    box-sizing: border-box !important;
   }
 
   .settings-content {
     padding: 12px !important;
     gap: 12px !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    overflow-x: hidden !important;
   }
 
   .setting-grid {
     grid-template-columns: 1fr !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
   }
 
   /* В настройках кнопка должна быть под описанием действия */
@@ -1016,16 +1024,99 @@ label[for].setting-label {
     gap: 12px !important;
     padding: 14px !important;
     min-height: auto !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    overflow: hidden !important;
   }
 
   .settings-page .setting-label {
     width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
   }
 
   .settings-page .settings-control {
     width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
     justify-content: flex-start !important;
     margin-top: 4px !important;
+    box-sizing: border-box !important;
+  }
+
+  /* Inputs and text fields strictly fit within mobile screen */
+  .settings-page input[type="text"],
+  .settings-page input[type="password"],
+  .settings-page input[type="number"],
+  .settings-page .settings-select {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page .save-path-control {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    display: flex !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page input.save-path-input {
+    flex: 1 1 auto !important;
+    width: 0 !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page .save-path-browse {
+    flex: 0 0 38px !important;
+    width: 38px !important;
+    min-width: 38px !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page input[type="range"] {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page .rotation-control {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    display: flex !important;
+    align-items: center !important;
+  }
+
+  .settings-page .rotation-control input[type="number"] {
+    width: 90px !important;
+    max-width: 100px !important;
+    flex: 0 0 auto !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page .segmented-control {
+    width: 100% !important;
+    max-width: 100% !important;
+    flex-wrap: wrap !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page .segmented-control .segment {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+  }
+
+  .settings-page .choice-cards {
+    grid-template-columns: 1fr !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
   }
 
   /* Large touch switches and buttons */

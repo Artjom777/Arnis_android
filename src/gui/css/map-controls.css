@@ -263,12 +263,19 @@
   transition: border-color 0.15s ease;
 }
 
+#search-box {
+  max-width: calc(100vw - 60px);
+  box-sizing: border-box;
+}
+
 #search-box:focus-within {
   border-color: rgba(254, 204, 68, 0.75);
 }
 
 #city-search {
   width: 210px;
+  max-width: calc(100vw - 110px);
+  box-sizing: border-box;
   padding: 8px 4px 8px 12px;
   border: none;
   border-radius: 0;

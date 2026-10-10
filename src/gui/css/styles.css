@@ -962,5 +962,39 @@ button,
     margin-top: auto !important;
     padding-top: 6px !important;
   }
+
+  /* Prevent menu inputs and controls from overflowing mobile screen bounds */
+  .world-name-row {
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+  }
+
+  .world-name-input {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+  }
+
+  .button-block-row {
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+  }
+
+  .start-button-wrap {
+    min-width: 0 !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+  }
+
+  input[type="text"],
+  input[type="password"],
+  input[type="number"],
+  select {
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+  }
 }
 

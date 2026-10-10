@@ -2645,10 +2645,7 @@ let customWorldName = "";
 
 function isCustomWorldNameFeatureEnabled() {
   const toggle = document.getElementById('custom-world-name-toggle');
-  // Custom names are Java-only: creating a Bedrock/Luanti world never calls
-  // gui_create_world, so offering the feature there would silently do
-  // nothing.
-  return !!(toggle && toggle.checked) && selectedWorldFormat === 'java';
+  return !!(toggle && toggle.checked) && (selectedWorldFormat === 'java' || selectedWorldFormat === 'bedrock');
 }
 
 // The name the next Start will ask for, if any.
@@ -3378,9 +3375,18 @@ async function startGeneration() {
     var worldTime = Math.round(((clockMinutes + 1440 - 360) % 1440) * (24000 / 1440));
 
     // Pass the selected options to the Rust backend
+    let generationSelectedWorld = oneWorld ? savePath : worldPath;
+    if (selectedWorldFormat === 'bedrock') {
+      const requestedName = pendingWorldName() || "";
+      if (requestedName) {
+        generationSelectedWorld = requestedName;
+        customWorldName = "";
+      }
+    }
+
     await invoke("gui_start_generation", {
         bboxText: selectedBBox,
-        selectedWorld: oneWorld ? savePath : worldPath,
+        selectedWorld: generationSelectedWorld,
         bedrockSavePath: bedrockSavePath,
         luantiSavePath: luantiSavePath,
         worldScale: scale,
