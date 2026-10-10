@@ -11,7 +11,7 @@ use crate::{
 };
 use postprocess::{
     apply_land_cover_repair, fill_nan_values, filter_elevation_outliers, repair_terrain_anomalies,
-    scale_to_minecraft_with,
+    scale_to_minecraft_in_place, scale_to_minecraft_with,
 };
 pub use postprocess::{AffinePolicy, ElevationAffine, SoftTop};
 use provider::{ElevationProvider, RawElevationGrid};
@@ -288,8 +288,8 @@ pub fn fetch_elevation_data(
     // The multiplier stretches only the vertical axis. `slope_correction` below still
     // divides by the horizontal scale, so slopes keep their real incline and a stretched
     // hillside stays grass instead of turning to rock.
-    let (mc_heights, affine) = scale_to_minecraft_with(
-        &height_grid,
+    let affine = scale_to_minecraft_in_place(
+        &mut height_grid,
         scale * height_multiplier,
         ground_level,
         min_ground_level,
@@ -305,23 +305,14 @@ pub fn fetch_elevation_data(
     } = affine;
     bench.mark("elev_scale_to_mc");
 
-    // Log min/max block heights
-    let mut min_block_height = f64::MAX;
-    let mut max_block_height = f64::MIN;
-    for row in &mc_heights {
-        for &height in row {
-            if height.is_finite() {
-                min_block_height = min_block_height.min(height);
-                max_block_height = max_block_height.max(height);
-            }
-        }
-    }
-
     // Downcast the f64 postprocess output to the f32 storage format. One-time
     // cost paid here so the large grid sits at half the memory for the rest
     // of the generation run. NaN/infinity preservation is a requirement —
     // downstream `is_finite` checks rely on non-finite sentinels surviving.
-    let mc_heights_f32: Vec<Vec<f32>> = mc_heights
+    //
+    // By consuming `height_grid` row-by-row, each f64 row is deallocated
+    // immediately as each f32 row is created, avoiding duplicate memory usage.
+    let mc_heights_f32: Vec<Vec<f32>> = height_grid
         .into_iter()
         .map(|row| row.into_iter().map(|v| v as f32).collect())
         .collect();

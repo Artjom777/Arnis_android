@@ -2809,55 +2809,47 @@ struct FitRange {
 }
 
 /// Kept in its original arithmetic so default worlds round exactly as before.
-fn apply_fit(
-    blurred_heights: &[Vec<f64>],
+fn apply_fit_in_place(
+    heights: &mut [Vec<f64>],
     affine: &ElevationAffine,
     fit: FitRange,
     upper_clamp: f64,
-) -> Vec<Vec<f64>> {
+) {
     let base = affine.ground_level as f64;
-    blurred_heights
-        .par_iter()
-        .map(|row| {
-            row.iter()
-                .map(|&h| {
-                    let relative_height: f64 = if fit.height_range > 0.0 {
-                        (h - affine.min_height_m) / fit.height_range
-                    } else {
-                        0.0
-                    };
-                    (base + relative_height * fit.scaled_range).clamp(base, upper_clamp)
-                })
-                .collect()
-        })
-        .collect()
+    heights.par_iter_mut().for_each(|row| {
+        for h in row.iter_mut() {
+            let relative_height: f64 = if fit.height_range > 0.0 {
+                (*h - affine.min_height_m) / fit.height_range
+            } else {
+                0.0
+            };
+            *h = (base + relative_height * fit.scaled_range).clamp(base, upper_clamp);
+        }
+    });
 }
 
-fn apply_affine(
-    blurred_heights: &[Vec<f64>],
+fn apply_affine_in_place(
+    heights: &mut [Vec<f64>],
     affine: &ElevationAffine,
     upper_clamp: f64,
-) -> Vec<Vec<f64>> {
+) {
     let base = affine.ground_level as f64;
-    blurred_heights
-        .par_iter()
-        .map(|row| {
-            row.iter()
-                .map(|&h| affine.y_for_metres(h).clamp(base, upper_clamp))
-                .collect()
-        })
-        .collect()
+    heights.par_iter_mut().for_each(|row| {
+        for h in row.iter_mut() {
+            *h = affine.y_for_metres(*h).clamp(base, upper_clamp);
+        }
+    });
 }
 
-pub fn scale_to_minecraft_with(
-    blurred_heights: &[Vec<f64>],
+pub fn scale_to_minecraft_in_place(
+    heights: &mut [Vec<f64>],
     scale: f64,
     ground_level: i32,
     min_ground_level: i32,
     disable_height_limit: bool,
     extended_max_y: i32,
     policy: AffinePolicy,
-) -> (Vec<Vec<f64>>, ElevationAffine) {
+) -> ElevationAffine {
     let ceiling = terrain_ceiling(disable_height_limit, extended_max_y);
     let upper_clamp = ceiling as f64;
 
@@ -2865,7 +2857,7 @@ pub fn scale_to_minecraft_with(
     let affine = match policy {
         AffinePolicy::Fit => {
             let (affine, range) = derive_affine(
-                blurred_heights,
+                heights,
                 scale,
                 ground_level,
                 min_ground_level,
@@ -2877,7 +2869,7 @@ pub fn scale_to_minecraft_with(
         }
         AffinePolicy::FitWithHeadroom => {
             let (mut affine, range) = derive_affine(
-                blurred_heights,
+                heights,
                 scale,
                 ground_level,
                 min_ground_level,
@@ -2918,14 +2910,9 @@ pub fn scale_to_minecraft_with(
         }
     };
 
-    let mc_heights = match fit {
-        Some(range) => apply_fit(blurred_heights, &affine, range, upper_clamp),
-        None => apply_affine(blurred_heights, &affine, upper_clamp),
-    };
-
     if let AffinePolicy::Fixed(_) = policy {
         let base = affine.ground_level as f64;
-        let (clamped, total) = blurred_heights
+        let (clamped, total) = heights
             .par_iter()
             .map(|row| {
                 let mut c = 0usize;
@@ -2962,10 +2949,15 @@ pub fn scale_to_minecraft_with(
         }
     }
 
+    match fit {
+        Some(range) => apply_fit_in_place(heights, &affine, range, upper_clamp),
+        None => apply_affine_in_place(heights, &affine, upper_clamp),
+    }
+
     // The map preview shades over the band the terrain fills, so publish where it ended up.
     let top = match fit {
         Some(range) => affine.ground_level as f64 + range.scaled_range,
-        None => mc_heights
+        None => heights
             .par_iter()
             .map(|row| row.iter().cloned().fold(f64::MIN, f64::max))
             .reduce(|| f64::MIN, f64::max),
@@ -2977,7 +2969,29 @@ pub fn scale_to_minecraft_with(
     };
     crate::world_editor::common::set_terrain_top_y(top.min(upper_clamp).round() as i32);
 
-    (mc_heights, affine)
+    affine
+}
+
+pub fn scale_to_minecraft_with(
+    blurred_heights: &[Vec<f64>],
+    scale: f64,
+    ground_level: i32,
+    min_ground_level: i32,
+    disable_height_limit: bool,
+    extended_max_y: i32,
+    policy: AffinePolicy,
+) -> (Vec<Vec<f64>>, ElevationAffine) {
+    let mut heights = blurred_heights.to_vec();
+    let affine = scale_to_minecraft_in_place(
+        &mut heights,
+        scale,
+        ground_level,
+        min_ground_level,
+        disable_height_limit,
+        extended_max_y,
+        policy,
+    );
+    (heights, affine)
 }
 
 #[cfg(test)]
