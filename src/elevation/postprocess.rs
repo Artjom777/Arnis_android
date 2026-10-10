@@ -69,6 +69,9 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
     // At block resolution this is the 6 m / 10 pass behaviour; past a few metres per cell the
     // window covers real landforms, so widen the gate and stop early.
     let abs_threshold = 6.0f64.max(0.25 * m_per_cell);
+    #[cfg(target_os = "android")]
+    let passes = if m_per_cell > 4.0 { 1 } else { 2 };
+    #[cfg(not(target_os = "android"))]
     let passes = if m_per_cell > 4.0 { 2 } else { 10 };
 
     let r = RADIUS as usize;

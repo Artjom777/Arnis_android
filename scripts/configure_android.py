@@ -18,6 +18,9 @@ def main():
         if 'android:requestLegacyExternalStorage="true"' not in content:
             content = content.replace('<application', '<application\n        android:requestLegacyExternalStorage="true"', 1)
 
+        if 'android:largeHeap="true"' not in content:
+            content = content.replace('<application', '<application\n        android:largeHeap="true"', 1)
+
         with open(manifest_path, "w", encoding="utf-8") as f:
             f.write(content)
         print("Updated AndroidManifest.xml")

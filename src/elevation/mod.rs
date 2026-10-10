@@ -124,6 +124,12 @@ impl ElevationData {
 /// same size and an f32 feathered mask alongside the land-cover grids: about
 /// 6.5 GB for the maximum case. Target deployment (MapSmith) has >20 GB
 /// available. Typical user bboxes stay well below the cap.
+#[cfg(target_os = "android")]
+/// Mobile elevation grid cap (2048² = ~33 MB f64 grid, peak ~100 MB).
+/// Prevents out-of-memory crashes on Android devices.
+pub const MAX_ELEVATION_GRID_DIM: usize = 2048;
+
+#[cfg(not(target_os = "android"))]
 pub const MAX_ELEVATION_GRID_DIM: usize = 16384;
 
 /// Total elevation-grid cell budget. The per-axis cap alone is not enough: clamping each
