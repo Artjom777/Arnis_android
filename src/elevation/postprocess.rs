@@ -75,36 +75,21 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
     let passes = if m_per_cell > 4.0 { 2 } else { 10 };
 
     let r = RADIUS as usize;
-    // Reuse the snapshot buffer across passes (saves ~128 MB/pass of allocs
-    // on a 4096² grid). The inner `clone_from` copies in place.
-    let mut snapshot: Vec<Vec<f64>> = heights.to_vec();
     let mut total_repaired = 0usize;
     let mut passes_ran = 0usize;
 
     for pass in 0..passes {
-        if pass > 0 {
-            // Refresh the snapshot to last pass's writes — also done in
-            // parallel because both sides are large contiguous allocs and
-            // the row-pair copy is independent.
-            snapshot
-                .par_iter_mut()
-                .zip(heights.par_iter())
-                .for_each(|(dst, src)| dst.clone_from(src));
-        }
-
-        // Stream writes directly into `heights` per row in parallel, reading
-        // from the immutable snapshot. Avoids buffering all changes in a Vec.
-        let snapshot_ref: &[Vec<f64>] = &snapshot;
-        let repaired: usize = heights
-            .par_iter_mut()
+        // Collect anomaly repairs per row reading immutably from heights
+        let row_repairs: Vec<(usize, Vec<(usize, f64)>)> = heights
+            .par_iter()
             .enumerate()
             .filter(|(y, _)| *y >= r && *y < grid_h - r)
             .map_init(
                 || (Vec::with_capacity(24), Vec::with_capacity(24)),
                 |(neighbors, abs_devs), (y, row)| {
-                    let mut row_repaired = 0usize;
+                    let mut repairs = Vec::new();
                     for x in r..grid_w - r {
-                        let center = snapshot_ref[y][x];
+                        let center = row[x];
                         if !center.is_finite() {
                             continue;
                         }
@@ -116,7 +101,7 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
                                 if dy == 0 && dx == 0 {
                                     continue;
                                 }
-                                let v = snapshot_ref[(y as i32 + dy) as usize]
+                                let v = heights[(y as i32 + dy) as usize]
                                     [(x as i32 + dx) as usize];
                                 if v.is_finite() {
                                     neighbors.push(v);
@@ -147,19 +132,28 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
 
                         let deviation = (center - median).abs();
                         if deviation > abs_threshold && deviation > RELATIVE_FACTOR * mad.max(1.0) {
-                            row[x] = median;
-                            row_repaired += 1;
+                            repairs.push((x, median));
                         }
                     }
-                    row_repaired
+                    (y, repairs)
                 },
             )
-            .sum();
+            .filter(|(_, rep)| !rep.is_empty())
+            .collect();
 
-        if repaired == 0 {
+        if row_repairs.is_empty() {
             break;
         }
-        total_repaired += repaired;
+
+        let mut pass_repaired = 0usize;
+        for (y, repairs) in row_repairs {
+            pass_repaired += repairs.len();
+            for (x, median) in repairs {
+                heights[y][x] = median;
+            }
+        }
+
+        total_repaired += pass_repaired;
         passes_ran = pass + 1;
     }
 
@@ -2482,17 +2476,13 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
         return;
     }
 
-    // One snapshot buffer for the whole loop; refreshed in place per iteration.
-    let mut snapshot: Vec<Vec<f64>> = height_grid.to_vec();
     loop {
-        let snapshot_ref: &[Vec<f64>] = &snapshot;
-
-        let any_changed = height_grid
-            .par_iter_mut()
+        let fills: Vec<(usize, Vec<(usize, f64)>)> = height_grid
+            .par_iter()
             .enumerate()
             .map(|(y, row)| {
-                let mut row_changed = false;
-                for (x, cell) in row.iter_mut().enumerate().take(width) {
+                let mut row_fills = Vec::new();
+                for (x, &cell) in row.iter().enumerate().take(width) {
                     if !cell.is_nan() {
                         continue;
                     }
@@ -2503,7 +2493,7 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
                             let ny: i32 = y as i32 + dy;
                             let nx: i32 = x as i32 + dx;
                             if ny >= 0 && ny < height as i32 && nx >= 0 && nx < width as i32 {
-                                let val: f64 = snapshot_ref[ny as usize][nx as usize];
+                                let val: f64 = height_grid[ny as usize][nx as usize];
                                 if !val.is_nan() {
                                     sum += val;
                                     count += 1;
@@ -2512,21 +2502,23 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
                         }
                     }
                     if count > 0 {
-                        *cell = sum / count as f64;
-                        row_changed = true;
+                        row_fills.push((x, sum / count as f64));
                     }
                 }
-                row_changed
+                (y, row_fills)
             })
-            .reduce(|| false, |a, b| a || b);
+            .filter(|(_, row_fills)| !row_fills.is_empty())
+            .collect();
 
-        if !any_changed {
+        if fills.is_empty() {
             break;
         }
-        snapshot
-            .par_iter_mut()
-            .zip(height_grid.par_iter())
-            .for_each(|(dst, src)| dst.clone_from(src));
+
+        for (y, row_fills) in fills {
+            for (x, val) in row_fills {
+                height_grid[y][x] = val;
+            }
+        }
     }
 }
 
