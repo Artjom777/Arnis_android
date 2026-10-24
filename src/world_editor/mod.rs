@@ -500,6 +500,7 @@ impl<'a> WorldEditor<'a> {
     pub fn release_sealed_surface(&mut self) {
         self.sealed_surface = None;
         self.mapped_trunks = None;
+        self.tree_pack = None;
     }
 
     /// Sets the mapped tree trunks (shared across the main and tile editors).
@@ -2330,6 +2331,9 @@ impl<'a> WorldEditor<'a> {
         // Compact sections before saving: collapses uniform mixed sections back to
         // Uniform and repacks any overflowed direct sections that fit a palette again.
         self.world.compact_sections();
+        unsafe {
+            mimalloc::ffi::mi_collect(false);
+        }
 
         // Non-Java formats have no per-region write hook, so feed the preview here.
         if self.format != WorldFormat::JavaAnvil {
@@ -2340,6 +2344,25 @@ impl<'a> WorldEditor<'a> {
                     .par_iter()
                     .for_each(|(&(rx, rz), region)| preview.ingest_region(rx, rz, region));
             }
+        }
+
+        // Drop auxiliary structures and masks not needed for world serialization
+        self.tree_pack = None;
+        self.sealed_surface = None;
+        self.mapped_trunks = None;
+        self.road_surface_overrides.clear();
+        self.road_surface_overrides.shrink_to_fit();
+        self.support_columns.clear();
+        self.support_columns.shrink_to_fit();
+        self.flushed_regions.clear();
+        self.flushed_regions.shrink_to_fit();
+        #[cfg(feature = "gui")]
+        {
+            self.preview_3d = None;
+        }
+
+        unsafe {
+            mimalloc::ffi::mi_collect(true);
         }
 
         match self.format {
@@ -2409,6 +2432,10 @@ impl<'a> WorldEditor<'a> {
         println!("{} Saving Bedrock world...", "[7/7]".bold());
         emit_gui_progress_update(90.0, "Saving Bedrock world...");
 
+        unsafe {
+            mimalloc::ffi::mi_collect(true);
+        }
+
         if let Err(error) = self.save_bedrock_internal() {
             let user_msg = format!("Failed to save Bedrock world: {error}");
             eprintln!("{user_msg}");
@@ -2441,7 +2468,7 @@ impl<'a> WorldEditor<'a> {
             self.world_time,
             self.start_with_map,
         )
-        .write_world(&self.world, self.xzbbox, &self.llbbox)
+        .write_world(&mut self.world, self.xzbbox, &self.llbbox)
     }
 
     /// Saves world metadata to a JSON file

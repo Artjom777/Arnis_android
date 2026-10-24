@@ -82,3 +82,5 @@ gen/
 
 # Working notes for coding agents, not part of the project.
 /CLAUDE.md
+
+.pocketdev/

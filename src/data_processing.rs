@@ -591,25 +591,44 @@ impl Drop for AbortOnPanic<'_> {
     }
 }
 
-/// Whether to stream regions to disk (lower peak RAM) for `num_regions` regions. Auto-enabled
-/// when the estimated resident world would crowd available RAM; trades some time for RAM, output
-/// unchanged (3D models + subways preserved). `ARNIS_STREAM_TO_DISK=1/0` overrides; constants tunable.
-fn should_stream_to_disk(num_regions: usize, available_mb: u64, fillground: bool) -> bool {
-    match std::env::var("ARNIS_STREAM_TO_DISK").ok().as_deref() {
-        Some("1") => return true,
-        Some("0") => return false,
-        _ => {}
-    }
-    const BASE_MB: u64 = 500;
-    let est_peak_mb =
-        BASE_MB + crate::world_editor::per_region_estimate_mb(fillground) * num_regions as u64;
-
-    // Stream once the estimate would use >55% of available RAM (unknown memory -> fast path).
-    available_mb > 0 && est_peak_mb * 100 > available_mb * 55
+/// Whether to stream regions to disk. All artificial memory limits have been removed;
+/// regions remain in memory unless explicitly forced via ARNIS_STREAM_TO_DISK=1.
+fn should_stream_to_disk(_num_regions: usize, _available_mb: u64, _fillground: bool) -> bool {
+    matches!(std::env::var("ARNIS_STREAM_TO_DISK").ok().as_deref(), Some("1"))
 }
 
-/// Free RAM in MB.
+/// Free RAM in MB, accounting for physical RAM and swap/zRAM on Linux/Android.
 fn available_memory_mb() -> u64 {
+    #[cfg(unix)]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            let mut mem_available_kb: Option<u64> = None;
+            let mut swap_free_kb: Option<u64> = None;
+            let mut mem_free_kb: Option<u64> = None;
+            let mut cached_kb: Option<u64> = None;
+
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                    mem_available_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+                } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+                    swap_free_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+                } else if let Some(rest) = line.strip_prefix("MemFree:") {
+                    mem_free_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+                } else if let Some(rest) = line.strip_prefix("Cached:") {
+                    cached_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+                }
+            }
+
+            let avail = mem_available_kb.unwrap_or_else(|| {
+                mem_free_kb.unwrap_or(0) + cached_kb.unwrap_or(0)
+            });
+            let total_avail_kb = avail + swap_free_kb.unwrap_or(0);
+            if total_avail_kb > 0 {
+                return total_avail_kb / 1024;
+            }
+        }
+    }
+
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     sys.available_memory() / (1024 * 1024)
@@ -868,11 +887,22 @@ pub fn generate_world_with_options(
     }
 
     let ground = Arc::new(ground);
+    let post_save_ground = (world_format == WorldFormat::JavaAnvil || one_world.is_some())
+        .then(|| Arc::clone(&ground));
     let mut bench = crate::bench::Bench::new(args.benchmark);
     crate::world_editor::reset_section_counters(args.benchmark);
     // Materialize the lazy water-blend mask now, before world memory peaks.
     ground.warm_water_blend();
     bench.mark("ground_warm");
+
+    // Isolated scope: OpenStreetMap data structures (parsing, elements,
+    // geo-nodes, floodfill caches, spatial indexes, building/highway masks)
+    // are enclosed in this block so they are fully dropped before world saving/archiving.
+    {
+        let mut elements = elements;
+        let outline_suppression = outline_suppression;
+        let part_groups = part_groups;
+        let ground = ground;
     // Load the schematic tree pack once (None keeps procedural trees); shared with tile editors.
     // Uses the area's floor, not args: the montane check measures blocks above it, and the
     // base sinks when the relief needs the extended floor. Its blocks-per-metre turns those
@@ -1498,6 +1528,12 @@ pub fn generate_world_with_options(
                         next_merge += 1;
                         *gate.0.lock().unwrap_or_else(|p| p.into_inner()) = next_merge;
                         gate.1.notify_all();
+
+                        if cfg!(target_os = "android") && (tiles_merged % 4 == 0 || tiles_merged == total_tiles) {
+                            unsafe {
+                                mimalloc::ffi::mi_collect(false);
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -1814,6 +1850,12 @@ pub fn generate_world_with_options(
             println!("{report}");
         }
     }
+    } // End of isolated scope: all OSM elements, geo-nodes, caches and masks are dropped here.
+
+    editor.release_sealed_surface();
+    unsafe {
+        mimalloc::ffi::mi_collect(true);
+    }
 
     // Save world
     if let Err(e) = editor.save() {
@@ -1923,7 +1965,7 @@ pub fn generate_world_with_options(
             run,
             &llbbox,
             &xzbbox,
-            ground.elevation_affine(),
+            post_save_ground.as_ref().and_then(|g| g.elevation_affine()),
             preview_path,
         )
         .map_err(|e| format!("The area was written but could not be recorded: {e}"))?;
@@ -1960,7 +2002,11 @@ pub fn generate_world_with_options(
                 sx - xzbbox.min_x(),
                 sz - xzbbox.min_z(),
             );
-            let sy = ground.level(rel) + 3;
+            let sy = post_save_ground
+                .as_ref()
+                .map(|g| g.level(rel))
+                .unwrap_or(64)
+                + 3;
             match crate::world_utils::set_spawn_in_level_dat(&output_path, sx, sy, sz) {
                 Ok(()) => println!("Spawn point moved to {sx}, {sy}, {sz}."),
                 Err(e) => eprintln!("Warning: Failed to move the spawn point: {e}"),
@@ -1977,13 +2023,13 @@ pub fn generate_world_with_options(
         // Use output_path (the actual "Arnis World N" folder holding level.dat), not args.path —
         // for CLI runs args.path is the parent --output-dir, so level.dat sits one level deeper.
         // `xzbbox` is post-rotation, which is what `ground` is indexed against.
-        if let Err(e) =
-            update_player_spawn_y_after_generation(&output_path, &xzbbox, ground.as_ref())
-        {
-            let warning_msg = format!("Failed to update spawn point Y coordinate: {}", e);
-            eprintln!("Warning: {}", warning_msg);
-            #[cfg(feature = "gui")]
-            send_log(LogLevel::Warning, &warning_msg);
+        if let Some(ref g) = post_save_ground {
+            if let Err(e) = update_player_spawn_y_after_generation(&output_path, &xzbbox, g.as_ref()) {
+                let warning_msg = format!("Failed to update spawn point Y coordinate: {}", e);
+                eprintln!("Warning: {}", warning_msg);
+                #[cfg(feature = "gui")]
+                send_log(LogLevel::Warning, &warning_msg);
+            }
         }
     }
 

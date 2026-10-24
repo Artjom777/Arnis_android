@@ -1143,6 +1143,9 @@ pub fn parse_osm_data(
 
     drop(nodes_map);
     drop(ways_map);
+    unsafe {
+        mimalloc::ffi::mi_collect(true);
+    }
 
     (processed_elements, xzbbox, outline_suppression, part_groups)
 }

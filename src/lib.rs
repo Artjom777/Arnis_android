@@ -79,12 +79,12 @@ pub mod progress {
     }
 }
 
-#[cfg(not(target_os = "android"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    world_utils::protect_process_memory();
     #[cfg(feature = "gui")]
     {
         let _ = std::panic::catch_unwind(|| {

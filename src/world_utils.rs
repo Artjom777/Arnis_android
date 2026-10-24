@@ -12,6 +12,40 @@ use std::{fs, io::Write};
 /// truncates it first: a crash, a full disk or a pulled plug in that window
 /// leaves a zero length or half written `level.dat`, which Minecraft cannot
 /// open, and the world is gone. A rename either happens or does not.
+/// Configures runtime memory protections against premature killing by OS daemons (such as Android lmkd).
+/// Also configures mimalloc to eagerly return freed pages to the OS to minimize RSS bloat.
+pub fn protect_process_memory() {
+    unsafe {
+        std::env::set_var("MIMALLOC_PURGE_DELAY", "0");
+        std::env::set_var("MIMALLOC_RESET_DELAY", "0");
+        std::env::set_var("MIMALLOC_LARGE_OS_PAGES", "0");
+        std::env::set_var("MIMALLOC_VERBOSE", "0");
+    }
+
+    #[cfg(unix)]
+    {
+        // Remove OS-level memory limits (RLIMIT_AS, RLIMIT_DATA) by setting to infinity
+        unsafe {
+            let unlimited = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: libc::RLIM_INFINITY,
+            };
+            let _ = libc::setrlimit(libc::RLIMIT_AS, &unlimited);
+            let _ = libc::setrlimit(libc::RLIMIT_DATA, &unlimited);
+        }
+
+        // Try lowering oom_score_adj to protect this foreground process from premature lmkd SIGKILL
+        let candidates = ["-1000", "-900", "-500", "0"];
+        for val in &candidates {
+            if let Ok(mut f) = fs::OpenOptions::new().write(true).open("/proc/self/oom_score_adj") {
+                if f.write_all(format!("{val}\n").as_bytes()).is_ok() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     // A rename is only atomic within one filesystem, so the temporary has to be
     // a sibling; `with_extension` keeps it in the same directory by

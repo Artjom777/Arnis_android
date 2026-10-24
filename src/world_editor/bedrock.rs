@@ -26,7 +26,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap as StdHashMap;
 use std::fs::{self, File};
-use std::io::{Cursor, Write as IoWrite};
+use std::io::{BufWriter, Cursor, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -343,7 +343,7 @@ impl BedrockWriter {
     /// Writes the world to disk
     pub fn write_world(
         &mut self,
-        world: &WorldToModify,
+        world: &mut WorldToModify,
         xzbbox: &XZBBox,
         llbbox: &LLBBox,
     ) -> Result<(), BedrockSaveError> {
@@ -352,18 +352,39 @@ impl BedrockWriter {
 
         emit_gui_progress_update(91.0, "Saving Bedrock world...");
         self.write_level_dat(xzbbox)?;
+        self.ground = None;
+
+        unsafe {
+            mimalloc::ffi::mi_collect(true);
+        }
 
         emit_gui_progress_update(92.0, "Saving Bedrock world...");
+        // Write metadata while world.regions still holds chunk count
+        self.write_metadata(world, xzbbox, llbbox)?;
+
+        // Write chunks and incrementally release memory as chunks are persisted
         self.write_chunks_to_db(world)?;
 
         emit_gui_progress_update(97.0, "Saving Bedrock world...");
-        self.write_metadata(world, xzbbox, llbbox)?;
+
+        // Free in-memory voxel world chunks and regions now that they are persisted in LevelDB on disk.
+        world.regions.clear();
+        world.regions.shrink_to_fit();
+
+        // Force mimalloc heap cleanup before ZIP packaging to prevent LMK on Android
+        unsafe {
+            mimalloc::ffi::mi_collect(true);
+        }
 
         emit_gui_progress_update(98.0, "Saving Bedrock world...");
         self.package_mcworld()?;
 
         emit_gui_progress_update(99.0, "Saving Bedrock world...");
         self.cleanup_temp_dir()?;
+
+        unsafe {
+            mimalloc::ffi::mi_collect(true);
+        }
         Ok(())
     }
 
@@ -615,7 +636,7 @@ impl BedrockWriter {
         Ok(())
     }
 
-    fn write_chunks_to_db(&self, world: &WorldToModify) -> Result<(), BedrockSaveError> {
+    fn write_chunks_to_db(&self, world: &mut WorldToModify) -> Result<(), BedrockSaveError> {
         let db_path = self.output_dir.join("db");
 
         // Open LevelDB once for all writes (blocks, entities, block entities)
@@ -624,26 +645,15 @@ impl BedrockWriter {
         let mut db = DB::open(db_path.into_boxed_path(), opts)
             .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
 
-        // Chunks per parallel-encode window. Bounds transient memory (only one window of encoded
-        // bytes is held at a time) while giving rayon plenty of work per batch.
+        // Chunks per parallel-encode window without artificial platform limits.
         const ENCODE_BATCH_CHUNKS: usize = 256;
 
-        // Flatten to absolute-coord chunk refs (cheap — references only). Iteration order matches
-        // the original nested loop, so LevelDB receives writes in the same order.
-        let chunks: Vec<(i32, i32, &ChunkToModify)> = world
+        let total_chunks: usize = world
             .regions
-            .iter()
-            .flat_map(|((region_x, region_z), region)| {
-                region
-                    .chunks
-                    .iter()
-                    .map(move |((local_x, local_z), chunk)| {
-                        (region_x * 32 + local_x, region_z * 32 + local_z, chunk)
-                    })
-            })
-            .collect();
+            .values()
+            .map(|region| region.chunks.len())
+            .sum();
 
-        let total_chunks = chunks.len();
         if total_chunks == 0 {
             return Ok(());
         }
@@ -656,27 +666,59 @@ impl BedrockWriter {
                 .progress_chars("█▓░"),
         );
 
-        // Encode each window's chunk records in parallel (CPU-bound), then write them to LevelDB
-        // sequentially — rusty_leveldb writes aren't concurrent-safe. Records are byte-identical
-        // to the previous serial path; only the encoding is now multi-threaded.
         let mut chunks_processed: usize = 0;
-        for window in chunks.chunks(ENCODE_BATCH_CHUNKS) {
-            let encoded: Vec<ChunkRecords> = window
-                .par_iter()
-                .map(|&(abs_x, abs_z, chunk)| self.encode_chunk_records(abs_x, abs_z, chunk))
-                .collect::<Result<_, _>>()?;
+        let region_coords: Vec<(i32, i32)> = world.regions.keys().copied().collect();
 
-            for records in &encoded {
-                for (key, value) in records {
-                    db.put(key, value)
-                        .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+        for (region_x, region_z) in region_coords {
+            // Remove the region from world to immediately free its entry from the map
+            let Some(mut region) = world.regions.remove(&(region_x, region_z)) else {
+                continue;
+            };
+
+            let chunk_coords: Vec<(i32, i32)> = region.chunks.keys().copied().collect();
+            for chunk_coord_batch in chunk_coords.chunks(ENCODE_BATCH_CHUNKS) {
+                // Drain chunks from region to drop them immediately after encoding
+                let mut chunk_batch: Vec<(i32, i32, ChunkToModify)> =
+                    Vec::with_capacity(chunk_coord_batch.len());
+                for &coord in chunk_coord_batch {
+                    if let Some(chunk) = region.chunks.remove(&coord) {
+                        chunk_batch.push((region_x * 32 + coord.0, region_z * 32 + coord.1, chunk));
+                    }
                 }
-                chunks_processed += 1;
-                progress_bar.inc(1);
-                // GUI progress spans 92%..97% for chunk writing.
-                if chunks_processed.is_multiple_of(10) || chunks_processed == total_chunks {
-                    let chunk_progress = chunks_processed as f64 / total_chunks as f64;
-                    emit_gui_progress_update(92.0 + chunk_progress * 5.0, "");
+
+                let encoded: Vec<ChunkRecords> = chunk_batch
+                    .par_iter()
+                    .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                    .collect::<Result<_, _>>()?;
+
+                drop(chunk_batch);
+
+                for records in &encoded {
+                    for (key, value) in records {
+                        db.put(key, value)
+                            .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                    }
+                    chunks_processed += 1;
+                    progress_bar.inc(1);
+                    // GUI progress spans 92%..97% for chunk writing.
+                    if chunks_processed.is_multiple_of(10) || chunks_processed == total_chunks {
+                        let chunk_progress = chunks_processed as f64 / total_chunks as f64;
+                        emit_gui_progress_update(92.0 + chunk_progress * 5.0, "");
+                    }
+                }
+
+                let _ = db.flush();
+                if cfg!(target_os = "android") {
+                    unsafe {
+                        mimalloc::ffi::mi_collect(false);
+                    }
+                }
+            }
+
+            drop(region);
+            if cfg!(target_os = "android") {
+                unsafe {
+                    mimalloc::ffi::mi_collect(false);
                 }
             }
         }
@@ -945,12 +987,43 @@ impl BedrockWriter {
         Ok(())
     }
 
-    fn package_mcworld(&self) -> Result<(), BedrockSaveError> {
-        if let Some(parent) = self.mcworld_path.parent() {
+    fn open_mcworld_target(path: &Path) -> Result<File, BedrockSaveError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::FromRawFd;
+
+            if let Ok(val) = std::env::var("ARNIS_MCWORLD_FD")
+                .or_else(|_| std::env::var("MCWORLD_FD"))
+                .or_else(|_| std::env::var("TARGET_FD"))
+            {
+                if let Ok(fd) = val.parse::<i32>() {
+                    return Ok(unsafe { File::from_raw_fd(fd) });
+                }
+            }
+
+            if let Some(s) = path.to_str() {
+                if let Some(fd_str) = s
+                    .strip_prefix("/proc/self/fd/")
+                    .or_else(|| s.strip_prefix("fd://"))
+                    .or_else(|| s.strip_prefix("fd:"))
+                {
+                    if let Ok(fd) = fd_str.parse::<i32>() {
+                        return Ok(unsafe { File::from_raw_fd(fd) });
+                    }
+                }
+            }
+        }
+
+        if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let file = File::create(&self.mcworld_path)?;
-        let mut writer = ZipWriter::new(file);
+        File::create(path).map_err(BedrockSaveError::Io)
+    }
+
+    fn package_mcworld(&self) -> Result<(), BedrockSaveError> {
+        let file = Self::open_mcworld_target(&self.mcworld_path)?;
+        let buf_writer = BufWriter::with_capacity(64 * 1024, file);
+        let mut writer = ZipWriter::new(buf_writer);
         let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
 
         // Add top-level files
@@ -958,15 +1031,15 @@ impl BedrockWriter {
             let path = self.output_dir.join(file_name);
             if path.exists() {
                 writer.start_file(file_name, options)?;
-                let contents = fs::read(&path)?;
-                writer.write_all(&contents)?;
+                let mut f = File::open(&path)?;
+                std::io::copy(&mut f, &mut writer)?;
             }
         }
 
         // Add world_icon.jpeg from embedded assets
         const WORLD_ICON: &[u8] = include_bytes!("../../assets/minecraft/world_icon.jpeg");
         writer.start_file("world_icon.jpeg", options)?;
-        writer.write_all(WORLD_ICON)?;
+        IoWrite::write_all(&mut writer, WORLD_ICON)?;
 
         if self.extend_build_height {
             const BP_MANIFEST: &[u8] =
@@ -981,18 +1054,18 @@ impl BedrockWriter {
             writer.add_directory("behavior_packs/arnis_tall/dimensions/", options)?;
 
             writer.start_file("behavior_packs/arnis_tall/manifest.json", options)?;
-            writer.write_all(BP_MANIFEST)?;
+            IoWrite::write_all(&mut writer, BP_MANIFEST)?;
 
             writer.start_file(
                 "behavior_packs/arnis_tall/dimensions/overworld.json",
                 options,
             )?;
-            writer.write_all(BP_OVERWORLD)?;
+            IoWrite::write_all(&mut writer, BP_OVERWORLD)?;
 
             writer.start_file("world_behavior_packs.json", options)?;
             let world_bp_json =
                 format!(r#"[{{"pack_id":"{}","version":[1,0,0]}}]"#, BP_HEADER_UUID);
-            writer.write_all(world_bp_json.as_bytes())?;
+            IoWrite::write_all(&mut writer, world_bp_json.as_bytes())?;
         }
 
         // Add db directory and its contents
@@ -1001,7 +1074,12 @@ impl BedrockWriter {
             add_directory_to_zip(&mut writer, &db_path, "db", options)?;
         }
 
-        writer.finish()?;
+        let mut buf_writer = writer.finish()?;
+        IoWrite::flush(&mut buf_writer)?;
+        drop(buf_writer);
+        unsafe {
+            mimalloc::ffi::mi_collect(true);
+        }
         Ok(())
     }
 
@@ -1029,8 +1107,8 @@ fn is_arnis_staging_dir(dir: &std::path::Path) -> bool {
     fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-fn add_directory_to_zip(
-    writer: &mut ZipWriter<File>,
+fn add_directory_to_zip<W: std::io::Write + std::io::Seek>(
+    writer: &mut ZipWriter<W>,
     dir_path: &std::path::Path,
     zip_prefix: &str,
     options: FileOptions,
@@ -1050,8 +1128,8 @@ fn add_directory_to_zip(
 
         if path.is_file() {
             writer.start_file(&zip_path, options)?;
-            let contents = fs::read(&path)?;
-            writer.write_all(&contents)?;
+            let mut file = File::open(&path)?;
+            std::io::copy(&mut file, writer)?;
         } else if path.is_dir() {
             add_directory_to_zip(writer, &path, &zip_path, options)?;
         }
@@ -1576,7 +1654,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let output_dir = temp_dir.path().join("bedrock_world");
 
-        let world = WorldToModify::default();
+        let mut world = WorldToModify::default();
         let xzbbox = XZBBox::rect_from_xz_lengths(15.0, 15.0).unwrap();
         let llbbox = LLBBox::new(0.0, 0.0, 1.0, 1.0).unwrap();
 
@@ -1592,7 +1670,7 @@ mod tests {
             6000,
             false,
         )
-        .write_world(&world, &xzbbox, &llbbox)
+        .write_world(&mut world, &xzbbox, &llbbox)
         .expect("write_world");
 
         // The temp directory should be cleaned up, but mcworld should exist
@@ -1627,7 +1705,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let output_dir = temp_dir.path().join("bedrock_world_spawn");
 
-        let world = WorldToModify::default();
+        let mut world = WorldToModify::default();
         let xzbbox = XZBBox::rect_from_xz_lengths(100.0, 100.0).unwrap();
         let llbbox = LLBBox::new(0.0, 0.0, 1.0, 1.0).unwrap();
 
@@ -1644,7 +1722,7 @@ mod tests {
             6000,
             false,
         )
-        .write_world(&world, &xzbbox, &llbbox)
+        .write_world(&mut world, &xzbbox, &llbbox)
         .expect("write_world");
 
         // Verify the mcworld was created
@@ -1657,7 +1735,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let output_dir = temp_dir.path().join("bedrock_world_tall");
 
-        let world = WorldToModify::default();
+        let mut world = WorldToModify::default();
         let xzbbox = XZBBox::rect_from_xz_lengths(15.0, 15.0).unwrap();
         let llbbox = LLBBox::new(0.0, 0.0, 1.0, 1.0).unwrap();
 
@@ -1673,7 +1751,7 @@ mod tests {
             6000,
             false,
         )
-        .write_world(&world, &xzbbox, &llbbox)
+        .write_world(&mut world, &xzbbox, &llbbox)
         .expect("write_world");
 
         let mcworld_path = output_dir.with_extension("mcworld");
@@ -1759,7 +1837,7 @@ mod tests {
             false,
         );
         writer.prepare_output_dir().expect("prepare dir");
-        writer.write_chunks_to_db(&world).expect("write chunks");
+        writer.write_chunks_to_db(&mut world).expect("write chunks");
 
         // Reopen the LevelDB and verify each populated chunk got version + Data3D + subchunk(4).
         let mut opts = bedrock_db_options();

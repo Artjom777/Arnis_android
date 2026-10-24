@@ -68,29 +68,28 @@ impl Drop for NewWorldCleanup {
 }
 
 pub fn run_gui() -> Result<(), String> {
-    // Configure thread pool: 50% on Android to prevent thermal throttling and OOM, 90% on desktop
-    if cfg!(target_os = "android") {
-        crate::floodfill_cache::configure_rayon_thread_pool(0.5);
-        #[cfg(target_os = "android")]
-        {
-            if env::var("TMPDIR").is_err() {
-                let candidate_dirs = [
-                    PathBuf::from("/data/data/com.louisdev.arnis/cache"),
-                    PathBuf::from("/data/user/0/com.louisdev.arnis/cache"),
-                    PathBuf::from("/storage/emulated/0/Download/.arnis_tmp"),
-                ];
-                for dir in &candidate_dirs {
-                    if fs::create_dir_all(dir).is_ok() {
-                        unsafe {
-                            env::set_var("TMPDIR", dir);
-                        }
-                        break;
+    crate::world_utils::protect_process_memory();
+
+    // Configure thread pool: 100% on all platforms without artificial throttle
+    crate::floodfill_cache::configure_rayon_thread_pool(1.0);
+
+    #[cfg(target_os = "android")]
+    {
+        if env::var("TMPDIR").is_err() {
+            let candidate_dirs = [
+                PathBuf::from("/data/data/com.louisdev.arnis/cache"),
+                PathBuf::from("/data/user/0/com.louisdev.arnis/cache"),
+                PathBuf::from("/storage/emulated/0/Download/.arnis_tmp"),
+            ];
+            for dir in &candidate_dirs {
+                if fs::create_dir_all(dir).is_ok() {
+                    unsafe {
+                        env::set_var("TMPDIR", dir);
                     }
+                    break;
                 }
             }
         }
-    } else {
-        crate::floodfill_cache::configure_rayon_thread_pool(0.9);
     }
 
     // Clean up old cached elevation tiles on startup
