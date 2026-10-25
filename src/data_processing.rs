@@ -1530,9 +1530,7 @@ pub fn generate_world_with_options(
                         gate.1.notify_all();
 
                         if cfg!(target_os = "android") && (tiles_merged % 4 == 0 || tiles_merged == total_tiles) {
-                            unsafe {
-                                mimalloc::ffi::mi_collect(false);
-                            }
+                            crate::world_utils::collect_memory(false);
                         }
                     }
                 }
@@ -1853,9 +1851,7 @@ pub fn generate_world_with_options(
     } // End of isolated scope: all OSM elements, geo-nodes, caches and masks are dropped here.
 
     editor.release_sealed_surface();
-    unsafe {
-        mimalloc::ffi::mi_collect(true);
-    }
+    crate::world_utils::collect_memory(true);
 
     // Save world
     if let Err(e) = editor.save() {

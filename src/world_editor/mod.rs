@@ -2331,9 +2331,7 @@ impl<'a> WorldEditor<'a> {
         // Compact sections before saving: collapses uniform mixed sections back to
         // Uniform and repacks any overflowed direct sections that fit a palette again.
         self.world.compact_sections();
-        unsafe {
-            mimalloc::ffi::mi_collect(false);
-        }
+        crate::world_utils::collect_memory(false);
 
         // Non-Java formats have no per-region write hook, so feed the preview here.
         if self.format != WorldFormat::JavaAnvil {
@@ -2356,14 +2354,9 @@ impl<'a> WorldEditor<'a> {
         self.support_columns.shrink_to_fit();
         self.flushed_regions.clear();
         self.flushed_regions.shrink_to_fit();
-        #[cfg(feature = "gui")]
-        {
-            self.preview_3d = None;
-        }
+        self.preview = None;
 
-        unsafe {
-            mimalloc::ffi::mi_collect(true);
-        }
+        crate::world_utils::collect_memory(true);
 
         match self.format {
             WorldFormat::JavaAnvil => {
@@ -2432,9 +2425,7 @@ impl<'a> WorldEditor<'a> {
         println!("{} Saving Bedrock world...", "[7/7]".bold());
         emit_gui_progress_update(90.0, "Saving Bedrock world...");
 
-        unsafe {
-            mimalloc::ffi::mi_collect(true);
-        }
+        crate::world_utils::collect_memory(true);
 
         if let Err(error) = self.save_bedrock_internal() {
             let user_msg = format!("Failed to save Bedrock world: {error}");

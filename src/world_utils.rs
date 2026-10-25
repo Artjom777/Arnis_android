@@ -12,6 +12,18 @@ use std::{fs, io::Write};
 /// truncates it first: a crash, a full disk or a pulled plug in that window
 /// leaves a zero length or half written `level.dat`, which Minecraft cannot
 /// open, and the world is gone. A rename either happens or does not.
+extern "C" {
+    fn mi_collect(force: bool);
+}
+
+/// Calls mimalloc's C API `mi_collect` to purge freed memory pages back to the OS.
+#[inline]
+pub fn collect_memory(force: bool) {
+    unsafe {
+        mi_collect(force);
+    }
+}
+
 /// Configures runtime memory protections against premature killing by OS daemons (such as Android lmkd).
 /// Also configures mimalloc to eagerly return freed pages to the OS to minimize RSS bloat.
 pub fn protect_process_memory() {

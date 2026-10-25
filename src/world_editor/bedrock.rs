@@ -354,9 +354,7 @@ impl BedrockWriter {
         self.write_level_dat(xzbbox)?;
         self.ground = None;
 
-        unsafe {
-            mimalloc::ffi::mi_collect(true);
-        }
+        crate::world_utils::collect_memory(true);
 
         emit_gui_progress_update(92.0, "Saving Bedrock world...");
         // Write metadata while world.regions still holds chunk count
@@ -372,9 +370,7 @@ impl BedrockWriter {
         world.regions.shrink_to_fit();
 
         // Force mimalloc heap cleanup before ZIP packaging to prevent LMK on Android
-        unsafe {
-            mimalloc::ffi::mi_collect(true);
-        }
+        crate::world_utils::collect_memory(true);
 
         emit_gui_progress_update(98.0, "Saving Bedrock world...");
         self.package_mcworld()?;
@@ -382,9 +378,7 @@ impl BedrockWriter {
         emit_gui_progress_update(99.0, "Saving Bedrock world...");
         self.cleanup_temp_dir()?;
 
-        unsafe {
-            mimalloc::ffi::mi_collect(true);
-        }
+        crate::world_utils::collect_memory(true);
         Ok(())
     }
 
@@ -709,17 +703,13 @@ impl BedrockWriter {
 
                 let _ = db.flush();
                 if cfg!(target_os = "android") {
-                    unsafe {
-                        mimalloc::ffi::mi_collect(false);
-                    }
+                    crate::world_utils::collect_memory(false);
                 }
             }
 
             drop(region);
             if cfg!(target_os = "android") {
-                unsafe {
-                    mimalloc::ffi::mi_collect(false);
-                }
+                crate::world_utils::collect_memory(false);
             }
         }
 
@@ -1077,9 +1067,7 @@ impl BedrockWriter {
         let mut buf_writer = writer.finish()?;
         IoWrite::flush(&mut buf_writer)?;
         drop(buf_writer);
-        unsafe {
-            mimalloc::ffi::mi_collect(true);
-        }
+        crate::world_utils::collect_memory(true);
         Ok(())
     }
 
