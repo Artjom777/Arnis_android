@@ -165,7 +165,9 @@ impl Env for MonotonicDiskEnv {
                 #[cfg(target_os = "android")]
                 {
                     eprintln!("Warning: ignoring database lock error on Android FUSE: {e:?}");
-                    Ok(0 as FileLock)
+                    Ok(FileLock {
+                        id: p.to_str().unwrap_or("dummy_lock").to_string(),
+                    })
                 }
                 #[cfg(not(target_os = "android"))]
                 Err(e)
@@ -174,9 +176,11 @@ impl Env for MonotonicDiskEnv {
     }
     fn unlock(&self, l: FileLock) -> rusty_leveldb::Result<()> {
         #[cfg(target_os = "android")]
-        if l == 0 as FileLock {
-            return Ok(());
+        {
+            let _ = self.inner.unlock(l);
+            Ok(())
         }
+        #[cfg(not(target_os = "android"))]
         self.inner.unlock(l)
     }
     fn new_logger(&self, p: &Path) -> rusty_leveldb::Result<Logger> {
