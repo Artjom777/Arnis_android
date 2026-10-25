@@ -315,6 +315,28 @@ pub fn install_panic_hook() {
         // Log the panic to both stderr and log file
         error!("Application panicked: {:?}", panic_info);
 
+        // Always write panic to local storage on Android so users can inspect it
+        #[cfg(target_os = "android")]
+        {
+            let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic".to_string()
+            };
+            let location = panic_info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "unknown location".to_string());
+            let log_entry = format!("PANIC: {payload} at {location}\n");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/storage/emulated/0/Download/arnis_crash.log")
+                .and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+        }
+
         // Filter out secondary "panic in a function that cannot unwind" panics
         if let Some(location) = panic_info.location() {
             if location.file().contains("panicking.rs") {

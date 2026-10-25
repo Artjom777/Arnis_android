@@ -2430,6 +2430,15 @@ impl<'a> WorldEditor<'a> {
         if let Err(error) = self.save_bedrock_internal() {
             let user_msg = format!("Failed to save Bedrock world: {error}");
             eprintln!("{user_msg}");
+            #[cfg(target_os = "android")]
+            {
+                let log_entry = format!("BEDROCK ERROR: {user_msg}\n");
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/storage/emulated/0/Download/arnis_crash.log")
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+            }
             #[cfg(feature = "gui")]
             emit_gui_error(&user_msg);
             return Err(user_msg.into());

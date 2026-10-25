@@ -159,9 +159,24 @@ impl Env for MonotonicDiskEnv {
         self.inner.rename(from, to)
     }
     fn lock(&self, p: &Path) -> rusty_leveldb::Result<FileLock> {
-        self.inner.lock(p)
+        match self.inner.lock(p) {
+            Ok(lock) => Ok(lock),
+            Err(e) => {
+                #[cfg(target_os = "android")]
+                {
+                    eprintln!("Warning: ignoring database lock error on Android FUSE: {e:?}");
+                    Ok(0 as FileLock)
+                }
+                #[cfg(not(target_os = "android"))]
+                Err(e)
+            }
+        }
     }
     fn unlock(&self, l: FileLock) -> rusty_leveldb::Result<()> {
+        #[cfg(target_os = "android")]
+        if l == 0 as FileLock {
+            return Ok(());
+        }
         self.inner.unlock(l)
     }
     fn new_logger(&self, p: &Path) -> rusty_leveldb::Result<Logger> {
@@ -256,15 +271,18 @@ impl BedrockWriter {
                 #[cfg(target_os = "android")]
                 {
                     let file_stem = output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("arnis_world");
-                    let staging_base = std::env::var_os("TMPDIR")
-                        .map(PathBuf::from)
-                        .or_else(|| dirs::cache_dir())
-                        .filter(|p| fs::create_dir_all(p).is_ok())
-                        .unwrap_or_else(|| {
-                            let fallback = PathBuf::from("/storage/emulated/0/Download/.arnis_staging");
-                            let _ = fs::create_dir_all(&fallback);
-                            fallback
-                        });
+                    let candidate_bases = [
+                        std::env::var_os("TMPDIR").map(PathBuf::from),
+                        Some(PathBuf::from("/data/data/com.louisdev.arnis/cache")),
+                        Some(PathBuf::from("/data/user/0/com.louisdev.arnis/cache")),
+                        dirs::cache_dir(),
+                        Some(PathBuf::from("/storage/emulated/0/Download/.arnis_staging")),
+                    ];
+                    let staging_base = candidate_bases
+                        .into_iter()
+                        .flatten()
+                        .find(|p| fs::create_dir_all(p).is_ok())
+                        .unwrap_or_else(|| PathBuf::from("/storage/emulated/0/Download/.arnis_staging"));
                     let staging_dir = staging_base.join(format!("arnis_staging_{}", file_stem));
                     let download_dir = PathBuf::from("/storage/emulated/0/Download");
                     let _ = fs::create_dir_all(&download_dir);
@@ -280,15 +298,18 @@ impl BedrockWriter {
                 #[cfg(target_os = "android")]
                 {
                     let file_stem = output_path.file_name().and_then(|s| s.to_str()).unwrap_or("arnis_world");
-                    let staging_base = std::env::var_os("TMPDIR")
-                        .map(PathBuf::from)
-                        .or_else(|| dirs::cache_dir())
-                        .filter(|p| fs::create_dir_all(p).is_ok())
-                        .unwrap_or_else(|| {
-                            let fallback = PathBuf::from("/storage/emulated/0/Download/.arnis_staging");
-                            let _ = fs::create_dir_all(&fallback);
-                            fallback
-                        });
+                    let candidate_bases = [
+                        std::env::var_os("TMPDIR").map(PathBuf::from),
+                        Some(PathBuf::from("/data/data/com.louisdev.arnis/cache")),
+                        Some(PathBuf::from("/data/user/0/com.louisdev.arnis/cache")),
+                        dirs::cache_dir(),
+                        Some(PathBuf::from("/storage/emulated/0/Download/.arnis_staging")),
+                    ];
+                    let staging_base = candidate_bases
+                        .into_iter()
+                        .flatten()
+                        .find(|p| fs::create_dir_all(p).is_ok())
+                        .unwrap_or_else(|| PathBuf::from("/storage/emulated/0/Download/.arnis_staging"));
                     let staging_dir = staging_base.join(format!("arnis_staging_{}", file_stem));
                     let download_dir = PathBuf::from("/storage/emulated/0/Download");
                     let _ = fs::create_dir_all(&download_dir);
@@ -639,8 +660,9 @@ impl BedrockWriter {
         let mut db = DB::open(db_path.into_boxed_path(), opts)
             .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
 
-        // Chunks per parallel-encode window without artificial platform limits.
-        const ENCODE_BATCH_CHUNKS: usize = 256;
+        // Chunks per parallel-encode window: 64 on Android, 128 elsewhere.
+        // Bounds transient memory burst while giving Rayon threads plenty of work.
+        const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
 
         let total_chunks: usize = world
             .regions
@@ -687,11 +709,12 @@ impl BedrockWriter {
 
                 drop(chunk_batch);
 
-                for records in &encoded {
-                    for (key, value) in records {
+                for records in encoded {
+                    for (key, value) in &records {
                         db.put(key, value)
                             .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
                     }
+                    drop(records);
                     chunks_processed += 1;
                     progress_bar.inc(1);
                     // GUI progress spans 92%..97% for chunk writing.
@@ -701,7 +724,6 @@ impl BedrockWriter {
                     }
                 }
 
-                let _ = db.flush();
                 if cfg!(target_os = "android") {
                     crate::world_utils::collect_memory(false);
                 }
@@ -712,6 +734,10 @@ impl BedrockWriter {
                 crate::world_utils::collect_memory(false);
             }
         }
+
+        // Flush all chunks to LevelDB tables before archiving
+        db.flush()
+            .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
 
         progress_bar.finish_with_message("Chunks written to LevelDB");
         Ok(())
@@ -1115,6 +1141,10 @@ fn add_directory_to_zip<W: std::io::Write + std::io::Seek>(
         let zip_path = format!("{}/{}", zip_prefix, name);
 
         if path.is_file() {
+            // Do not package the temporary LevelDB LOCK file into the mcworld archive
+            if name == "LOCK" {
+                continue;
+            }
             writer.start_file(&zip_path, options)?;
             let mut file = File::open(&path)?;
             std::io::copy(&mut file, writer)?;

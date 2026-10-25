@@ -1858,6 +1858,15 @@ pub fn generate_world_with_options(
         // The panels were waiting for the pack this save was going to make a
         // world for; without one they are only memory.
         crate::mapillary::displays::discard();
+        #[cfg(target_os = "android")]
+        {
+            let log_entry = format!("EDITOR SAVE ERROR: {e}\n");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/storage/emulated/0/Download/arnis_crash.log")
+                .and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+        }
         return Err(e.to_string());
     }
     bench.mark("save");
