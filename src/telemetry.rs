@@ -330,11 +330,7 @@ pub fn install_panic_hook() {
                 .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
                 .unwrap_or_else(|| "unknown location".to_string());
             let log_entry = format!("PANIC: {payload} at {location}\n");
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/storage/emulated/0/Download/arnis_crash.log")
-                .and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+            crate::world_utils::write_android_crash_log(&log_entry);
         }
 
         // Filter out secondary "panic in a function that cannot unwind" panics

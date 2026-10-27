@@ -79,7 +79,7 @@ pub fn run_gui() -> Result<(), String> {
             let candidate_dirs = [
                 PathBuf::from("/data/data/com.louisdev.arnis/cache"),
                 PathBuf::from("/data/user/0/com.louisdev.arnis/cache"),
-                PathBuf::from("/storage/emulated/0/Download/.arnis_tmp"),
+                crate::world_utils::resolve_android_download_dir().join(".arnis_tmp"),
             ];
             for dir in &candidate_dirs {
                 if fs::create_dir_all(dir).is_ok() {
@@ -189,7 +189,7 @@ pub fn run_gui() -> Result<(), String> {
 /// Falls back to Desktop, then current directory.
 fn detect_minecraft_saves_directory() -> PathBuf {
     if cfg!(target_os = "android") {
-        return PathBuf::from("/storage/emulated/0/Download");
+        return crate::world_utils::resolve_android_download_dir();
     }
     // Try standard Minecraft saves directories per OS
     let mc_saves: Option<PathBuf> = if cfg!(target_os = "windows") {
@@ -236,7 +236,7 @@ fn detect_minecraft_saves_directory() -> PathBuf {
 #[tauri::command]
 fn gui_get_default_save_path() -> String {
     if cfg!(target_os = "android") {
-        return "/storage/emulated/0/Download".to_string();
+        return crate::world_utils::resolve_android_download_dir().display().to_string();
     }
     detect_minecraft_saves_directory().display().to_string()
 }
@@ -252,7 +252,7 @@ fn gui_get_default_bedrock_save_path() -> String {
 /// Returns the configured Bedrock output directory, or the default if it is unusable.
 fn resolve_bedrock_output_dir(configured: &str) -> PathBuf {
     if cfg!(target_os = "android") {
-        return PathBuf::from("/storage/emulated/0/Download");
+        return crate::world_utils::resolve_android_download_dir();
     }
     let trimmed = configured.trim();
     if !trimmed.is_empty() {
@@ -383,7 +383,7 @@ fn gui_pick_save_directory(start_path: String) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
         let _ = start_path;
-        return Ok("/storage/emulated/0/Download".to_string());
+        return Ok(crate::world_utils::resolve_android_download_dir().display().to_string());
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -414,9 +414,14 @@ fn gui_create_world(save_path: String, world_name: Option<String>) -> Result<Str
     let trimmed = save_path.trim();
     let base = if cfg!(target_os = "android") {
         let p = if trimmed.is_empty() {
-            PathBuf::from("/storage/emulated/0/Download")
+            crate::world_utils::resolve_android_download_dir()
         } else {
-            PathBuf::from(trimmed)
+            let candidate = PathBuf::from(trimmed);
+            if candidate.is_dir() {
+                candidate
+            } else {
+                crate::world_utils::resolve_android_download_dir()
+            }
         };
         let _ = std::fs::create_dir_all(&p);
         p

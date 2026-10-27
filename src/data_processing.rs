@@ -1861,11 +1861,7 @@ pub fn generate_world_with_options(
         #[cfg(target_os = "android")]
         {
             let log_entry = format!("EDITOR SAVE ERROR: {e}\n");
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/storage/emulated/0/Download/arnis_crash.log")
-                .and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
+            crate::world_utils::write_android_crash_log(&log_entry);
         }
         return Err(e.to_string());
     }

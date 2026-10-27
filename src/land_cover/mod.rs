@@ -338,7 +338,7 @@ pub fn fetch_land_cover_data(
 
 fn get_cache_dir() -> PathBuf {
     if cfg!(target_os = "android") {
-        PathBuf::from("/storage/emulated/0/Download/.arnis_cache/land_cover")
+        crate::world_utils::resolve_android_download_dir().join(".arnis_cache/land_cover")
     } else if let Some(cache_dir) = dirs::cache_dir() {
         cache_dir.join(LAND_COVER_CACHE_DIR)
     } else {

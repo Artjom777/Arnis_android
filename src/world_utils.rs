@@ -44,6 +44,16 @@ pub fn protect_process_memory() {
             };
             let _ = libc::setrlimit(libc::RLIMIT_AS, &unlimited);
             let _ = libc::setrlimit(libc::RLIMIT_DATA, &unlimited);
+
+            // Increase open file limits so LevelDB and ZipWriter never run out of handles
+            let mut nofile = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile) == 0 {
+                nofile.rlim_cur = nofile.rlim_max.min(65536);
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &nofile);
+            }
         }
 
         // Try lowering oom_score_adj to protect this foreground process from premature lmkd SIGKILL
@@ -55,6 +65,54 @@ pub fn protect_process_memory() {
                 }
             }
         }
+    }
+}
+
+/// Discovers the first existing, writable download directory on Android.
+/// Tries external storage, SD card, primary external, and internal app files storage.
+pub fn resolve_android_download_dir() -> PathBuf {
+    let candidates = [
+        PathBuf::from("/storage/emulated/0/Download"),
+        PathBuf::from("/sdcard/Download"),
+        PathBuf::from("/storage/self/primary/Download"),
+        PathBuf::from("/storage/emulated/0"),
+        PathBuf::from("/sdcard"),
+        PathBuf::from("/data/data/com.louisdev.arnis/files"),
+        PathBuf::from("/data/user/0/com.louisdev.arnis/files"),
+    ];
+    for dir in &candidates {
+        if dir.is_dir() || fs::create_dir_all(dir).is_ok() {
+            let test_file = dir.join(".arnis_write_probe");
+            if fs::write(&test_file, b"").is_ok() {
+                let _ = fs::remove_file(test_file);
+                return dir.clone();
+            }
+        }
+    }
+    PathBuf::from("/sdcard/Download")
+}
+
+/// Appends a crash or diagnostic message to local Android log files across fallback directories.
+pub fn write_android_crash_log(message: &str) {
+    #[cfg(target_os = "android")]
+    {
+        let candidates = [
+            resolve_android_download_dir().join("arnis_crash.log"),
+            PathBuf::from("/storage/emulated/0/Download/arnis_crash.log"),
+            PathBuf::from("/sdcard/Download/arnis_crash.log"),
+            PathBuf::from("/data/data/com.louisdev.arnis/cache/arnis_crash.log"),
+            PathBuf::from("/data/user/0/com.louisdev.arnis/cache/arnis_crash.log"),
+        ];
+        for path in &candidates {
+            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = io::Write::write_all(&mut f, message.as_bytes());
+                break;
+            }
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = message;
     }
 }
 
@@ -80,7 +138,7 @@ pub fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> 
 /// Falls back to home directory, then current directory.
 pub fn get_bedrock_output_directory() -> PathBuf {
     if cfg!(target_os = "android") {
-        return PathBuf::from("/storage/emulated/0/Download");
+        return resolve_android_download_dir();
     }
     dirs::desktop_dir()
         .or_else(dirs::home_dir)
@@ -227,7 +285,11 @@ pub fn build_bedrock_output_with_name(
     custom_name: Option<&str>,
 ) -> (PathBuf, String) {
     let output_dir = if cfg!(target_os = "android") {
-        PathBuf::from("/storage/emulated/0/Download")
+        if output_dir.as_os_str().is_empty() || !output_dir.is_dir() {
+            resolve_android_download_dir()
+        } else {
+            output_dir
+        }
     } else {
         output_dir
     };

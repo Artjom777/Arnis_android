@@ -2425,20 +2425,27 @@ impl<'a> WorldEditor<'a> {
         println!("{} Saving Bedrock world...", "[7/7]".bold());
         emit_gui_progress_update(90.0, "Saving Bedrock world...");
 
+        // Release all auxiliary caches and data structures not needed for Bedrock export
+        self.preview = None;
+        self.tree_pack = None;
+        self.sealed_surface = None;
+        self.mapped_trunks = None;
+        self.signage = None;
+        self.voxy = None;
+        self.road_surface_overrides.clear();
+        self.road_surface_overrides.shrink_to_fit();
+        self.support_columns.clear();
+        self.support_columns.shrink_to_fit();
+        self.frame_cells.clear();
+        self.frame_cells.shrink_to_fit();
+
         crate::world_utils::collect_memory(true);
 
         if let Err(error) = self.save_bedrock_internal() {
             let user_msg = format!("Failed to save Bedrock world: {error}");
             eprintln!("{user_msg}");
-            #[cfg(target_os = "android")]
-            {
-                let log_entry = format!("BEDROCK ERROR: {user_msg}\n");
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/storage/emulated/0/Download/arnis_crash.log")
-                    .and_then(|mut f| std::io::Write::write_all(&mut f, log_entry.as_bytes()));
-            }
+            let log_entry = format!("BEDROCK ERROR: {user_msg}\n");
+            crate::world_utils::write_android_crash_log(&log_entry);
             #[cfg(feature = "gui")]
             emit_gui_error(&user_msg);
             return Err(user_msg.into());
@@ -2460,7 +2467,7 @@ impl<'a> WorldEditor<'a> {
             self.world_dir.clone(),
             level_name,
             self.bedrock_spawn_point,
-            self.ground.clone(),
+            self.ground.take(),
             self.bedrock_extend_height,
             self.projection.clone(),
             self.scale,

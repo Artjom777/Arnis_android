@@ -90,20 +90,20 @@ impl From<serde_json::Error> for BedrockSaveError {
 
 const DEFAULT_BEDROCK_COMPRESSION_LEVEL: u8 = 6;
 
-/// rusty-leveldb 3.0.3's LRU `remove` leaves the list's tail pointer dangling
-/// when it removes the last node, and the table cache is the only cache that
-/// removes (on every compaction). A table cache of one entry never has a tail
-/// apart from its head, so the dangling pointer is reset by the next insert
-/// before anything reads it. The library reserves 10 handles, so 11 gives 1.
-/// Fixed upstream after 4.0.1; drop this once bedrockrs moves to a fixed release.
-const LEVELDB_MAX_OPEN_FILES: usize = 11;
-
 /// LevelDB options for writing a Bedrock world. `mcpe_options` sets the
 /// compressors; this adds the workarounds for rusty-leveldb panics.
+///
+/// In rusty-leveldb 3.0.3, LRU `remove` has a bug when evicting table cache entries.
+/// An Arnis world export writes at most a few dozen SSTable files total.
+/// By setting `write_buffer_size` to 64 MB and `max_open_files` to 1000 (cache capacity 990),
+/// the table cache never exceeds capacity during export, so it never needs to evict,
+/// which completely avoids the LRU list remove bug and avoids multi-table compaction thrashing.
 fn bedrock_db_options() -> Options {
     let mut opts = mcpe_options(DEFAULT_BEDROCK_COMPRESSION_LEVEL);
     opts.env = Rc::new(Box::new(MonotonicDiskEnv::new()));
-    opts.max_open_files = LEVELDB_MAX_OPEN_FILES;
+    opts.write_buffer_size = 64 * 1024 * 1024;
+    opts.max_file_size = 64 * 1024 * 1024;
+    opts.max_open_files = 1000;
     opts
 }
 
@@ -156,7 +156,25 @@ impl Env for MonotonicDiskEnv {
         self.inner.rmdir(p)
     }
     fn rename(&self, from: &Path, to: &Path) -> rusty_leveldb::Result<()> {
-        self.inner.rename(from, to)
+        match self.inner.rename(from, to) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                #[cfg(target_os = "android")]
+                {
+                    // On Android FUSE filesystems, atomic rename fails if the target file already exists
+                    // (e.g. updating CURRENT file in LevelDB).
+                    if to.exists() {
+                        let _ = fs::remove_file(to);
+                        if self.inner.rename(from, to).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                    Err(e)
+                }
+                #[cfg(not(target_os = "android"))]
+                Err(e)
+            }
+        }
     }
     fn lock(&self, p: &Path) -> rusty_leveldb::Result<FileLock> {
         match self.inner.lock(p) {
@@ -275,20 +293,20 @@ impl BedrockWriter {
                 #[cfg(target_os = "android")]
                 {
                     let file_stem = output_path.file_stem().and_then(|s| s.to_str()).unwrap_or("arnis_world");
+                    let download_dir = crate::world_utils::resolve_android_download_dir();
                     let candidate_bases = [
                         std::env::var_os("TMPDIR").map(PathBuf::from),
                         Some(PathBuf::from("/data/data/com.louisdev.arnis/cache")),
                         Some(PathBuf::from("/data/user/0/com.louisdev.arnis/cache")),
                         dirs::cache_dir(),
-                        Some(PathBuf::from("/storage/emulated/0/Download/.arnis_staging")),
+                        Some(download_dir.join(".arnis_staging")),
                     ];
                     let staging_base = candidate_bases
                         .into_iter()
                         .flatten()
                         .find(|p| fs::create_dir_all(p).is_ok())
-                        .unwrap_or_else(|| PathBuf::from("/storage/emulated/0/Download/.arnis_staging"));
+                        .unwrap_or_else(|| download_dir.join(".arnis_staging"));
                     let staging_dir = staging_base.join(format!("arnis_staging_{}", file_stem));
-                    let download_dir = PathBuf::from("/storage/emulated/0/Download");
                     let _ = fs::create_dir_all(&download_dir);
                     let final_path = download_dir.join(
                         output_path.file_name().unwrap_or_default()
@@ -302,20 +320,20 @@ impl BedrockWriter {
                 #[cfg(target_os = "android")]
                 {
                     let file_stem = output_path.file_name().and_then(|s| s.to_str()).unwrap_or("arnis_world");
+                    let download_dir = crate::world_utils::resolve_android_download_dir();
                     let candidate_bases = [
                         std::env::var_os("TMPDIR").map(PathBuf::from),
                         Some(PathBuf::from("/data/data/com.louisdev.arnis/cache")),
                         Some(PathBuf::from("/data/user/0/com.louisdev.arnis/cache")),
                         dirs::cache_dir(),
-                        Some(PathBuf::from("/storage/emulated/0/Download/.arnis_staging")),
+                        Some(download_dir.join(".arnis_staging")),
                     ];
                     let staging_base = candidate_bases
                         .into_iter()
                         .flatten()
                         .find(|p| fs::create_dir_all(p).is_ok())
-                        .unwrap_or_else(|| PathBuf::from("/storage/emulated/0/Download/.arnis_staging"));
+                        .unwrap_or_else(|| download_dir.join(".arnis_staging"));
                     let staging_dir = staging_base.join(format!("arnis_staging_{}", file_stem));
-                    let download_dir = PathBuf::from("/storage/emulated/0/Download");
                     let _ = fs::create_dir_all(&download_dir);
                     let final_path = download_dir.join(
                         mcworld_path.file_name().unwrap_or_default()
@@ -1037,7 +1055,25 @@ impl BedrockWriter {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        File::create(path).map_err(BedrockSaveError::Io)
+        match File::create(path) {
+            Ok(file) => Ok(file),
+            Err(e) => {
+                #[cfg(target_os = "android")]
+                {
+                    eprintln!(
+                        "Failed to create mcworld at {}: {}, attempting fallback to resolved download dir",
+                        path.display(),
+                        e
+                    );
+                    let fallback_dir = crate::world_utils::resolve_android_download_dir();
+                    let _ = fs::create_dir_all(&fallback_dir);
+                    let fallback_path = fallback_dir.join(path.file_name().unwrap_or_default());
+                    File::create(&fallback_path).map_err(BedrockSaveError::Io)
+                }
+                #[cfg(not(target_os = "android"))]
+                Err(BedrockSaveError::Io(e))
+            }
+        }
     }
 
     fn package_mcworld(&self) -> Result<(), BedrockSaveError> {
@@ -1104,7 +1140,7 @@ impl BedrockWriter {
     /// Clean up the temporary directory after packaging mcworld
     fn cleanup_temp_dir(&self) -> Result<(), BedrockSaveError> {
         if self.output_dir.exists() {
-            fs::remove_dir_all(&self.output_dir)?;
+            let _ = fs::remove_dir_all(&self.output_dir);
         }
         Ok(())
     }
@@ -1121,6 +1157,11 @@ fn append_mcworld_extension(dir: &std::path::Path) -> PathBuf {
 fn is_arnis_staging_dir(dir: &std::path::Path) -> bool {
     if dir.join(STAGING_MARKER).is_file() {
         return true;
+    }
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+        if name.contains("arnis_staging") || name.contains(".arnis_staging") {
+            return true;
+        }
     }
     fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
 }

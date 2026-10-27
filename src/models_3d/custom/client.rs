@@ -13,7 +13,7 @@ const MAX_GLB_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(crate) fn cache_root() -> PathBuf {
     if cfg!(target_os = "android") {
-        PathBuf::from("/storage/emulated/0/Download/.arnis_cache").join(CACHE_SUBDIR)
+        crate::world_utils::resolve_android_download_dir().join(".arnis_cache").join(CACHE_SUBDIR)
     } else {
         dirs::cache_dir()
             .map(|d| d.join(CACHE_SUBDIR))

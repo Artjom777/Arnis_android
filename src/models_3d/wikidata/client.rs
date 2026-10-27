@@ -15,7 +15,7 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) fn cache_root() -> PathBuf {
     if cfg!(target_os = "android") {
-        PathBuf::from("/storage/emulated/0/Download/.arnis_cache").join(CACHE_SUBDIR)
+        crate::world_utils::resolve_android_download_dir().join(".arnis_cache").join(CACHE_SUBDIR)
     } else if let Some(dir) = dirs::cache_dir() {
         dir.join(CACHE_SUBDIR)
     } else {
