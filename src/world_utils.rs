@@ -2,9 +2,8 @@ use crate::coordinate_system::geographic::LLBBox;
 use crate::retrieve_data;
 use fastnbt::Value;
 use flate2::read::GzDecoder;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::{fs, io::Write};
+use std::{fs, io, io::Read, io::Write};
 
 /// Replaces `path` by writing a temporary beside it and renaming it into place.
 ///
@@ -105,7 +104,7 @@ pub fn write_android_crash_log(message: &str) {
         ];
         for path in &candidates {
             if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = io::Write::write_all(&mut f, message.as_bytes());
+                let _ = f.write_all(message.as_bytes());
                 break;
             }
         }
