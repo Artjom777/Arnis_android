@@ -1089,11 +1089,12 @@ pub fn generate_world_with_options(
     // Tile subdivision is aligned to 512-block Minecraft region boundaries.
     let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
 
-    // Tile editors are created as JavaAnvil (WorldEditor::new), so their
-    // format-dependent block-entity schema (banners) only matches Java output.
-    // Restrict the parallel tile path to Java; Bedrock/Luanti large worlds use
-    // the sequential path (correct, just not tile-parallel).
-    let use_parallel_tiles = tiles.len() >= 3 && matches!(world_format, WorldFormat::JavaAnvil);
+    // If tiled_generation is enabled (default) and there are 2 or more tiles,
+    // process the world in parts (tiles) and assemble them into 1 world.
+    // Supported on JavaAnvil and BedrockMcWorld.
+    let use_parallel_tiles = args.tiled_generation
+        && tiles.len() >= 2
+        && matches!(world_format, WorldFormat::JavaAnvil | WorldFormat::BedrockMcWorld);
 
     if use_parallel_tiles {
         // Large area: process tiles in parallel using rayon.
@@ -1107,7 +1108,11 @@ pub fn generate_world_with_options(
         // Tiles are processed in batches (one tile per rayon thread) to cap peak memory.
         // Without batching, all tile WorldToModify structs would be in memory at once,
         // which can exceed RAM for large areas and cause disk thrashing.
-        let tile_batch_size = rayon::current_num_threads().max(1);
+        let tile_batch_size = if cfg!(target_os = "android") {
+            rayon::current_num_threads().clamp(1, 2)
+        } else {
+            rayon::current_num_threads().max(1)
+        };
         println!(
             "  Processing {} tiles across {tile_batch_size} threads...",
             tiles.len()
@@ -1227,7 +1232,15 @@ pub fn generate_world_with_options(
             )
             .expect("Failed to create tile XZBBox");
 
-            let mut tile_editor = WorldEditor::new(PathBuf::new(), &tile_xzbbox, llbbox);
+            let mut tile_editor = WorldEditor::new_with_format_and_name(
+                PathBuf::new(),
+                &tile_xzbbox,
+                llbbox,
+                world_format,
+                options.level_name.clone(),
+                options.spawn_point,
+                args.disable_height_limit,
+            );
             tile_editor.set_ground(Arc::clone(&ground));
             tile_editor.set_ground_origin(xzbbox.min_x(), xzbbox.min_z());
             // Ground generation runs on tile editors, so they need the real scale.
@@ -1377,7 +1390,8 @@ pub fn generate_world_with_options(
             let placed = tiles_placed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if (placed * 50 / total_tiles) != ((placed - 1) * 50 / total_tiles) {
                 let pct = 20.0 + (placed as f64 / total_tiles as f64) * 50.0;
-                emit_gui_progress_update_ex(pct, "Generating area...", eviction_active);
+                let msg = format!("Generating part {placed}/{total_tiles}...");
+                emit_gui_progress_update_ex(pct, &msg, eviction_active);
             }
 
             (
@@ -1520,7 +1534,8 @@ pub fn generate_world_with_options(
                         tiles_merged += 1;
                         let pct = 20.0 + (tiles_merged as f64 / total_tiles as f64) * 50.0;
                         if pct - last_emitted_pct >= 1.0 {
-                            emit_gui_progress_update_ex(pct, "Generating area...", eviction_active);
+                            let msg = format!("Assembling part {tiles_merged}/{total_tiles} into 1 world...");
+                            emit_gui_progress_update_ex(pct, &msg, eviction_active);
                             last_emitted_pct = pct;
                         }
                         merge_dur += merge_start.elapsed();

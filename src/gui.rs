@@ -1486,6 +1486,7 @@ fn gui_start_generation(
     celestial_body_name: String,
     one_world: bool,
     one_world_name: String,
+    tiled_generation: Option<bool>,
 ) -> Result<(), String> {
     use progress::emit_gui_error;
     use LLBBox;
@@ -1780,6 +1781,7 @@ fn gui_start_generation(
                 height_multiplier,
                 projection: crate::projection::ProjectionKind::Local,
                 one_world: false,
+                tiled_generation: tiled_generation.unwrap_or(true),
                 world_name: None,
                 one_world_run: None,
                 ground_level,

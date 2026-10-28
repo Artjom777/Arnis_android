@@ -3334,6 +3334,8 @@ async function startGeneration() {
     var maxTreeSizeBtn = document.querySelector("#max-tree-size-group .segment.active");
     var maxTreeSize = maxTreeSizeBtn ? maxTreeSizeBtn.dataset.maxTreeSize : "giant";
     var overture = document.getElementById("overture-toggle").checked;
+    var tiledGenToggle = document.getElementById("tiled-generation-toggle");
+    var tiled_generation = tiledGenToggle ? tiledGenToggle.checked : true;
     var use_3d = document.getElementById("use-3d-toggle").checked;
     var heightLimitToggle = document.getElementById("disable-height-limit-toggle");
     // Disabled means unsupported for this body or format, so never send a stale tick.
@@ -3423,7 +3425,8 @@ async function startGeneration() {
         facadeDetail: getFacadeDetail(),
         celestialBodyName: selectedCelestialBody,
         oneWorld: oneWorld,
-        oneWorldName: oneWorld ? oneWorldFolderName() : ""
+        oneWorldName: oneWorld ? oneWorldFolderName() : "",
+        tiledGeneration: tiled_generation
     });
 
     console.log("Generation process started.");

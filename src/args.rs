@@ -66,6 +66,10 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub one_world: bool,
 
+    /// Generate the world in parts/tiles (subdivided by regions) and assemble into one world.
+    #[arg(long, default_value_t = true)]
+    pub tiled_generation: bool,
+
     /// Name of the world folder for --one-world (default "Arnis One World").
     #[arg(long)]
     pub world_name: Option<String>,

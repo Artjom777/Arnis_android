@@ -426,6 +426,23 @@
               </div>
 
               <div class="setting-grid">
+                <!-- Chunked/Tiled Generation (generate by parts and assemble into 1 world) -->
+                <div class="settings-row setting-tile is-wide">
+                  <label for="tiled-generation-toggle" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="tiled_generation">Generate in parts (assemble into 1 world)</span>
+                        <span class="tooltip-icon" data-tooltip="Automatically divides selected territory into parts (tiles), generates each part, and merges them into one complete world. Drastically reduces memory usage.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="tiled_generation_desc">Automatically divides selected territory into parts and merges them into one complete world.</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <input type="checkbox" class="switch" id="tiled-generation-toggle" name="tiled-generation-toggle" checked>
+                  </div>
+                </div>
+
                 <!-- Additional Buildings (Overture Maps ML-derived footprints) -->
                 <div class="settings-row setting-tile">
                   <label for="overture-toggle" class="setting-label">

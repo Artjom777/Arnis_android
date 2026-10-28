@@ -23,6 +23,7 @@ const NONE = 'none'; // never stored, revert only
 const SETTINGS = [
   // Generation
   { id: 'generation-mode-select', kind: 'select', store: OWN },
+  { id: 'tiled-generation-toggle', kind: 'checkbox', store: OWN },
   { id: 'overture-toggle', kind: 'checkbox', store: OWN },
   { id: 'use-3d-toggle', kind: 'checkbox', store: OWN },
   { id: 'interior-toggle', kind: 'checkbox', store: OWN },
