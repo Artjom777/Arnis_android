@@ -1408,20 +1408,6 @@ pub fn generate_world_with_options(
                 tile_road_overrides,
             )
         };
-            if (placed * 50 / total_tiles) != ((placed - 1) * 50 / total_tiles) {
-                let pct = 20.0 + (placed as f64 / total_tiles as f64) * 50.0;
-                let msg = format!("Generating part {placed}/{total_tiles}...");
-                emit_gui_progress_update_ex(pct, &msg, eviction_active);
-            }
-
-            (
-                tile_idx,
-                tile_editor.into_world(),
-                tile_rail_tunnel_points,
-                tile_tunnel_cells,
-                tile_road_overrides,
-            )
-        };
 
         // Tiles merge in list order: outside its own bounds a tile only fills air, so the
         // first writer wins there, and the flush bookkeeping counts merges. Workers take
