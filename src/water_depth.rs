@@ -738,6 +738,9 @@ pub fn carve_lc_water_region(
     iter_min_z: i32,
     iter_max_z: i32,
 ) {
+    if iter_min_x > iter_max_x || iter_min_z > iter_max_z {
+        return;
+    }
     let off_x = xzbbox.min_x();
     let off_z = xzbbox.min_z();
     // Only the water sub-rect can hold LC_WATER cells; intersect it with the range.

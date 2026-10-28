@@ -3,8 +3,16 @@ use reqwest::blocking::Client;
 use serde::Serialize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+/// Holds the description and location of the most recent panic
+static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+/// Returns the last panic description if one occurred, clearing the stored value.
+pub fn get_last_panic() -> Option<String> {
+    LAST_PANIC.lock().ok().and_then(|mut p| p.take())
+}
 
 /// Telemetry endpoint URL
 const TELEMETRY_URL: &str = "https://arnismc.com/telemetry/report_telemetry.php";
@@ -315,21 +323,27 @@ pub fn install_panic_hook() {
         // Log the panic to both stderr and log file
         error!("Application panicked: {:?}", panic_info);
 
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let panic_str = format!("{payload} at {location}");
+
+        if let Ok(mut lock) = LAST_PANIC.lock() {
+            *lock = Some(panic_str.clone());
+        }
+
         // Always write panic to local storage on Android so users can inspect it
         #[cfg(target_os = "android")]
         {
-            let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "Unknown panic".to_string()
-            };
-            let location = panic_info
-                .location()
-                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-                .unwrap_or_else(|| "unknown location".to_string());
-            let log_entry = format!("PANIC: {payload} at {location}\n");
+            let log_entry = format!("PANIC: {panic_str}\n");
             crate::world_utils::write_android_crash_log(&log_entry);
         }
 

@@ -89,11 +89,14 @@ impl<'g> CaveShape<'g> {
         // A feature whose origin chunk lies within FEATURE_REACH of the region can touch it, and
         // it looks up to FEATURE_REACH around that origin.
         let ext = region.grow(2 * FEATURE_REACH + 16).clip(world);
-        let h = (ext.max_z - ext.min_z + 1) as usize;
-        let mut surf = Vec::with_capacity((ext.max_x - ext.min_x + 1) as usize * h);
-        for x in ext.min_x..=ext.max_x {
-            for z in ext.min_z..=ext.max_z {
-                surf.push(surf_at(x, z));
+        let h = (ext.max_z - ext.min_z + 1).max(0) as usize;
+        let w = (ext.max_x - ext.min_x + 1).max(0) as usize;
+        let mut surf = Vec::with_capacity(w * h);
+        if ext.min_x <= ext.max_x && ext.min_z <= ext.max_z {
+            for x in ext.min_x..=ext.max_x {
+                for z in ext.min_z..=ext.max_z {
+                    surf.push(surf_at(x, z));
+                }
             }
         }
 

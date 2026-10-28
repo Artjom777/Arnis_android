@@ -155,6 +155,10 @@ pub fn carve_region(
     min_z: i32,
     max_z: i32,
 ) {
+    if min_x > max_x || min_z > max_z {
+        return;
+    }
+
     // The ore variants and the lava rims match the host rock, so the deepslate line goes first.
     deepslate::apply_region(editor, min_x, max_x, min_z, max_z);
 
@@ -182,8 +186,9 @@ pub fn carve_region(
     });
 
     // 1) surface heightmap, X-major.
-    let h = (max_z - min_z + 1) as usize;
-    let mut surf = Vec::with_capacity((max_x - min_x + 1) as usize * h);
+    let h = (max_z - min_z + 1).max(0) as usize;
+    let w = (max_x - min_x + 1).max(0) as usize;
+    let mut surf = Vec::with_capacity(w * h);
     for x in min_x..=max_x {
         for z in min_z..=max_z {
             surf.push(shape.surf(x, z));
@@ -541,6 +546,9 @@ pub fn seal_floating_fluid_region(
     min_z: i32,
     max_z: i32,
 ) {
+    if min_x > max_x || min_z > max_z {
+        return;
+    }
     let floor = terrain_floor_y();
     // Scan in parallel, then apply. The scan is the expensive half - a full-depth probe
     // of every column - while the writes are rare (only genuine floaters) and must stay

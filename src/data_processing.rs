@@ -1224,13 +1224,17 @@ pub fn generate_world_with_options(
             // max_* are exclusive; rect_from_min_max treats max as inclusive,
             // so subtract 1. Clamp to the world bbox so edge-tile halos don't
             // extend past world bounds.
-            let tile_xzbbox = XZBBox::rect_from_min_max(
-                (tile_bounds.min_x - tile::TILE_EDITOR_HALO).max(xzbbox.min_x()),
-                (tile_bounds.min_z - tile::TILE_EDITOR_HALO).max(xzbbox.min_z()),
-                (tile_bounds.max_x - 1 + tile::TILE_EDITOR_HALO).min(xzbbox.max_x()),
-                (tile_bounds.max_z - 1 + tile::TILE_EDITOR_HALO).min(xzbbox.max_z()),
-            )
-            .expect("Failed to create tile XZBBox");
+            let min_x = (tile_bounds.min_x - tile::TILE_EDITOR_HALO).max(xzbbox.min_x());
+            let min_z = (tile_bounds.min_z - tile::TILE_EDITOR_HALO).max(xzbbox.min_z());
+            let max_x = (tile_bounds.max_x - 1 + tile::TILE_EDITOR_HALO)
+                .min(xzbbox.max_x())
+                .max(min_x);
+            let max_z = (tile_bounds.max_z - 1 + tile::TILE_EDITOR_HALO)
+                .min(xzbbox.max_z())
+                .max(min_z);
+
+            let tile_xzbbox = XZBBox::rect_from_min_max(min_x, min_z, max_x, max_z)
+                .expect("Failed to create tile XZBBox");
 
             let mut tile_editor = WorldEditor::new_with_format_and_name(
                 PathBuf::new(),
@@ -1314,73 +1318,75 @@ pub fn generate_world_with_options(
             let g_max_x = (tile_bounds.max_x - 1).min(xzbbox.max_x());
             let g_min_z = tile_bounds.min_z.max(xzbbox.min_z());
             let g_max_z = (tile_bounds.max_z - 1).min(xzbbox.max_z());
-            ground_generation::generate_ground_region(
-                &mut tile_editor,
-                ground.as_ref(),
-                args,
-                &xzbbox,
-                &building_footprints,
-                &tunnel_footprint,
-                &bridge_surface,
-                g_min_x,
-                g_max_x,
-                g_min_z,
-                g_max_z,
-                false,
-            );
-            // Caves bring their own vanilla ore table, placed after the carve so no
-            // vein hangs in a cave; the plain veins only fill caveless ground.
-            if args.caves {
-                crate::caves::carve_region(
+
+            if g_min_x <= g_max_x && g_min_z <= g_max_z {
+                ground_generation::generate_ground_region(
                     &mut tile_editor,
+                    ground.as_ref(),
                     args,
                     &xzbbox,
-                    g_min_x,
-                    g_max_x,
-                    g_min_z,
-                    g_max_z,
-                );
-            } else if args.fillground {
-                crate::ore_generation::generate_ores_region(
-                    &mut tile_editor,
+                    &building_footprints,
+                    &tunnel_footprint,
+                    &bridge_surface,
                     g_min_x,
                     g_max_x,
                     g_min_z,
                     g_max_z,
                     false,
                 );
-            }
-            crate::water_depth::carve_lc_water_region(
-                &mut tile_editor,
-                ground.as_ref(),
-                &xzbbox,
-                &big_water_field,
-                &road_mask,
-                &tunnel_footprint,
-                &bridge_surface,
-                g_min_x,
-                g_max_x,
-                g_min_z,
-                g_max_z,
-            );
-
-            // Under eviction the post-merge rail-tunnel carve can't run (regions get freed),
-            // so carve in-tile now, after ground/fill so the interior isn't refilled.
-            if eviction_active {
-                railways::carve_rail_tunnel_interior(&mut tile_editor, &tile_rail_tunnel_points);
-                highways::carve_highway_tunnel_interior(&mut tile_editor, &tile_tunnel_cells);
-            }
-            // Seal floating water/lava last: the water-depth carve and the tunnel carves
-            // above can each undercut a water body over a cave. Under eviction this tile
-            // flushes soon, so it happens here; otherwise once after the merge.
-            if args.caves && eviction_active {
-                crate::caves::seal_floating_fluid_region(
+                // Caves bring their own vanilla ore table, placed after the carve so no
+                // vein hangs in a cave; the plain veins only fill caveless ground.
+                if args.caves {
+                    crate::caves::carve_region(
+                        &mut tile_editor,
+                        args,
+                        &xzbbox,
+                        g_min_x,
+                        g_max_x,
+                        g_min_z,
+                        g_max_z,
+                    );
+                } else if args.fillground {
+                    crate::ore_generation::generate_ores_region(
+                        &mut tile_editor,
+                        g_min_x,
+                        g_max_x,
+                        g_min_z,
+                        g_max_z,
+                        false,
+                    );
+                }
+                crate::water_depth::carve_lc_water_region(
                     &mut tile_editor,
+                    ground.as_ref(),
+                    &xzbbox,
+                    &big_water_field,
+                    &road_mask,
+                    &tunnel_footprint,
+                    &bridge_surface,
                     g_min_x,
                     g_max_x,
                     g_min_z,
                     g_max_z,
                 );
+
+                // Under eviction the post-merge rail-tunnel carve can't run (regions get freed),
+                // so carve in-tile now, after ground/fill so the interior isn't refilled.
+                if eviction_active {
+                    railways::carve_rail_tunnel_interior(&mut tile_editor, &tile_rail_tunnel_points);
+                    highways::carve_highway_tunnel_interior(&mut tile_editor, &tile_tunnel_cells);
+                }
+                // Seal floating water/lava last: the water-depth carve and the tunnel carves
+                // above can each undercut a water body over a cave.
+                if args.caves {
+                    crate::caves::seal_floating_fluid_region(
+                        &mut tile_editor,
+                        g_min_x,
+                        g_max_x,
+                        g_min_z,
+                        g_max_z,
+                    );
+                }
             }
 
             let tile_road_overrides = tile_editor.take_road_surface_overrides();
@@ -1388,6 +1394,20 @@ pub fn generate_world_with_options(
             // Emit on whole-percent steps only; the monotonic clamp
             // reconciles these with the merge-side emits.
             let placed = tiles_placed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if (placed * 50 / total_tiles) != ((placed - 1) * 50 / total_tiles) {
+                let pct = 20.0 + (placed as f64 / total_tiles as f64) * 50.0;
+                let msg = format!("Generating part {placed}/{total_tiles}...");
+                emit_gui_progress_update_ex(pct, &msg, eviction_active);
+            }
+
+            (
+                tile_idx,
+                tile_editor.into_world(),
+                tile_rail_tunnel_points,
+                tile_tunnel_cells,
+                tile_road_overrides,
+            )
+        };
             if (placed * 50 / total_tiles) != ((placed - 1) * 50 / total_tiles) {
                 let pct = 20.0 + (placed as f64 / total_tiles as f64) * 50.0;
                 let msg = format!("Generating part {placed}/{total_tiles}...");
@@ -1432,10 +1452,39 @@ pub fn generate_world_with_options(
                             merged = gate.1.wait(merged).unwrap_or_else(|p| p.into_inner());
                         }
                         drop(merged);
-                        if stop.load(Ordering::Relaxed)
-                            || tx.send((i, process_tile(entry))).is_err()
-                        {
+                        if stop.load(Ordering::Relaxed) {
                             break;
+                        }
+                        let tile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            process_tile(entry)
+                        }));
+                        match tile_result {
+                            Ok(res) => {
+                                if tx.send((i, Ok(res))).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(panic_err) => {
+                                let last_panic = crate::telemetry::get_last_panic();
+                                let panic_desc = if let Some(msg) = last_panic {
+                                    msg
+                                } else if let Some(s) = panic_err.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "Tile processing panic".to_string()
+                                };
+                                let err_msg = format!("Part {} failed: {}", entry.0 + 1, panic_desc);
+                                eprintln!("{err_msg}");
+                                #[cfg(target_os = "android")]
+                                {
+                                    crate::world_utils::write_android_crash_log(&format!("TILE ERROR: {err_msg}\n"));
+                                }
+                                abort_tile_pipeline(stop, gate);
+                                let _ = tx.send((i, Err(err_msg)));
+                                break;
+                            }
                         }
                     }
                 });
@@ -1452,7 +1501,8 @@ pub fn generate_world_with_options(
             let mut next_merge = 0usize;
             let merged = (|| -> Result<(), String> {
                 for (i, result) in &rx {
-                    pending.insert(i, result);
+                    let tile_output = result?;
+                    pending.insert(i, tile_output);
                     while let Some((
                         tile_idx,
                         tile_world,
@@ -1765,8 +1815,8 @@ pub fn generate_world_with_options(
     if !eviction_active && !tunnel_cells.is_empty() {
         highways::carve_highway_tunnel_interior(&mut editor, &tunnel_cells);
     }
-    // Seal floating water/lava as the final underground pass; eviction tiles did it in-tile.
-    if args.caves && !eviction_active {
+    // Seal floating water/lava as the final underground pass; parallel tiles did it in-tile.
+    if args.caves && !use_parallel_tiles {
         crate::caves::seal_floating_fluid_region(
             &mut editor,
             xzbbox.min_x(),

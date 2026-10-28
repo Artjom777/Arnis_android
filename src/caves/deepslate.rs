@@ -23,6 +23,9 @@ pub(super) fn apply_region(
     iter_min_z: i32,
     iter_max_z: i32,
 ) {
+    if iter_min_x > iter_max_x || iter_min_z > iter_max_z {
+        return;
+    }
     let seed = 0xDEE9_5147;
     let floor = terrain_floor_y();
     let band_floor = floor + BAND_FLOOR_OFFSET;

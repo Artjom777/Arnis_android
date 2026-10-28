@@ -247,6 +247,9 @@ pub fn generate_ground_region(
     iter_max_z: i32,
     show_progress: bool,
 ) {
+    if iter_min_x > iter_max_x || iter_min_z > iter_max_z {
+        return;
+    }
     // `Some` only off Earth, where the body's palette replaces land cover and
     // every Earth-only surface pass is off.
     let planetary_body = (!args.body.is_earth()).then_some(args.body);

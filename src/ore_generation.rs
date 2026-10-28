@@ -99,6 +99,9 @@ pub fn generate_ores_region(
     iter_max_z: i32,
     show_progress: bool,
 ) {
+    if iter_min_x > iter_max_x || iter_min_z > iter_max_z {
+        return;
+    }
     if show_progress {
         println!("{} Sprinkling ore veins...", "[6b/7]".bold());
         emit_gui_progress_update(89.0, "Sprinkling ore veins...");

@@ -1594,7 +1594,8 @@ fn gui_start_generation(
     tauri::async_runtime::spawn(async move {
         // Held until the worker finishes, on every path, so the globals stay this run's.
         let _generation_slot = generation_slot;
-        if let Err(e) = tokio::task::spawn_blocking(move || {
+        let task_result = tokio::task::spawn_blocking(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let world_path = if one_world {
                 one_world_dir(&selected_world, &one_world_name)
             } else {
@@ -2153,10 +2154,40 @@ fn gui_start_generation(
                     Err(e.to_string())
                 }
             }
+            }));
+            match res {
+                Ok(inner) => inner,
+                Err(panic_payload) => {
+                    let last_panic = crate::telemetry::get_last_panic();
+                    let panic_desc = if let Some(p) = last_panic {
+                        p
+                    } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic in generation task".to_string()
+                    };
+                    let err_msg = format!("Panic: {panic_desc}");
+                    eprintln!("{err_msg}");
+                    #[cfg(target_os = "android")]
+                    {
+                        crate::world_utils::write_android_crash_log(&format!("TASK PANIC: {err_msg}\n"));
+                    }
+                    emit_gui_error(&err_msg);
+                    Err(err_msg)
+                }
+            }
         })
-        .await
-        {
-            let error_msg = format!("Error in blocking task: {e}");
+        .await;
+
+        if let Err(e) = task_result {
+            let last_panic = crate::telemetry::get_last_panic();
+            let error_msg = if let Some(p) = last_panic {
+                format!("Panic: {p}")
+            } else {
+                format!("Error in blocking task: {e}")
+            };
             eprintln!("{error_msg}");
             emit_gui_error(&error_msg);
             // Session lock will be automatically released when the task fails
