@@ -713,6 +713,8 @@ pub fn generate_world_with_options(
     editor.set_game_settings(args.gamemode, args.world_time);
     editor.set_start_with_map(args.map_item);
     editor.set_map_decals(world_format == WorldFormat::JavaAnvil);
+
+    let mut bedrock_writer: Option<BedrockWriter> = None;
     editor.set_projection_info(&args.projection.to_string(), args.scale);
     if let Some(run) = one_world {
         editor.set_merge_into_existing(crate::world_utils::WorldLayout::of(&run.world_dir));
@@ -1085,7 +1087,6 @@ pub fn generate_world_with_options(
     let mut evicted_regions: HashSet<(i32, i32)> = HashSet::new();
     // Background writer for eviction; None unless eviction is active.
     let mut flush_worker: Option<FlushWorker> = None;
-    let mut bedrock_writer: Option<BedrockWriter> = None;
     // The spawn's region is kept resident (never evicted) so the finalize map-item lands on
     // real ground. Resolved exactly like the finalize call; spawn doesn't change during generation.
     // An explicit spawn wins over level.dat, which the CLI only updates after generation.

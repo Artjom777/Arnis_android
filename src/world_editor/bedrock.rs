@@ -3,7 +3,7 @@
 //! This module handles saving worlds in the Bedrock Edition format,
 //! producing .mcworld files that can be imported into Minecraft Bedrock.
 
-use super::common::{ChunkToModify, SectionToModify, WorldToModify};
+use super::common::{ChunkToModify, RegionToModify, SectionToModify, WorldToModify};
 use super::WorldMetadata;
 use crate::bedrock_block_map::{
     to_bedrock_block_with_properties, BedrockBlock, BedrockBlockStateValue,
