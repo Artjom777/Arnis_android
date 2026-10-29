@@ -425,7 +425,7 @@ impl BedrockWriter {
 
             let encoded: Vec<ChunkRecords> = chunk_batch
                 .par_iter()
-                .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                .map(|(abs_x, abs_z, chunk)| Self::encode_chunk_records(*abs_x, *abs_z, chunk))
                 .collect::<Result<_, _>>()?;
 
             drop(chunk_batch);
@@ -791,7 +791,7 @@ impl BedrockWriter {
 
                 let encoded: Vec<ChunkRecords> = chunk_batch
                     .par_iter()
-                    .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                    .map(|(abs_x, abs_z, chunk)| Self::encode_chunk_records(*abs_x, *abs_z, chunk))
                     .collect::<Result<_, _>>()?;
 
                 drop(chunk_batch);
@@ -832,7 +832,6 @@ impl BedrockWriter {
 
     /// Encodes every LevelDB record for one chunk: version, Data3D, subchunks, then entities.
     fn encode_chunk_records(
-        &self,
         abs_chunk_x: i32,
         abs_chunk_z: i32,
         chunk: &ChunkToModify,
@@ -848,11 +847,11 @@ impl BedrockWriter {
         // Data3D (heightmap + biomes), required for a valid chunk.
         records.push((
             build_chunk_key_bytes(chunk_pos, Dimension::Overworld, KeyTypeTag::Data3D, None),
-            self.create_data3d(chunk),
+            Self::create_data3d(chunk),
         ));
         // Subchunks.
         for (&section_y, section) in &chunk.sections {
-            let bytes = self.encode_subchunk(section, section_y)?;
+            let bytes = Self::encode_subchunk(section, section_y)?;
             records.push((
                 build_chunk_key_bytes(
                     chunk_pos,
@@ -864,14 +863,14 @@ impl BedrockWriter {
             ));
         }
         // Block entities and entities.
-        if let Some(record) = self.encode_compound_list_record(
+        if let Some(record) = Self::encode_compound_list_record(
             chunk_pos,
             KeyTypeTag::BlockEntity,
             chunk.other.get("block_entities"),
         )? {
             records.push(record);
         }
-        if let Some(record) = self.encode_compound_list_record(
+        if let Some(record) = Self::encode_compound_list_record(
             chunk_pos,
             KeyTypeTag::Entity,
             chunk.other.get("entities"),
@@ -884,7 +883,6 @@ impl BedrockWriter {
 
     /// Encodes a block-entity / entity record as a (key, value) pair, or None if empty.
     fn encode_compound_list_record(
-        &self,
         chunk_pos: Vec2<i32>,
         key_type: KeyTypeTag,
         value: Option<&Value>,
@@ -915,7 +913,7 @@ impl BedrockWriter {
     /// Creates a Data3D record containing heightmap and biome data.
     ///
     /// Format: 512 bytes heightmap (256 x i16 LE) + 28 bytes minimal biome data
-    fn create_data3d(&self, _chunk: &ChunkToModify) -> Vec<u8> {
+    fn create_data3d(_chunk: &ChunkToModify) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(540);
 
         // Heightmap: 256 entries (16x16) as i16 LE, fixed height of 4 for flat world
@@ -931,7 +929,6 @@ impl BedrockWriter {
 
     /// Encode a section into Bedrock subchunk format
     fn encode_subchunk(
-        &self,
         section: &SectionToModify,
         y_index: i8,
     ) -> Result<Vec<u8>, BedrockSaveError> {
@@ -947,7 +944,7 @@ impl BedrockWriter {
         buffer.write_i8(y_index)?;
 
         // Build palette and block indices
-        let (palette, indices) = self.build_palette_and_indices(section)?;
+        let (palette, indices) = Self::build_palette_and_indices(section)?;
 
         // Calculate bits per block using valid Bedrock values: {1, 2, 3, 4, 5, 6, 8, 16}
         let bits_per_block = bedrock_bits_per_block(palette.len() as u32);
@@ -1011,7 +1008,6 @@ impl BedrockWriter {
     /// Also propagates stored block properties (e.g., stair facing/shape) to the
     /// Bedrock palette, ensuring blocks with non-default states are serialized correctly.
     fn build_palette_and_indices(
-        &self,
         section: &SectionToModify,
     ) -> Result<(Vec<BedrockBlock>, [u16; 4096]), BedrockSaveError> {
         let mut palette: Vec<BedrockBlock> = Vec::new();
