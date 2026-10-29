@@ -594,6 +594,7 @@ impl Drop for AbortOnPanic<'_> {
 /// Whether to stream regions to disk (lower peak RAM) for `num_tiles` tiles.
 /// When the resident world would crowd available RAM or the user-configured RAM limit,
 /// regions stream to disk, bounding memory so arbitrarily large areas succeed without OOM.
+#[allow(dead_code)]
 fn should_stream_to_disk(num_tiles: usize, available_mb: u64, fillground: bool) -> bool {
     if let Some(forced) = std::env::var("ARNIS_STREAM_TO_DISK").ok().as_deref() {
         return forced == "1";
@@ -1155,8 +1156,10 @@ pub fn generate_world_with_options(
         } else {
             available_memory_mb()
         };
-        eviction_active = matches!(world_format, WorldFormat::JavaAnvil)
-            && should_stream_to_disk(tiles.len(), available_mb, args.fillground);
+        eviction_active = matches!(
+            world_format,
+            WorldFormat::JavaAnvil | WorldFormat::BedrockMcWorld
+        );
 
         // Regions any 3D placement may write to: kept resident (not evicted in-loop)
         // so the post-merge placement pass lands in RAM, then flushed at finalize.
@@ -1172,7 +1175,7 @@ pub fn generate_world_with_options(
             HashSet::new()
         };
 
-        if eviction_active {
+        if eviction_active && matches!(world_format, WorldFormat::JavaAnvil) {
             let (flush_threads, flush_queue) = crate::world_editor::flush_pool_params(
                 tile_batch_size,
                 available_mb,
@@ -1577,8 +1580,13 @@ pub fn generate_world_with_options(
                                         );
                                         if let Some(w) = flush_worker.as_ref() {
                                             editor.flush_region_via(w, d.0, d.1)?;
+                                        } else if world_format == WorldFormat::BedrockMcWorld {
+                                            editor.flush_bedrock_region(d.0, d.1)?;
                                         }
                                         evicted_regions.insert(d);
+                                        if cfg!(target_os = "android") {
+                                            crate::world_utils::collect_memory(false);
+                                        }
                                     }
                                 }
                             }
@@ -1872,6 +1880,8 @@ pub fn generate_world_with_options(
             crate::building_facades::flush_region(&mut editor, rx, rz);
             if let Some(w) = flush_worker.as_ref() {
                 editor.flush_region_via(w, rx, rz)?;
+            } else if world_format == WorldFormat::BedrockMcWorld {
+                editor.flush_bedrock_region(rx, rz)?;
             }
             evicted_regions.insert((rx, rz));
         }

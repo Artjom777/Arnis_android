@@ -269,6 +269,9 @@ pub struct BedrockWriter {
     game_mode: crate::args::GameMode,
     world_time: i64,
     start_with_map: bool,
+    db: Option<DB>,
+    prepared: bool,
+    flushed_chunks_count: usize,
 }
 
 impl BedrockWriter {
@@ -380,7 +383,61 @@ impl BedrockWriter {
             game_mode,
             world_time,
             start_with_map,
+            db: None,
+            prepared: false,
+            flushed_chunks_count: 0,
         }
+    }
+
+    /// Ensures the LevelDB database in the staging directory is open for streaming writes.
+    pub fn ensure_db_open(&mut self) -> Result<&mut DB, BedrockSaveError> {
+        if self.db.is_none() {
+            self.prepare_output_dir()?;
+            let db_path = self.output_dir.join("db");
+            let mut opts = bedrock_db_options();
+            opts.create_if_missing = true;
+            let db = DB::open(db_path.into_boxed_path(), opts)
+                .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+            self.db = Some(db);
+        }
+        Ok(self.db.as_mut().unwrap())
+    }
+
+    /// Stream a single sealed region directly to LevelDB on disk and release its memory.
+    pub fn flush_single_region(
+        &mut self,
+        region_x: i32,
+        region_z: i32,
+        mut region: RegionToModify,
+    ) -> Result<(), BedrockSaveError> {
+        self.flushed_chunks_count += region.chunks.len();
+        let db = self.ensure_db_open()?;
+        const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
+        let chunk_coords: Vec<(i32, i32)> = region.chunks.keys().copied().collect();
+        for chunk_coord_batch in chunk_coords.chunks(ENCODE_BATCH_CHUNKS) {
+            let mut chunk_batch: Vec<(i32, i32, ChunkToModify)> =
+                Vec::with_capacity(chunk_coord_batch.len());
+            for &coord in chunk_coord_batch {
+                if let Some(chunk) = region.chunks.remove(&coord) {
+                    chunk_batch.push((region_x * 32 + coord.0, region_z * 32 + coord.1, chunk));
+                }
+            }
+
+            let encoded: Vec<ChunkRecords> = chunk_batch
+                .par_iter()
+                .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                .collect::<Result<_, _>>()?;
+
+            drop(chunk_batch);
+
+            for records in encoded {
+                for (key, value) in &records {
+                    db.put(key, value)
+                        .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Writes the world to disk
@@ -426,7 +483,10 @@ impl BedrockWriter {
     }
 
     /// Prepares the staging directory, reusing leftovers but never deleting foreign data.
-    fn prepare_output_dir(&self) -> Result<(), BedrockSaveError> {
+    fn prepare_output_dir(&mut self) -> Result<(), BedrockSaveError> {
+        if self.prepared {
+            return Ok(());
+        }
         if self.output_dir.exists() {
             if !is_arnis_staging_dir(&self.output_dir) {
                 return Err(BedrockSaveError::Io(std::io::Error::new(
@@ -447,6 +507,7 @@ impl BedrockWriter {
         fs::create_dir_all(&self.output_dir)?;
         fs::write(self.output_dir.join(STAGING_MARKER), b"")?;
         // db directory will be created by LevelDB
+        self.prepared = true;
         Ok(())
     }
 
@@ -673,14 +734,16 @@ impl BedrockWriter {
         Ok(())
     }
 
-    fn write_chunks_to_db(&self, world: &mut WorldToModify) -> Result<(), BedrockSaveError> {
-        let db_path = self.output_dir.join("db");
-
-        // Open LevelDB once for all writes (blocks, entities, block entities)
-        let mut opts = bedrock_db_options();
-        opts.create_if_missing = true;
-        let mut db = DB::open(db_path.into_boxed_path(), opts)
-            .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+    fn write_chunks_to_db(&mut self, world: &mut WorldToModify) -> Result<(), BedrockSaveError> {
+        let mut db = if let Some(db) = self.db.take() {
+            db
+        } else {
+            let db_path = self.output_dir.join("db");
+            let mut opts = bedrock_db_options();
+            opts.create_if_missing = true;
+            DB::open(db_path.into_boxed_path(), opts)
+                .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?
+        };
 
         // Chunks per parallel-encode window: 64 on Android, 128 elsewhere.
         // Bounds transient memory burst while giving Rayon threads plenty of work.
@@ -693,6 +756,8 @@ impl BedrockWriter {
             .sum();
 
         if total_chunks == 0 {
+            // Drop db handle to commit WAL/memtable and release file lock before packaging
+            drop(db);
             return Ok(());
         }
 
@@ -995,11 +1060,12 @@ impl BedrockWriter {
         xzbbox: &XZBBox,
         llbbox: &LLBBox,
     ) -> Result<(), BedrockSaveError> {
-        let chunk_count = world
-            .regions
-            .values()
-            .map(|region| region.chunks.len())
-            .sum();
+        let chunk_count: usize = self.flushed_chunks_count
+            + world
+                .regions
+                .values()
+                .map(|region| region.chunks.len())
+                .sum::<usize>();
 
         let metadata = BedrockMetadata {
             world: WorldMetadata {
@@ -1625,7 +1691,7 @@ mod tests {
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("notes.txt"), b"not ours").unwrap();
 
-        let writer = test_writer(staging.with_extension("mcworld"));
+        let mut writer = test_writer(staging.with_extension("mcworld"));
         assert!(writer.prepare_output_dir().is_err());
         assert!(staging.join("notes.txt").is_file());
     }
@@ -1638,7 +1704,7 @@ mod tests {
         fs::write(staging.join("levelname.txt"), b"Someone's World").unwrap();
         fs::write(staging.join("db").join("CURRENT"), b"leveldb").unwrap();
 
-        let writer = test_writer(staging.with_extension("mcworld"));
+        let mut writer = test_writer(staging.with_extension("mcworld"));
         assert!(writer.prepare_output_dir().is_err());
         assert!(staging.join("db").join("CURRENT").is_file());
     }
@@ -1651,7 +1717,7 @@ mod tests {
         fs::write(staging.join(STAGING_MARKER), b"").unwrap();
         fs::write(staging.join("levelname.txt"), b"Arnis World: Old").unwrap();
 
-        let writer = test_writer(staging.with_extension("mcworld"));
+        let mut writer = test_writer(staging.with_extension("mcworld"));
         writer.prepare_output_dir().unwrap();
         assert!(staging.join(STAGING_MARKER).is_file());
         assert!(!staging.join("levelname.txt").exists());
@@ -1663,7 +1729,7 @@ mod tests {
         let staging = tmp.path().join("Arnis Test");
         fs::create_dir_all(&staging).unwrap();
 
-        let writer = test_writer(staging.with_extension("mcworld"));
+        let mut writer = test_writer(staging.with_extension("mcworld"));
         writer.prepare_output_dir().unwrap();
         assert!(staging.join(STAGING_MARKER).is_file());
     }
