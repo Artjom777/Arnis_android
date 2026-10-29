@@ -232,7 +232,6 @@ pub struct WorldEditor<'a> {
     bedrock_level_name: Option<String>,
     bedrock_spawn_point: Option<(i32, i32)>,
     bedrock_extend_height: bool,
-    pub(crate) bedrock_writer: Option<BedrockWriter>,
     /// Optional level name for Luanti worlds
     luanti_level_name: Option<String>,
     /// Optional spawn point for Luanti worlds (x, z coordinates)
@@ -298,7 +297,6 @@ impl<'a> WorldEditor<'a> {
             bedrock_level_name: None,
             bedrock_spawn_point: None,
             bedrock_extend_height: false,
-            bedrock_writer: None,
             luanti_level_name: None,
             luanti_spawn_point: None,
             luanti_ground_level: -62,
@@ -352,7 +350,6 @@ impl<'a> WorldEditor<'a> {
             bedrock_level_name,
             bedrock_spawn_point,
             bedrock_extend_height,
-            bedrock_writer: None,
             luanti_level_name: None,
             luanti_spawn_point: None,
             luanti_ground_level: -62,
@@ -406,7 +403,6 @@ impl<'a> WorldEditor<'a> {
             bedrock_level_name: None,
             bedrock_spawn_point: None,
             bedrock_extend_height: false,
-            bedrock_writer: None,
             luanti_level_name: level_name,
             luanti_spawn_point: spawn_point,
             luanti_ground_level: ground_level,
@@ -1096,38 +1092,43 @@ impl<'a> WorldEditor<'a> {
         }
     }
 
+    /// Creates a BedrockWriter configured for this world's output directory and settings.
+    pub(crate) fn create_bedrock_writer(&self) -> BedrockWriter {
+        let level_name = self.bedrock_level_name.clone().unwrap_or_else(|| {
+            self.world_dir
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Arnis World")
+                .to_string()
+        });
+        BedrockWriter::new(
+            self.world_dir.clone(),
+            level_name,
+            self.bedrock_spawn_point,
+            self.ground.clone(),
+            self.bedrock_extend_height,
+            self.projection.clone(),
+            self.scale,
+            self.game_mode,
+            self.world_time,
+            self.start_with_map,
+        )
+    }
+
     /// Evict one Bedrock region (stream-to-disk): encode its chunks and write them directly
     /// into the staging LevelDB, then drop the region to keep resident memory flat.
-    pub(crate) fn flush_bedrock_region(&mut self, rx: i32, rz: i32) -> Result<bool, String> {
+    pub(crate) fn flush_bedrock_region_via(
+        &mut self,
+        writer: &mut BedrockWriter,
+        rx: i32,
+        rz: i32,
+    ) -> Result<bool, String> {
         if self.format != WorldFormat::BedrockMcWorld {
             return Ok(false);
         }
         let Some(region) = self.world.regions.remove(&(rx, rz)) else {
             return Ok(false);
         };
-        if self.bedrock_writer.is_none() {
-            let level_name = self.bedrock_level_name.clone().unwrap_or_else(|| {
-                self.world_dir
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Arnis World")
-                    .to_string()
-            });
-            let writer = BedrockWriter::new(
-                self.world_dir.clone(),
-                level_name,
-                self.bedrock_spawn_point,
-                self.ground.clone(),
-                self.bedrock_extend_height,
-                self.projection.clone(),
-                self.scale,
-                self.game_mode,
-                self.world_time,
-                self.start_with_map,
-            );
-            self.bedrock_writer = Some(writer);
-        }
-        let writer = self.bedrock_writer.as_mut().unwrap();
         writer
             .flush_single_region(rx, rz, region)
             .map_err(|e| format!("Failed to flush Bedrock region ({rx}, {rz}): {e:?}"))?;
@@ -2362,6 +2363,15 @@ impl<'a> WorldEditor<'a> {
     /// before returning so the GUI is notified regardless of how the caller handles
     /// the `Result`.
     pub fn save(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.save_with_bedrock_writer(None)
+    }
+
+    /// Saves all changes made to the world by writing to the appropriate format,
+    /// optionally reusing an in-progress BedrockWriter that has already ingested streamed regions.
+    pub fn save_with_bedrock_writer(
+        &mut self,
+        existing_bedrock_writer: Option<BedrockWriter>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!(
             "Generating world for: {}",
             match self.format {
@@ -2416,7 +2426,7 @@ impl<'a> WorldEditor<'a> {
                 }
                 self.finish_voxy();
             }
-            WorldFormat::BedrockMcWorld => self.save_bedrock()?,
+            WorldFormat::BedrockMcWorld => self.save_bedrock(existing_bedrock_writer)?,
             WorldFormat::LuantiWorld => {
                 if let Err(e) = luanti::save_luanti_world(
                     &self.world,
@@ -2464,7 +2474,10 @@ impl<'a> WorldEditor<'a> {
         }
     }
 
-    fn save_bedrock(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn save_bedrock(
+        &mut self,
+        existing_writer: Option<BedrockWriter>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("{} Saving Bedrock world...", "[7/7]".bold());
         emit_gui_progress_update(90.0, "Saving Bedrock world...");
 
@@ -2484,7 +2497,13 @@ impl<'a> WorldEditor<'a> {
 
         crate::world_utils::collect_memory(true);
 
-        if let Err(error) = self.save_bedrock_internal() {
+        let res = if let Some(mut writer) = existing_writer {
+            writer.write_world(&mut self.world, self.xzbbox, &self.llbbox)
+        } else {
+            self.save_bedrock_internal()
+        };
+
+        if let Err(error) = res {
             let user_msg = format!("Failed to save Bedrock world: {error}");
             eprintln!("{user_msg}");
             let log_entry = format!("BEDROCK ERROR: {user_msg}\n");
@@ -2497,33 +2516,28 @@ impl<'a> WorldEditor<'a> {
     }
 
     fn save_bedrock_internal(&mut self) -> Result<(), BedrockSaveError> {
-        let mut writer = if let Some(writer) = self.bedrock_writer.take() {
-            writer
-        } else {
-            // Use the stored level name if available, otherwise extract from path
-            let level_name = self.bedrock_level_name.clone().unwrap_or_else(|| {
-                self.world_dir
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("Arnis World")
-                    .to_string()
-            });
+        // Use the stored level name if available, otherwise extract from path
+        let level_name = self.bedrock_level_name.clone().unwrap_or_else(|| {
+            self.world_dir
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Arnis World")
+                .to_string()
+        });
 
-            BedrockWriter::new(
-                self.world_dir.clone(),
-                level_name,
-                self.bedrock_spawn_point,
-                self.ground.take(),
-                self.bedrock_extend_height,
-                self.projection.clone(),
-                self.scale,
-                self.game_mode,
-                self.world_time,
-                self.start_with_map,
-            )
-        };
-
-        writer.write_world(&mut self.world, self.xzbbox, &self.llbbox)
+        BedrockWriter::new(
+            self.world_dir.clone(),
+            level_name,
+            self.bedrock_spawn_point,
+            self.ground.take(),
+            self.bedrock_extend_height,
+            self.projection.clone(),
+            self.scale,
+            self.game_mode,
+            self.world_time,
+            self.start_with_map,
+        )
+        .write_world(&mut self.world, self.xzbbox, &self.llbbox)
     }
 
     /// Saves world metadata to a JSON file
