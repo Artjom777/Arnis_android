@@ -591,10 +591,17 @@ impl Drop for AbortOnPanic<'_> {
     }
 }
 
-/// Whether to stream regions to disk. All artificial memory limits have been removed;
-/// regions remain in memory unless explicitly forced via ARNIS_STREAM_TO_DISK=1.
-fn should_stream_to_disk(_num_regions: usize, _available_mb: u64, _fillground: bool) -> bool {
-    matches!(std::env::var("ARNIS_STREAM_TO_DISK").ok().as_deref(), Some("1"))
+/// Whether to stream regions to disk (lower peak RAM) for `num_regions` regions.
+/// When the resident world would crowd available RAM or the user-configured RAM limit,
+/// regions stream to disk, bounding memory so arbitrarily large areas succeed without OOM.
+fn should_stream_to_disk(num_regions: usize, available_mb: u64, fillground: bool) -> bool {
+    if let Some(forced) = std::env::var("ARNIS_STREAM_TO_DISK").ok().as_deref() {
+        return forced == "1";
+    }
+    const BASE_MB: u64 = 400;
+    let est_peak_mb =
+        BASE_MB + crate::world_editor::per_region_estimate_mb(fillground) * num_regions as u64;
+    available_mb > 0 && est_peak_mb * 100 > available_mb * 60
 }
 
 /// Free RAM in MB, accounting for physical RAM and swap/zRAM on Linux/Android.
@@ -1086,8 +1093,9 @@ pub fn generate_world_with_options(
     });
 
     // Decide between sequential and parallel processing based on world size.
-    // Tile subdivision is aligned to 512-block Minecraft region boundaries.
-    let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
+    // Tile size is configurable (clamped safely between 256 and 2048).
+    let tile_size = args.tile_size.clamp(256, 2048);
+    let tiles = tile::create_tiles(&xzbbox, tile_size);
 
     // If tiled_generation is enabled (default) and there are 2 or more tiles,
     // process the world in parts (tiles) and assemble them into 1 world.
@@ -1108,13 +1116,16 @@ pub fn generate_world_with_options(
         // Tiles are processed in batches (one tile per rayon thread) to cap peak memory.
         // Without batching, all tile WorldToModify structs would be in memory at once,
         // which can exceed RAM for large areas and cause disk thrashing.
-        let tile_batch_size = if cfg!(target_os = "android") {
+        let max_concurrency = if args.ram_limit_mb > 0 && args.ram_limit_mb <= 2048 {
+            1
+        } else if cfg!(target_os = "android") {
             rayon::current_num_threads().clamp(1, 2)
         } else {
             rayon::current_num_threads().max(1)
         };
+        let tile_batch_size = max_concurrency;
         println!(
-            "  Processing {} tiles across {tile_batch_size} threads...",
+            "  Processing {} tiles across {tile_batch_size} threads (tile size: {tile_size}x{tile_size})...",
             tiles.len()
         );
 
@@ -1129,11 +1140,15 @@ pub fn generate_world_with_options(
         );
 
         // Stream-to-disk: flush+evict each region once its owner + 8 neighbour tiles merge,
-        // auto-enabled when the resident world would crowd available RAM. Java only; 3D models
-        // are kept via region deferral.
+        // auto-enabled when the resident world would crowd available RAM or user-configured limit.
+        // Java only; 3D models are kept via region deferral.
         // Read at the decision point: the precompute above allocates heavily, and an
         // optimistic figure would skip streaming in exactly the runs that need it.
-        let available_mb = available_memory_mb();
+        let available_mb = if args.ram_limit_mb > 0 {
+            args.ram_limit_mb
+        } else {
+            available_memory_mb()
+        };
         eviction_active = matches!(world_format, WorldFormat::JavaAnvil)
             && should_stream_to_disk(tiles.len(), available_mb, args.fillground);
 
@@ -1216,7 +1231,6 @@ pub fn generate_world_with_options(
         // Counted per tile, not per element: measured per-tile cost is near flat
         // (the area work dominates), so tile count tracks time despite LPT order.
         let mut tiles_merged = 0usize;
-        let mut last_emitted_pct = 20.0_f64;
         // Placement-side ticks so the bar moves before the first tile merges.
         let tiles_placed = std::sync::atomic::AtomicUsize::new(0);
         // Phase 1: build one tile on its own editor.
@@ -1391,14 +1405,17 @@ pub fn generate_world_with_options(
 
             let tile_road_overrides = tile_editor.take_road_surface_overrides();
 
-            // Emit on whole-percent steps only; the monotonic clamp
-            // reconciles these with the merge-side emits.
+            // Emit progress with tile counters so the user sees live tile completion
             let placed = tiles_placed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if (placed * 50 / total_tiles) != ((placed - 1) * 50 / total_tiles) {
-                let pct = 20.0 + (placed as f64 / total_tiles as f64) * 50.0;
-                let msg = format!("Generating part {placed}/{total_tiles}...");
-                emit_gui_progress_update_ex(pct, &msg, eviction_active);
-            }
+            let pct = 20.0 + (placed as f64 / total_tiles as f64) * 25.0;
+            let msg = format!("Generating part {placed}/{total_tiles}...");
+            crate::progress::emit_gui_progress_update_tiled(
+                pct,
+                &msg,
+                eviction_active,
+                Some(placed),
+                Some(total_tiles),
+            );
 
             (
                 tile_idx,
@@ -1566,21 +1583,24 @@ pub fn generate_world_with_options(
                             tunnel_cells.extend(tile_tunnel_cells);
                         }
 
-                        // Step 20%->70% per merged tile, throttled to whole-percent steps.
+                        // Step 45%->70% per merged tile.
                         tiles_merged += 1;
-                        let pct = 20.0 + (tiles_merged as f64 / total_tiles as f64) * 50.0;
-                        if pct - last_emitted_pct >= 1.0 {
-                            let msg = format!("Assembling part {tiles_merged}/{total_tiles} into 1 world...");
-                            emit_gui_progress_update_ex(pct, &msg, eviction_active);
-                            last_emitted_pct = pct;
-                        }
+                        let pct = 45.0 + (tiles_merged as f64 / total_tiles as f64) * 25.0;
+                        let msg = format!("Assembling part {tiles_merged}/{total_tiles} into 1 world...");
+                        crate::progress::emit_gui_progress_update_tiled(
+                            pct,
+                            &msg,
+                            eviction_active,
+                            Some(tiles_merged),
+                            Some(total_tiles),
+                        );
                         merge_dur += merge_start.elapsed();
 
                         next_merge += 1;
                         *gate.0.lock().unwrap_or_else(|p| p.into_inner()) = next_merge;
                         gate.1.notify_all();
 
-                        if cfg!(target_os = "android") && (tiles_merged % 4 == 0 || tiles_merged == total_tiles) {
+                        if cfg!(target_os = "android") || args.ram_limit_mb > 0 {
                             crate::world_utils::collect_memory(false);
                         }
                     }

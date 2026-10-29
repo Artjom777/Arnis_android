@@ -58,19 +58,23 @@ const MAX_LINEAR_HALF_WIDTH_M: f64 = 40.0;
 pub fn create_tiles(xzbbox: &XZBBox, tile_size: i32) -> Vec<TileBounds> {
     let mut tiles = Vec::new();
 
-    // Align tile grid to region boundaries (multiples of 512 from world origin)
-    // This ensures each tile maps cleanly to Minecraft regions
-    let aligned_min_x = (xzbbox.min_x() >> 9) << 9; // floor to nearest 512
-    let aligned_min_z = (xzbbox.min_z() >> 9) << 9;
-    let aligned_max_x = ((xzbbox.max_x() + 512) >> 9) << 9; // ceil to nearest 512 region
-    let aligned_max_z = ((xzbbox.max_z() + 512) >> 9) << 9;
+    // Guard tile_size to safe, valid bounds (256..=2048)
+    let safe_tile_size = tile_size.clamp(256, 2048);
+
+    // Align tile grid to tile_size boundaries using Euclidean division
+    // to handle positive and negative world coordinates consistently
+    let step = safe_tile_size;
+    let aligned_min_x = xzbbox.min_x().div_euclid(step) * step;
+    let aligned_min_z = xzbbox.min_z().div_euclid(step) * step;
+    let aligned_max_x = (xzbbox.max_x() + step).div_euclid(step) * step;
+    let aligned_max_z = (xzbbox.max_z() + step).div_euclid(step) * step;
 
     let mut z = aligned_min_z;
     while z < aligned_max_z {
         let mut x = aligned_min_x;
         while x < aligned_max_x {
-            let tile_max_x = (x + tile_size).min(aligned_max_x);
-            let tile_max_z = (z + tile_size).min(aligned_max_z);
+            let tile_max_x = (x + safe_tile_size).min(aligned_max_x);
+            let tile_max_z = (z + safe_tile_size).min(aligned_max_z);
 
             // Only create a tile if it overlaps with the actual world bbox
             if tile_max_x > xzbbox.min_x()
@@ -86,9 +90,9 @@ pub fn create_tiles(xzbbox: &XZBBox, tile_size: i32) -> Vec<TileBounds> {
                 });
             }
 
-            x += tile_size;
+            x += safe_tile_size;
         }
-        z += tile_size;
+        z += safe_tile_size;
     }
 
     tiles

@@ -111,15 +111,30 @@ pub fn emit_gui_progress_update(progress: f64, message: &str) {
 /// ~instant when streaming, a real save otherwise). Additive payload field;
 /// only the two terrain emits use it, all other sites stay on the plain fn.
 pub fn emit_gui_progress_update_ex(progress: f64, message: &str, streaming: bool) {
+    emit_gui_progress_update_tiled(progress, message, streaming, None, None);
+}
+
+/// Emits progress with optional tile counters (done / total) for tiled generation.
+pub fn emit_gui_progress_update_tiled(
+    progress: f64,
+    message: &str,
+    streaming: bool,
+    tiles_done: Option<usize>,
+    tiles_total: Option<usize>,
+) {
     if emits_suppressed(progress, message) {
         return;
     }
     if let Some(window) = get_main_window() {
-        let payload = json!({
+        let mut payload = json!({
             "progress": clamp_progress(progress),
             "message": message,
             "streaming": streaming
         });
+        if let (Some(done), Some(total)) = (tiles_done, tiles_total) {
+            payload["tiles_done"] = json!(done);
+            payload["tiles_total"] = json!(total);
+        }
         if let Err(e) = window.emit("progress-update", payload) {
             eprintln!("Failed to emit progress event: {e}");
         }

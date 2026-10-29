@@ -833,14 +833,80 @@ function etaLsRate(s) {
   return slope > 0 ? slope * 1000 : null;
 }
 
+let generationTimerHandle = null;
+let generationStartTime = null;
+
+function formatClockTime(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) {
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h}:${remM.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+}
+
+function startGenerationTimer() {
+  if (generationTimerHandle) clearInterval(generationTimerHandle);
+  generationStartTime = performance.now();
+  generationTimerHandle = setInterval(tickGenerationTimer, 1000);
+  renderTimerDisplay();
+}
+
+function stopGenerationTimer(success) {
+  if (generationTimerHandle) {
+    clearInterval(generationTimerHandle);
+    generationTimerHandle = null;
+  }
+  if (generationStartTime != null) {
+    const elapsedSec = Math.floor((performance.now() - generationStartTime) / 1000);
+    const el = document.getElementById("progress-eta");
+    if (el) {
+      if (success) {
+        el.textContent = `✓ ${formatClockTime(elapsedSec)}`;
+        el.classList.add("visible");
+      }
+    }
+    generationStartTime = null;
+  }
+}
+
+function tickGenerationTimer() {
+  if (generationStartTime == null) return;
+  renderTimerDisplay();
+}
+
+function renderTimerDisplay() {
+  const el = document.getElementById("progress-eta");
+  if (!el || generationStartTime == null) return;
+  const elapsedSec = Math.floor((performance.now() - generationStartTime) / 1000);
+  const elapsedStr = formatClockTime(elapsedSec);
+
+  let displayText = elapsedStr;
+  if (eta && eta.shown != null && eta.shown > 0) {
+    const etaStr = formatEtaDuration(Math.max(1, eta.shown));
+    displayText = `${elapsedStr} (~${etaStr})`;
+  }
+
+  el.textContent = displayText;
+  el.setAttribute("aria-label", `Time: ${displayText}`);
+  el.classList.add("visible");
+}
+
 function resetEta() {
   if (eta && eta.tickHandle) clearInterval(eta.tickHandle);
   eta = null;
-  const el = document.getElementById("progress-eta");
-  if (el) {
-    el.classList.remove("visible");
-    el.textContent = "";
-    el.removeAttribute("aria-label");
+  if (generationStartTime != null) {
+    renderTimerDisplay();
+  } else {
+    const el = document.getElementById("progress-eta");
+    if (el) {
+      el.classList.remove("visible");
+      el.textContent = "";
+      el.removeAttribute("aria-label");
+    }
   }
 }
 
@@ -855,22 +921,7 @@ function formatEtaDuration(sec) {
 }
 
 function renderEta() {
-  const el = document.getElementById("progress-eta");
-  if (!el) return;
-  // Show nothing until we actually have an estimate (no "…" placeholder).
-  if (!eta || eta.shown == null) {
-    el.classList.remove("visible");
-    el.textContent = "";
-    el.removeAttribute("aria-label");
-    return;
-  }
-  // Floor at 1s so it never reads "0s" before Done.
-  const value = formatEtaDuration(Math.max(1, eta.shown));
-  el.textContent = value; // duration only on the bar; no "~" prefix
-  // Screen-reader context (the visible pill is just the duration). Hardcoded
-  // English to match the rest of the progress messages, which aren't localized.
-  el.setAttribute("aria-label", `Time remaining: ${value}`);
-  el.classList.add("visible");
+  renderTimerDisplay();
 }
 
 // Two-layer display: `est` is the belief, `shown` follows it but falls freely
@@ -894,7 +945,7 @@ function etaTick() {
   eta.est = Math.max(0, eta.est - dt);
   if (eta.shown != null) eta.shown = Math.max(0, eta.shown - dt);
   etaReconcile();
-  renderEta();
+  renderTimerDisplay();
 }
 
 function updateEta(progress, streaming) {
@@ -992,12 +1043,18 @@ function resetProgressUi(message) {
   const bar = document.getElementById("progress-bar");
   const info = document.getElementById("progress-info");
   const detail = document.getElementById("progress-detail");
+  const tilesBadge = document.getElementById("progress-tiles-badge");
   if (bar) bar.style.width = "0%";
   if (detail) detail.textContent = "0%";
+  if (tilesBadge) {
+    tilesBadge.textContent = "";
+    tilesBadge.style.display = "none";
+  }
   if (info) {
     info.textContent = message;
     info.style.color = "#ececec";
   }
+  stopGenerationTimer(false);
   resetEta();
 }
 
@@ -1006,14 +1063,20 @@ function setupProgressListener() {
   const progressBar = document.getElementById("progress-bar");
   const progressInfo = document.getElementById("progress-info");
   const progressDetail = document.getElementById("progress-detail");
+  const tilesBadge = document.getElementById("progress-tiles-badge");
 
   window.__TAURI__.event.listen("progress-update", (event) => {
-    const { progress, message, streaming } = event.payload;
+    const { progress, message, streaming, tiles_done, tiles_total } = event.payload;
 
     if (progress != -1) {
       progressBar.style.width = `${progress}%`;
       progressDetail.textContent = `${Math.round(progress)}%`;
       updateEta(progress, streaming);
+    }
+
+    if (tilesBadge && tiles_total != null && tiles_total > 0 && tiles_done != null) {
+      tilesBadge.textContent = `Плитки: ${tiles_done} / ${tiles_total}`;
+      tilesBadge.style.display = "inline-block";
     }
 
     if (message != "") {
@@ -1023,6 +1086,7 @@ function setupProgressListener() {
         progressInfo.style.color = "#fa7878";
         setGenerationButtonEnabled(true);
         window.arnisPreview3D?.setGenerationRunning(false);
+        stopGenerationTimer(false);
         if (lastRunOneWorld) {
           // The world keeps its name; the status line carries the reason.
           setWorldNameLabel(oneWorldDisplayName());
@@ -1035,6 +1099,10 @@ function setupProgressListener() {
         progressInfo.style.color = "#7bd864";
         setGenerationButtonEnabled(true);
         window.arnisPreview3D?.setGenerationRunning(false);
+        stopGenerationTimer(true);
+        if (tilesBadge && tiles_total != null && tiles_total > 0) {
+          tilesBadge.textContent = `Плитки: ${tiles_total} / ${tiles_total} (100%)`;
+        }
         resetEta();
         // The world just grew by one area: reload its status and overlays.
         if (lastRunOneWorld) {
@@ -3273,6 +3341,7 @@ async function startGeneration() {
 
     // Past every synchronous refusal, so from here the click is a real start.
     resetProgressUi(STARTING_MESSAGE);
+    startGenerationTimer();
 
     const oneWorld = isOneWorldEnabled();
     if (oneWorld && !(await prepareOneWorldRun())) {
@@ -3336,6 +3405,10 @@ async function startGeneration() {
     var overture = document.getElementById("overture-toggle").checked;
     var tiledGenToggle = document.getElementById("tiled-generation-toggle");
     var tiled_generation = tiledGenToggle ? tiledGenToggle.checked : true;
+    var tileSizeSelect = document.getElementById("tile-size-select");
+    var tile_size = tileSizeSelect ? parseInt(tileSizeSelect.value, 10) : 512;
+    var ramLimitSelect = document.getElementById("ram-limit-select");
+    var ram_limit_mb = ramLimitSelect ? parseInt(ramLimitSelect.value, 10) : 0;
     var use_3d = document.getElementById("use-3d-toggle").checked;
     var heightLimitToggle = document.getElementById("disable-height-limit-toggle");
     // Disabled means unsupported for this body or format, so never send a stale tick.
@@ -3426,7 +3499,9 @@ async function startGeneration() {
         celestialBodyName: selectedCelestialBody,
         oneWorld: oneWorld,
         oneWorldName: oneWorld ? oneWorldFolderName() : "",
-        tiledGeneration: tiled_generation
+        tiledGeneration: tiled_generation,
+        tileSize: tile_size,
+        ramLimitMb: ram_limit_mb
     });
 
     console.log("Generation process started.");
@@ -3440,6 +3515,7 @@ async function startGeneration() {
     // Hand the guard back unless a run actually started; once it has, the Done!/Error!
     // progress message releases it instead.
     if (!started) {
+      stopGenerationTimer(false);
       // Some abort paths say why (handleWorldSelectionError writes here); the
       // rest would leave our placeholder claiming a run that never began, so
       // clear it only if nothing else has taken the line since.

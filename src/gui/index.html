@@ -152,7 +152,10 @@
 
           <div class="progress-section">
             <img src="" alt="" class="secret-parrot" id="secret-parrot">
-            <span id="progress-info" class="progress-info-text"></span>
+            <div class="progress-status-row">
+              <span id="progress-info" class="progress-info-text"></span>
+              <span id="progress-tiles-badge" class="progress-tiles-badge" style="display: none;"></span>
+            </div>
             <div class="progress-row">
               <div class="progress-bar-container">
                 <div class="progress-bar" id="progress-bar"></div>
@@ -440,6 +443,56 @@
                   </label>
                   <div class="settings-control">
                     <input type="checkbox" class="switch" id="tiled-generation-toggle" name="tiled-generation-toggle" checked>
+                  </div>
+                </div>
+
+                <!-- Tile Size Setting (part size) -->
+                <div class="settings-row setting-tile">
+                  <label for="tile-size-select" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-blocks"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="tile_size">Tile Size (part size)</span>
+                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. 256 uses minimal RAM (best for weak devices). 512 is 1 Minecraft region (recommended). 1024 or 2048 is faster on high-RAM devices.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="tile_size_desc">Block size of each part. Smaller sizes save RAM.</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <select id="tile-size-select" name="tile-size-select" class="settings-select">
+                      <option value="256" data-localize="tile_size_256">256×256 (16 chunks — minimal RAM)</option>
+                      <option value="512" selected data-localize="tile_size_512">512×512 (1 region — recommended)</option>
+                      <option value="768" data-localize="tile_size_768">768×768 (balanced)</option>
+                      <option value="1024" data-localize="tile_size_1024">1024×1024 (2×2 regions — high RAM)</option>
+                      <option value="1536" data-localize="tile_size_1536">1536×1536 (large)</option>
+                      <option value="2048" data-localize="tile_size_2048">2048×2048 (4×4 regions — maximum)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <!-- RAM Limit Setting -->
+                <div class="settings-row setting-tile">
+                  <label for="ram-limit-select" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-hard-drive"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="ram_limit">RAM Allocation Limit</span>
+                        <span class="tooltip-icon" data-tooltip="Maximum RAM allocated for Arnis. If generating a territory exceeds this limit, parts automatically stream to disk to prevent out-of-memory crashes.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="ram_limit_desc">Memory limit for generation. Prevents out-of-memory.</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <select id="ram-limit-select" name="ram-limit-select" class="settings-select">
+                      <option value="0" selected data-localize="ram_limit_auto">Auto (device memory)</option>
+                      <option value="1024" data-localize="ram_limit_1gb">1 GB (ultra-low)</option>
+                      <option value="2048" data-localize="ram_limit_2gb">2 GB (low)</option>
+                      <option value="3072" data-localize="ram_limit_3gb">3 GB (standard mobile)</option>
+                      <option value="4096" data-localize="ram_limit_4gb">4 GB (balanced)</option>
+                      <option value="6144" data-localize="ram_limit_6gb">6 GB (powerful)</option>
+                      <option value="8192" data-localize="ram_limit_8gb">8 GB (high performance)</option>
+                      <option value="12288" data-localize="ram_limit_12gb">12 GB (maximum)</option>
+                    </select>
                   </div>
                 </div>
 

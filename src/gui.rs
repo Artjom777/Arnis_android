@@ -1487,6 +1487,8 @@ fn gui_start_generation(
     one_world: bool,
     one_world_name: String,
     tiled_generation: Option<bool>,
+    tile_size: Option<i32>,
+    ram_limit_mb: Option<u64>,
 ) -> Result<(), String> {
     use progress::emit_gui_error;
     use LLBBox;
@@ -1783,6 +1785,8 @@ fn gui_start_generation(
                 projection: crate::projection::ProjectionKind::Local,
                 one_world: false,
                 tiled_generation: tiled_generation.unwrap_or(true),
+                tile_size: tile_size.unwrap_or(512).clamp(256, 2048),
+                ram_limit_mb: ram_limit_mb.unwrap_or(0),
                 world_name: None,
                 one_world_run: None,
                 ground_level,

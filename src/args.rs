@@ -70,6 +70,14 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub tiled_generation: bool,
 
+    /// Size of each tile in blocks for tiled generation (256..2048, default 512 = 1 Minecraft region).
+    #[arg(long, default_value_t = 512)]
+    pub tile_size: i32,
+
+    /// User-configured RAM limit in megabytes (0 = auto-detect based on system memory).
+    #[arg(long, default_value_t = 0)]
+    pub ram_limit_mb: u64,
+
     /// Name of the world folder for --one-world (default "Arnis One World").
     #[arg(long)]
     pub world_name: Option<String>,
