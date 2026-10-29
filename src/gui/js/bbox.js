@@ -479,7 +479,7 @@ $(document).ready(function () {
     $("#projection").val(currentproj);
 
     // Initialize map
-    map = L.map('map', { zoomControl: false }).setView([50.114768, 8.687322], 4);
+    map = L.map('map', { zoomControl: false, attributionControl: false }).setView([50.114768, 8.687322], 4);
 
     // Define available tile themes
     var tileThemes = {
@@ -722,7 +722,7 @@ $(document).ready(function () {
             }
             currentTileLayer = L.maplibreGL({
                 style: theme.style,
-                attributionControl: { customAttribution: theme.attribution },
+                attributionControl: false,
                 pixelRatio: window.devicePixelRatio || 1
             });
             currentTileLayer.addTo(map);
