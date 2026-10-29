@@ -528,7 +528,7 @@ impl BedrockWriter {
             (x, z)
         });
 
-        // Calculate spawn Y from ground elevation data, or default to 64
+        // Calculate spawn Y from ground elevation data, or default to -61 (surface of standard Bedrock ground at -62)
         let spawn_y = self
             .ground
             .as_ref()
@@ -538,9 +538,10 @@ impl BedrockWriter {
                 let rel_z = spawn_z - xzbbox.min_z();
                 let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
                 let lvl = ground.level(coord);
-                (lvl + 3).clamp(-60, 319)
+                // Place player feet at lvl + 1 (standing directly on top of the ground block at lvl)
+                (lvl + 1).clamp(-63, 318)
             })
-            .unwrap_or(64);
+            .unwrap_or(-61);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -649,7 +650,7 @@ impl BedrockWriter {
             limited_world_depth: 16,
             limited_world_width: 16,
             limited_world_origin_x: spawn_x,
-            limited_world_origin_y: 64,
+            limited_world_origin_y: spawn_y,
             limited_world_origin_z: spawn_z,
             world_start_count: 0xFFFFFFFE_u64 as i64, // Special value for new worlds
 
