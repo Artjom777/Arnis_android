@@ -97,10 +97,10 @@ const DEFAULT_BEDROCK_COMPRESSION_LEVEL: u8 = 6;
 fn bedrock_db_options() -> Options {
     let mut opts = mcpe_options(DEFAULT_BEDROCK_COMPRESSION_LEVEL);
     opts.env = Rc::new(Box::new(MonotonicDiskEnv::new()));
-    opts.write_buffer_size = 64 * 1024 * 1024;
-    opts.max_file_size = 64 * 1024 * 1024;
+    opts.write_buffer_size = 4 * 1024 * 1024;
+    opts.max_file_size = 4 * 1024 * 1024;
     opts.max_open_files = 1000;
-    opts.block_cache_capacity_bytes = 64 * 1024 * 1024;
+    opts.block_cache_capacity_bytes = 16 * 1024 * 1024;
     opts
 }
 
@@ -538,7 +538,7 @@ impl BedrockWriter {
                 let rel_z = spawn_z - xzbbox.min_z();
                 let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
                 let lvl = ground.level(coord);
-                (lvl + 3).max(64)
+                (lvl + 3).clamp(-60, 319)
             })
             .unwrap_or(64);
 
@@ -755,7 +755,9 @@ impl BedrockWriter {
             .sum();
 
         if total_chunks == 0 {
-            // Drop db handle to commit WAL/memtable and release file lock before packaging
+            // Flush all memtable data to SSTable files and release file lock before packaging
+            db.flush()
+                .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
             drop(db);
             return Ok(());
         }

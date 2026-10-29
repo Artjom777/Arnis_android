@@ -420,6 +420,15 @@ impl DB {
 
     /// flush makes sure that all pending changes (e.g. from put()) are stored on disk.
     pub fn flush(&mut self) -> Result<()> {
+        if self.imm.is_some() {
+            self.compact_memtable()?;
+        }
+        if self.mem.len() > 0 {
+            self.make_room_for_write(true)?;
+        }
+        if self.imm.is_some() {
+            self.compact_memtable()?;
+        }
         if let Some(ref mut log) = self.log.as_mut() {
             log.flush()?;
         }
