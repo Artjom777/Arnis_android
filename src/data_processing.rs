@@ -591,16 +591,19 @@ impl Drop for AbortOnPanic<'_> {
     }
 }
 
-/// Whether to stream regions to disk (lower peak RAM) for `num_regions` regions.
+/// Whether to stream regions to disk (lower peak RAM) for `num_tiles` tiles.
 /// When the resident world would crowd available RAM or the user-configured RAM limit,
 /// regions stream to disk, bounding memory so arbitrarily large areas succeed without OOM.
-fn should_stream_to_disk(num_regions: usize, available_mb: u64, fillground: bool) -> bool {
+fn should_stream_to_disk(num_tiles: usize, available_mb: u64, fillground: bool) -> bool {
     if let Some(forced) = std::env::var("ARNIS_STREAM_TO_DISK").ok().as_deref() {
         return forced == "1";
     }
+    if available_mb > 0 && available_mb <= 2048 && num_tiles >= 2 {
+        return true;
+    }
     const BASE_MB: u64 = 400;
     let est_peak_mb =
-        BASE_MB + crate::world_editor::per_region_estimate_mb(fillground) * num_regions as u64;
+        BASE_MB + crate::world_editor::per_region_estimate_mb(fillground) * num_tiles as u64;
     available_mb > 0 && est_peak_mb * 100 > available_mb * 60
 }
 
@@ -1093,8 +1096,8 @@ pub fn generate_world_with_options(
     });
 
     // Decide between sequential and parallel processing based on world size.
-    // Tile size is configurable (clamped safely between 256 and 2048).
-    let tile_size = args.tile_size.clamp(256, 2048);
+    // Tile size is configurable (clamped safely between 32 and 2048).
+    let tile_size = args.tile_size.clamp(32, 2048);
     let tiles = tile::create_tiles(&xzbbox, tile_size);
 
     // If tiled_generation is enabled (default) and there are 2 or more tiles,
@@ -1118,8 +1121,11 @@ pub fn generate_world_with_options(
         // which can exceed RAM for large areas and cause disk thrashing.
         let max_concurrency = if args.ram_limit_mb > 0 && args.ram_limit_mb <= 2048 {
             1
+        } else if args.ram_limit_mb > 0 && args.ram_limit_mb <= 4096 {
+            2
         } else if cfg!(target_os = "android") {
-            rayon::current_num_threads().clamp(1, 2)
+            // Leave at least 2 cores free for OS media decoders (video, music) and system UI
+            (rayon::current_num_threads().saturating_sub(2)).clamp(1, 4)
         } else {
             rayon::current_num_threads().max(1)
         };
@@ -1206,24 +1212,32 @@ pub fn generate_world_with_options(
             });
         }
 
-        let region_of_tile: Vec<(i32, i32)> =
-            tiles.iter().map(|t| (t.min_x >> 9, t.min_z >> 9)).collect();
-        real_regions = region_of_tile.iter().copied().collect();
-        // remaining[R] = 1 (owner) + count of R's in-grid region neighbours; R is
-        // flushable when this reaches 0 (owner + all neighbour tiles merged).
+        // Compute all regions touched by each tile (including editor halo).
+        // Works for any tile size (32..2048), properly handling multiple tiles per 512-region.
+        let mut tile_touches_regions: Vec<Vec<(i32, i32)>> = Vec::with_capacity(tiles.len());
         let mut remaining: HashMap<(i32, i32), u32> = HashMap::new();
-        if eviction_active {
-            for &r in &real_regions {
-                let mut c = 1u32;
-                for dz in -1..=1 {
-                    for dx in -1..=1 {
-                        if (dx, dz) != (0, 0) && real_regions.contains(&(r.0 + dx, r.1 + dz)) {
-                            c += 1;
-                        }
+        for t in &tiles {
+            let rx0 = (t.min_x - tile::TILE_EDITOR_HALO) >> 9;
+            let rx1 = (t.max_x - 1 + tile::TILE_EDITOR_HALO) >> 9;
+            let rz0 = (t.min_z - tile::TILE_EDITOR_HALO) >> 9;
+            let rz1 = (t.max_z - 1 + tile::TILE_EDITOR_HALO) >> 9;
+            let mut touched = Vec::new();
+            for rx in rx0..=rx1 {
+                for rz in rz0..=rz1 {
+                    if eviction_active {
+                        *remaining.entry((rx, rz)).or_default() += 1;
                     }
+                    touched.push((rx, rz));
                 }
-                remaining.insert(r, c);
             }
+            touched.sort_unstable();
+            touched.dedup();
+            tile_touches_regions.push(touched);
+        }
+
+        real_regions = remaining.keys().copied().collect();
+        if real_regions.is_empty() {
+            real_regions = tile_touches_regions.iter().flatten().copied().collect();
         }
 
         let mut merge_dur = std::time::Duration::ZERO;
@@ -1535,42 +1549,36 @@ pub fn generate_world_with_options(
                         }
 
                         if eviction_active {
-                            // This tile contributes to its own region and its 8 neighbours;
-                            // flush each non-deferred region whose contributors are all merged.
-                            // (Rail tunnels are carved in-tile above, so they don't defer regions.)
-                            let rt = region_of_tile[tile_idx];
-                            for dz in -1..=1 {
-                                for dx in -1..=1 {
-                                    let d = (rt.0 + dx, rt.1 + dz);
-                                    if let Some(c) = remaining.get_mut(&d) {
-                                        *c -= 1;
-                                        if *c == 0
-                                            && !evicted_regions.contains(&d)
-                                            && !model_regions.contains(&d)
-                                            && Some(d) != spawn_region
-                                        {
-                                            if hash_check {
-                                                hash_acc = hash_acc.wrapping_add(
-                                                    editor.region_content_hash(d.0, d.1),
-                                                );
-                                            }
-                                            // Facade panels check the region's final blocks
-                                            // and must be in before it leaves memory.
-                                            crate::mapillary::displays::flush_region(
-                                                &mut editor,
-                                                d.0,
-                                                d.1,
+                            // Flush each non-deferred region when all contributor tiles are merged.
+                            for &d in &tile_touches_regions[tile_idx] {
+                                if let Some(c) = remaining.get_mut(&d) {
+                                    *c -= 1;
+                                    if *c == 0
+                                        && !evicted_regions.contains(&d)
+                                        && !model_regions.contains(&d)
+                                        && Some(d) != spawn_region
+                                    {
+                                        if hash_check {
+                                            hash_acc = hash_acc.wrapping_add(
+                                                editor.region_content_hash(d.0, d.1),
                                             );
-                                            crate::building_facades::flush_region(
-                                                &mut editor,
-                                                d.0,
-                                                d.1,
-                                            );
-                                            if let Some(w) = flush_worker.as_ref() {
-                                                editor.flush_region_via(w, d.0, d.1)?;
-                                            }
-                                            evicted_regions.insert(d);
                                         }
+                                        // Facade panels check the region's final blocks
+                                        // and must be in before it leaves memory.
+                                        crate::mapillary::displays::flush_region(
+                                            &mut editor,
+                                            d.0,
+                                            d.1,
+                                        );
+                                        crate::building_facades::flush_region(
+                                            &mut editor,
+                                            d.0,
+                                            d.1,
+                                        );
+                                        if let Some(w) = flush_worker.as_ref() {
+                                            editor.flush_region_via(w, d.0, d.1)?;
+                                        }
+                                        evicted_regions.insert(d);
                                     }
                                 }
                             }
@@ -1601,7 +1609,7 @@ pub fn generate_world_with_options(
                         gate.1.notify_all();
 
                         if cfg!(target_os = "android") || args.ram_limit_mb > 0 {
-                            crate::world_utils::collect_memory(false);
+                            crate::world_utils::collect_memory(true);
                         }
                     }
                 }
@@ -1629,6 +1637,7 @@ pub fn generate_world_with_options(
         emit_gui_progress_update_ex(70.0, "", eviction_active);
         // Elements were only borrowed by the tile loop; free them before save.
         drop(elements);
+        crate::world_utils::collect_memory(true);
     } else {
         // Small area: sequential processing along the original code path.
         let elements_count: usize = elements.len();

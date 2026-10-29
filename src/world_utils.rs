@@ -35,6 +35,12 @@ pub fn protect_process_memory() {
 
     #[cfg(unix)]
     {
+        // Set cooperative nice level (+5) so foreground/background media apps (video, music)
+        // and audio server always receive priority CPU time slices and never stutter.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 5);
+        }
+
         // Remove OS-level memory limits (RLIMIT_AS, RLIMIT_DATA) by setting to infinity
         unsafe {
             let unlimited = libc::rlimit {

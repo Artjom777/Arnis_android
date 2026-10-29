@@ -70,7 +70,7 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub tiled_generation: bool,
 
-    /// Size of each tile in blocks for tiled generation (256..2048, default 512 = 1 Minecraft region).
+    /// Size of each tile in blocks for tiled generation (32..2048, default 512 = 1 Minecraft region).
     #[arg(long, default_value_t = 512)]
     pub tile_size: i32,
 

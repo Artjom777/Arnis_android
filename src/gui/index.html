@@ -453,13 +453,16 @@
                     <span class="setting-text">
                       <span class="setting-heading">
                         <span data-localize="tile_size">Tile Size (part size)</span>
-                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. 256 uses minimal RAM (best for weak devices). 512 is 1 Minecraft region (recommended). 1024 or 2048 is faster on high-RAM devices.">?</span>
+                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. 32-128 uses ultra-low RAM (freeing memory for background apps like music/video). 512 is 1 Minecraft region (recommended). 1024-2048 is faster on high-RAM devices.">?</span>
                       </span>
                       <span class="setting-desc" data-localize="tile_size_desc">Block size of each part. Smaller sizes save RAM.</span>
                     </span>
                   </label>
                   <div class="settings-control">
                     <select id="tile-size-select" name="tile-size-select" class="settings-select">
+                      <option value="32" data-localize="tile_size_32">32×32 (2 chunks — ultra-low RAM)</option>
+                      <option value="64" data-localize="tile_size_64">64×64 (4 chunks — very low RAM)</option>
+                      <option value="128" data-localize="tile_size_128">128×128 (8 chunks — low RAM)</option>
                       <option value="256" data-localize="tile_size_256">256×256 (16 chunks — minimal RAM)</option>
                       <option value="512" selected data-localize="tile_size_512">512×512 (1 region — recommended)</option>
                       <option value="768" data-localize="tile_size_768">768×768 (balanced)</option>

@@ -835,6 +835,14 @@ function etaLsRate(s) {
 
 let generationTimerHandle = null;
 let generationStartTime = null;
+let countdownSec = null;
+let countdownTargetSec = null;
+let countdownTileStats = {
+  total: 0,
+  done: 0,
+  placeStartT: null,
+  mergeStartT: null,
+};
 
 function formatClockTime(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -851,6 +859,7 @@ function formatClockTime(sec) {
 function startGenerationTimer() {
   if (generationTimerHandle) clearInterval(generationTimerHandle);
   generationStartTime = performance.now();
+  resetCountdown();
   generationTimerHandle = setInterval(tickGenerationTimer, 1000);
   renderTimerDisplay();
 }
@@ -875,6 +884,17 @@ function stopGenerationTimer(success) {
 
 function tickGenerationTimer() {
   if (generationStartTime == null) return;
+
+  if (countdownSec != null && countdownSec > 0) {
+    // Tick countdown down by 1 second every second
+    countdownSec = Math.max(0, countdownSec - 1);
+    // Smoothly converge toward target
+    if (countdownTargetSec != null && isFinite(countdownTargetSec)) {
+      const delta = countdownTargetSec - countdownSec;
+      countdownSec += Math.sign(delta) * Math.min(Math.abs(delta) * 0.25, 1.5);
+    }
+  }
+
   renderTimerDisplay();
 }
 
@@ -884,10 +904,14 @@ function renderTimerDisplay() {
   const elapsedSec = Math.floor((performance.now() - generationStartTime) / 1000);
   const elapsedStr = formatClockTime(elapsedSec);
 
-  let displayText = elapsedStr;
-  if (eta && eta.shown != null && eta.shown > 0) {
-    const etaStr = formatEtaDuration(Math.max(1, eta.shown));
-    displayText = `${elapsedStr} (~${etaStr})`;
+  let displayText = `⏱ ${elapsedStr}`;
+  if (countdownSec != null) {
+    const remSec = Math.max(0, Math.round(countdownSec));
+    if (remSec > 0) {
+      displayText = `⏳ -${formatClockTime(remSec)} (⏱ ${elapsedStr})`;
+    } else {
+      displayText = `⏳ ~00:01 (⏱ ${elapsedStr})`;
+    }
   }
 
   el.textContent = displayText;
@@ -895,136 +919,103 @@ function renderTimerDisplay() {
   el.classList.add("visible");
 }
 
-function resetEta() {
+function resetCountdown() {
+  countdownSec = null;
+  countdownTargetSec = null;
+  countdownTileStats = {
+    total: 0,
+    done: 0,
+    placeStartT: null,
+    mergeStartT: null,
+  };
   if (eta && eta.tickHandle) clearInterval(eta.tickHandle);
   eta = null;
-  if (generationStartTime != null) {
-    renderTimerDisplay();
-  } else {
+  if (generationStartTime == null) {
     const el = document.getElementById("progress-eta");
     if (el) {
       el.classList.remove("visible");
       el.textContent = "";
       el.removeAttribute("aria-label");
     }
+  } else {
+    renderTimerDisplay();
   }
 }
 
-function formatEtaDuration(sec) {
-  sec = Math.max(0, Math.round(sec));
-  if (sec < 60) return `${sec}s`;
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
+function resetEta() {
+  resetCountdown();
 }
 
-function renderEta() {
-  renderTimerDisplay();
-}
-
-// Two-layer display: `est` is the belief, `shown` follows it but falls freely
-// and rises slowly, so the countdown never jumps upward jarringly.
-function etaReconcile() {
-  if (!eta || eta.est == null) return;
-  if (eta.shown == null || eta.est <= eta.shown) eta.shown = eta.est;
-  else
-    eta.shown = Math.min(
-      eta.est,
-      eta.shown + Math.max(ETA_RISE_ABS, eta.shown * ETA_RISE_FRAC)
-    );
-}
-
-// Counts the value down between progress events (and through the 70% stall).
-function etaTick() {
-  if (!eta || eta.est == null) return;
-  const now = performance.now();
-  const dt = (now - eta.lastTickAt) / 1000;
-  eta.lastTickAt = now;
-  eta.est = Math.max(0, eta.est - dt);
-  if (eta.shown != null) eta.shown = Math.max(0, eta.shown - dt);
-  etaReconcile();
-  renderTimerDisplay();
-}
-
-function updateEta(progress, streaming) {
-  // Reset before the generation phases and once finished / on a new run.
-  if (progress < ETA_START || progress >= 100) {
-    resetEta();
+function updateCountdown(progress, streaming, tiles_done, tiles_total) {
+  if (progress < 0 || progress >= 100) {
+    resetCountdown();
     return;
   }
   const now = performance.now();
-  if (!eta) {
-    eta = {
-      streamingKnown: false, wprior: etaWeightsFor(false), phaseIdx: -1,
-      phaseStartT: now, phaseStartProgress: null, movedInPhase: false,
-      samples: [], doneSec: 0, doneWeight: 0, est: null, shown: null,
-      lastTickAt: now, lastProgress: null, lastIncreaseAt: now, tickHandle: null,
-    };
-  }
-  if (streaming != null && !eta.streamingKnown) {
-    eta.streamingKnown = true;
-    eta.wprior = etaWeightsFor(streaming);
-  }
+  if (generationStartTime == null) generationStartTime = now;
 
-  const idx = etaPhaseIdx(progress), ph = ETA_PHASES[idx];
-  if (idx !== eta.phaseIdx) {
-    // Bank the real duration (incl. any stall) of the phase we just left.
-    if (eta.phaseIdx >= 0) {
-      eta.doneSec += (now - eta.phaseStartT) / 1000;
-      eta.doneWeight += eta.wprior[eta.phaseIdx];
-      for (let k = eta.phaseIdx + 1; k < idx; k++) eta.doneWeight += eta.wprior[k];
+  let targetRem = null;
+
+  // 1. If tile progress is available, use highly accurate tile completion rate
+  if (tiles_total != null && tiles_total > 0 && tiles_done != null) {
+    countdownTileStats.total = tiles_total;
+    countdownTileStats.done = tiles_done;
+
+    if (progress < 45.0) {
+      // Tile placement phase (20% to 45%)
+      if (countdownTileStats.placeStartT == null) {
+        countdownTileStats.placeStartT = now;
+      }
+      const elapsedPlace = (now - countdownTileStats.placeStartT) / 1000;
+      if (tiles_done > 0 && elapsedPlace > 0.4) {
+        const secPerTile = elapsedPlace / tiles_done;
+        const remPlace = (tiles_total - tiles_done) * secPerTile;
+        const estMerge = tiles_total * (secPerTile * 0.22);
+        const estTail = 2.5;
+        targetRem = Math.max(1, remPlace + estMerge + estTail);
+      }
+    } else if (progress < 70.0) {
+      // Tile merging phase (45% to 70%)
+      if (countdownTileStats.mergeStartT == null) {
+        countdownTileStats.mergeStartT = now;
+      }
+      const elapsedMerge = (now - countdownTileStats.mergeStartT) / 1000;
+      if (tiles_done > 0 && elapsedMerge > 0.4) {
+        const secPerMerge = elapsedMerge / tiles_done;
+        const remMerge = (tiles_total - tiles_done) * secPerMerge;
+        const estTail = 2.5;
+        targetRem = Math.max(1, remMerge + estTail);
+      }
     }
-    eta.phaseIdx = idx;
-    eta.phaseStartT = now;
-    eta.samples = [];
-    eta.phaseStartProgress = progress;
-    eta.movedInPhase = false;
   }
 
-  if (eta.lastProgress == null || progress > eta.lastProgress) eta.lastIncreaseAt = now;
-  eta.lastProgress = progress;
-  const stalled = now - eta.lastIncreaseAt > ETA_STALL_MS;
-
-  eta.samples.push({ t: now, p: progress });
-  // Drop the flat phase-start hold (e.g. precompute sitting at 25%) the first
-  // time progress actually moves, so the rate reflects real work, not setup.
-  if (!eta.movedInPhase && eta.phaseStartProgress != null && progress > eta.phaseStartProgress) {
-    eta.samples = [{ t: now, p: progress }];
-    eta.movedInPhase = true;
-  }
-  const cut = now - ETA_WINDOW_MS;
-  while (eta.samples.length > ETA_MIN_SAMPLES && eta.samples[0].t < cut) eta.samples.shift();
-  const span = now - eta.samples[0].t;
-  const rate = !stalled && span >= ETA_MIN_MS ? etaLsRate(eta.samples) : null;
-
-  const phaseElapsed = (now - eta.phaseStartT) / 1000;
-  let G = eta.doneWeight > 0 ? eta.doneSec / eta.doneWeight : null; // sec per prior-unit
-  let remCur = null;
-  if (rate) remCur = (ph.hi - progress) / rate;
-  else if (G != null) remCur = ((ph.hi - progress) / (ph.hi - ph.lo)) * eta.wprior[idx] * G;
-  if (G == null && remCur != null) G = (phaseElapsed + remCur) / eta.wprior[idx];
-  if (G != null) G = Math.min(1000, Math.max(0.02, G));
-
-  let raw = null;
-  if (remCur != null) {
-    // In the last band this is just the measured rate; earlier ones budget the rest.
-    raw = Math.max(0, remCur);
-    if (G != null) for (let j = idx + 1; j < ETA_PHASES.length; j++) raw += eta.wprior[j] * G;
+  // 2. Fallback to overall rate if tile rate not ready yet
+  if (targetRem == null) {
+    const totalElapsed = (now - generationStartTime) / 1000;
+    if (progress >= 3.0 && totalElapsed > 0.5) {
+      const overallRate = progress / totalElapsed; // % per sec
+      if (overallRate > 0) {
+        const remainingPct = 100 - progress;
+        targetRem = Math.max(1, remainingPct / overallRate);
+      }
+    }
   }
 
-  if (!stalled && raw != null && isFinite(raw) && raw <= ETA_MAX_S) {
-    const a = eta.est == null || raw <= eta.est ? ETA_A_DOWN : ETA_A_UP;
-    eta.est = eta.est == null ? raw : a * raw + (1 - a) * eta.est;
-    eta.lastTickAt = now;
+  if (targetRem != null && isFinite(targetRem) && targetRem > 0 && targetRem <= 86400) {
+    countdownTargetSec = targetRem;
+    if (countdownSec == null) {
+      countdownSec = targetRem;
+    } else {
+      const delta = targetRem - countdownSec;
+      countdownSec += Math.sign(delta) * Math.min(Math.abs(delta) * 0.35, 3.0);
+    }
   }
-  if (eta.est != null && !eta.tickHandle) {
-    eta.lastTickAt = now;
-    eta.tickHandle = setInterval(etaTick, 1000);
-  }
-  etaReconcile();
-  renderEta();
+
+  renderTimerDisplay();
+}
+
+function updateEta(progress, streaming, tiles_done, tiles_total) {
+  updateCountdown(progress, streaming, tiles_done, tiles_total);
 }
 
 // What the status line says between the click and the backend's first real
@@ -1071,7 +1062,7 @@ function setupProgressListener() {
     if (progress != -1) {
       progressBar.style.width = `${progress}%`;
       progressDetail.textContent = `${Math.round(progress)}%`;
-      updateEta(progress, streaming);
+      updateCountdown(progress, streaming, tiles_done, tiles_total);
     }
 
     if (tilesBadge && tiles_total != null && tiles_total > 0 && tiles_done != null) {

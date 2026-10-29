@@ -58,8 +58,8 @@ const MAX_LINEAR_HALF_WIDTH_M: f64 = 40.0;
 pub fn create_tiles(xzbbox: &XZBBox, tile_size: i32) -> Vec<TileBounds> {
     let mut tiles = Vec::new();
 
-    // Guard tile_size to safe, valid bounds (256..=2048)
-    let safe_tile_size = tile_size.clamp(256, 2048);
+    // Guard tile_size to safe, valid bounds (32..=2048)
+    let safe_tile_size = tile_size.clamp(32, 2048);
 
     // Align tile grid to tile_size boundaries using Euclidean division
     // to handle positive and negative world coordinates consistently
@@ -186,12 +186,20 @@ pub fn assign_elements_to_tiles(
     // strict bounds receive its blocks is assigned it (else per-tile ground overwrites).
     let linear_halo = TILE_EDITOR_HALO.max((MAX_LINEAR_HALF_WIDTH_M * scale).ceil() as i32);
 
-    // Region-coord -> tile index, for O(1) node assignment (tiles are 512-region-aligned).
-    let tile_grid: HashMap<(i32, i32), usize> = tiles
-        .iter()
-        .enumerate()
-        .map(|(i, t)| ((t.min_x >> 9, t.min_z >> 9), i))
-        .collect();
+    // Region-coord -> tile indices, for spatial element assignment.
+    // Handles any tile size (32..2048) correctly when a region contains multiple tiles.
+    let mut tile_grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (i, t) in tiles.iter().enumerate() {
+        let rx0 = t.min_x >> 9;
+        let rx1 = (t.max_x - 1) >> 9;
+        let rz0 = t.min_z >> 9;
+        let rz1 = (t.max_z - 1) >> 9;
+        for rx in rx0..=rx1 {
+            for rz in rz0..=rz1 {
+                tile_grid.entry((rx, rz)).or_default().push(i);
+            }
+        }
+    }
 
     for (elem_idx, element) in elements.iter().enumerate() {
         match element {
@@ -209,9 +217,13 @@ pub fn assign_elements_to_tiles(
                     let (rx0, rx1, rz0, rz1) = region_range(aabb, 0);
                     for rx in rx0..=rx1 {
                         for rz in rz0..=rz1 {
-                            if let Some(&tile_idx) = tile_grid.get(&(rx, rz)) {
-                                if aabb_intersects(aabb, &tiles[tile_idx]) {
-                                    tile_elements[tile_idx].push(elem_idx);
+                            if let Some(tile_indices) = tile_grid.get(&(rx, rz)) {
+                                for &tile_idx in tile_indices {
+                                    if tile_elements[tile_idx].last() != Some(&elem_idx)
+                                        && aabb_intersects(aabb, &tiles[tile_idx])
+                                    {
+                                        tile_elements[tile_idx].push(elem_idx);
+                                    }
                                 }
                             }
                         }
@@ -221,9 +233,14 @@ pub fn assign_elements_to_tiles(
                 // A node belongs to the strict tile whose region contains it; the owning
                 // tile's editor halo handles canopy overflow. (Strict + non-overlapping, so
                 // this matches scanning for the first containing tile, in O(1).)
-                if let Some(&tile_idx) = tile_grid.get(&(node.x >> 9, node.z >> 9)) {
-                    if tiles[tile_idx].contains(node.x, node.z) {
-                        tile_elements[tile_idx].push(elem_idx);
+                let rx = node.x >> 9;
+                let rz = node.z >> 9;
+                if let Some(tile_indices) = tile_grid.get(&(rx, rz)) {
+                    for &tile_idx in tile_indices {
+                        if tiles[tile_idx].contains(node.x, node.z) {
+                            tile_elements[tile_idx].push(elem_idx);
+                            break;
+                        }
                     }
                 }
             }
@@ -239,9 +256,13 @@ pub fn assign_elements_to_tiles(
                 let (rx0, rx1, rz0, rz1) = region_range(aabb, halo);
                 for rx in rx0..=rx1 {
                     for rz in rz0..=rz1 {
-                        if let Some(&tile_idx) = tile_grid.get(&(rx, rz)) {
-                            if aabb_intersects(aabb, &tiles[tile_idx].expanded(halo)) {
-                                tile_elements[tile_idx].push(elem_idx);
+                        if let Some(tile_indices) = tile_grid.get(&(rx, rz)) {
+                            for &tile_idx in tile_indices {
+                                if tile_elements[tile_idx].last() != Some(&elem_idx)
+                                    && aabb_intersects(aabb, &tiles[tile_idx].expanded(halo))
+                                {
+                                    tile_elements[tile_idx].push(elem_idx);
+                                }
                             }
                         }
                     }
@@ -267,14 +288,18 @@ pub fn assign_elements_to_tiles(
                 let (rx0, rx1, rz0, rz1) = region_range(aabb, TILE_EDITOR_HALO);
                 for rx in rx0..=rx1 {
                     for rz in rz0..=rz1 {
-                        if let Some(&tile_idx) = tile_grid.get(&(rx, rz)) {
-                            let expanded = tiles[tile_idx].expanded(TILE_EDITOR_HALO);
-                            if member_aabbs
-                                .iter()
-                                .copied()
-                                .any(|member_aabb| aabb_intersects(member_aabb, &expanded))
-                            {
-                                tile_elements[tile_idx].push(elem_idx);
+                        if let Some(tile_indices) = tile_grid.get(&(rx, rz)) {
+                            for &tile_idx in tile_indices {
+                                if tile_elements[tile_idx].last() != Some(&elem_idx) {
+                                    let expanded = tiles[tile_idx].expanded(TILE_EDITOR_HALO);
+                                    if member_aabbs
+                                        .iter()
+                                        .copied()
+                                        .any(|member_aabb| aabb_intersects(member_aabb, &expanded))
+                                    {
+                                        tile_elements[tile_idx].push(elem_idx);
+                                    }
+                                }
                             }
                         }
                     }
