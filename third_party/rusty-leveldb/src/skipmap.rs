@@ -133,7 +133,7 @@ impl InnerSkipMap {
 
         loop {
             unsafe {
-                if let Some(next) = (*current).skips[level] {
+                if let Some(next) = (&(*current).skips)[level] {
                     let ord = self.cmp.cmp((*next).key.as_slice(), key);
 
                     match ord {
@@ -176,7 +176,7 @@ impl InnerSkipMap {
 
         loop {
             unsafe {
-                if let Some(next) = (*current).skips[level] {
+                if let Some(next) = (&(*current).skips)[level] {
                     let ord = self.cmp.cmp((*next).key.as_slice(), key);
 
                     if let Ordering::Less = ord {
@@ -222,7 +222,7 @@ impl InnerSkipMap {
         // immediately smaller than the key to be inserted.
         loop {
             unsafe {
-                if let Some(next) = (*current).skips[level] {
+                if let Some(next) = (&(*current).skips)[level] {
                     // If the wanted position is after the current node
                     let ord = self.cmp.cmp(&(*next).key, &key);
 
@@ -260,8 +260,8 @@ impl InnerSkipMap {
         (0..new_height).for_each(|i| {
             if let Some(prev) = prevs[i] {
                 unsafe {
-                    new.skips[i] = (*prev).skips[i];
-                    (*prev).skips[i] = Some(newp);
+                    new.skips[i] = (&(*prev).skips)[i];
+                    (&mut (*prev).skips)[i] = Some(newp);
                 }
             }
         });
@@ -293,7 +293,7 @@ impl InnerSkipMap {
                     (*current).value,
                     (*current).skips
                 );
-                if let Some(next) = (*current).skips[0] {
+                if let Some(next) = (&(*current).skips)[0] {
                     current = next;
                 } else {
                     break;

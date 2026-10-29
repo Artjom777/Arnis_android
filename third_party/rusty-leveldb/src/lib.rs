@@ -21,6 +21,7 @@
 //! ```
 //!
 
+#![allow(warnings)]
 #![allow(dead_code)]
 
 #[cfg(feature = "fs")]
