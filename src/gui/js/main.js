@@ -2509,9 +2509,9 @@ function displayBboxSizeStatus(bboxSelectionElement, selectedSize) {
   const t = AREA_THRESHOLDS[selectedCelestialBody] || AREA_THRESHOLDS.earth;
   selectedSize *= earthScaleFactor();
   if (selectedSize > t.extreme) {
-    setBboxSelectionInfo(bboxSelectionElement, "area_extreme", "#ff4444");
+    setBboxSelectionInfo(bboxSelectionElement, "area_extreme", "#fecc44");
   } else if (selectedSize > t.large) {
-    setBboxSelectionInfo(bboxSelectionElement, "area_too_large", "#fa7878");
+    setBboxSelectionInfo(bboxSelectionElement, "area_too_large", "#fecc44");
   } else if (selectedSize > t.extensive) {
     setBboxSelectionInfo(bboxSelectionElement, "area_extensive", "#fecc44");
   } else {

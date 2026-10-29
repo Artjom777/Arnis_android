@@ -71,6 +71,7 @@ jobs:
       - name: Update Dependencies
         run: |
           cargo update -p reqwest || true
+          cargo update -p rusty-leveldb || true
 
       - name: Build APK
         run: |

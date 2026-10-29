@@ -98,3 +98,7 @@ path = "assets/refresh_wikidata_index.rs"
 # bedrockrs_proto_core leaves it unpinned so cargo update would break it.
 [patch."https://github.com/bedrock-crustaceans/nbtx"]
 nbtx = { git = "https://github.com/louis-e/nbtx", rev = "551c38ac74f2e68a07d3dbdd354faac0c0ac966e" }
+
+[patch.crates-io]
+rusty-leveldb = { path = "third_party/rusty-leveldb" }
+

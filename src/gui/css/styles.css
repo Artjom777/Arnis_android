@@ -230,9 +230,8 @@ a:hover {
   font-weight: bold;
   line-height: 1.25em;
   flex: 1;
+  word-break: break-word;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .progress-tiles-badge {

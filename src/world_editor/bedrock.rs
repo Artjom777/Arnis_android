@@ -93,17 +93,14 @@ const DEFAULT_BEDROCK_COMPRESSION_LEVEL: u8 = 6;
 /// LevelDB options for writing a Bedrock world. `mcpe_options` sets the
 /// compressors; this adds the workarounds for rusty-leveldb panics.
 ///
-/// In rusty-leveldb 3.0.3, LRU `remove` has a bug when evicting table cache entries.
-/// An Arnis world export writes at most a few dozen SSTable files total.
-/// By setting `write_buffer_size` to 64 MB and `max_open_files` to 1000 (cache capacity 990),
-/// the table cache never exceeds capacity during export, so it never needs to evict,
-/// which completely avoids the LRU list remove bug and avoids multi-table compaction thrashing.
+/// LevelDB options for Bedrock export with generous capacities and safe eviction.
 fn bedrock_db_options() -> Options {
     let mut opts = mcpe_options(DEFAULT_BEDROCK_COMPRESSION_LEVEL);
     opts.env = Rc::new(Box::new(MonotonicDiskEnv::new()));
     opts.write_buffer_size = 64 * 1024 * 1024;
     opts.max_file_size = 64 * 1024 * 1024;
     opts.max_open_files = 1000;
+    opts.block_cache_capacity_bytes = 64 * 1024 * 1024;
     opts
 }
 
@@ -400,7 +397,9 @@ impl BedrockWriter {
                 .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
             self.db = Some(db);
         }
-        Ok(self.db.as_mut().unwrap())
+        self.db
+            .as_mut()
+            .ok_or_else(|| BedrockSaveError::Database("LevelDB database failed to initialize".into()))
     }
 
     /// Stream a single sealed region directly to LevelDB on disk and release its memory.

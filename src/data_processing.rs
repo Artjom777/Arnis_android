@@ -1583,10 +1583,7 @@ pub fn generate_world_with_options(
                                         if let Some(w) = flush_worker.as_ref() {
                                             editor.flush_region_via(w, d.0, d.1)?;
                                         } else if world_format == WorldFormat::BedrockMcWorld {
-                                            if bedrock_writer.is_none() {
-                                                bedrock_writer = Some(editor.create_bedrock_writer());
-                                            }
-                                            let writer = bedrock_writer.as_mut().unwrap();
+                                            let writer = bedrock_writer.get_or_insert_with(|| editor.create_bedrock_writer());
                                             editor.flush_bedrock_region_via(writer, d.0, d.1)?;
                                         }
                                         evicted_regions.insert(d);
@@ -1887,10 +1884,7 @@ pub fn generate_world_with_options(
             if let Some(w) = flush_worker.as_ref() {
                 editor.flush_region_via(w, rx, rz)?;
             } else if world_format == WorldFormat::BedrockMcWorld {
-                if bedrock_writer.is_none() {
-                    bedrock_writer = Some(editor.create_bedrock_writer());
-                }
-                let writer = bedrock_writer.as_mut().unwrap();
+                let writer = bedrock_writer.get_or_insert_with(|| editor.create_bedrock_writer());
                 editor.flush_bedrock_region_via(writer, rx, rz)?;
             }
             evicted_regions.insert((rx, rz));
