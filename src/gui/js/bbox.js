@@ -1383,22 +1383,11 @@ $(document).ready(function () {
             return;
         }
 
-        // Keep any existing spawn point marker, clamping it inside the new bounds if needed.
+        // A spawn point picked for the previous area is meaningless here, and
+        // the frame reload this replaces used to drop it too.
         if (drawnItems) {
-            var minLat = Math.min(b[0], b[2]);
-            var maxLat = Math.max(b[0], b[2]);
-            var minLng = Math.min(b[1], b[3]);
-            var maxLng = Math.max(b[1], b[3]);
-            var newBounds = new L.LatLngBounds([minLat, minLng], [maxLat, maxLng]);
             drawnItems.eachLayer(function (layer) {
-                if (layer instanceof L.Marker) {
-                    var mLatLng = layer.getLatLng();
-                    if (!newBounds.contains(mLatLng)) {
-                        var clampedLat = Math.min(Math.max(mLatLng.lat, minLat), maxLat);
-                        var clampedLng = Math.min(Math.max(mLatLng.lng, minLng), maxLng);
-                        layer.setLatLng([clampedLat, clampedLng]);
-                    }
-                }
+                if (layer instanceof L.Marker) drawnItems.removeLayer(layer);
             });
             notifySpawnPointUpdate();
         }
@@ -2044,78 +2033,6 @@ $(document).ready(function () {
             });
     })();
 
-    // Spawn point tool: clicking the button activates spawn placement mode (standard behavior).
-    // Tapping on the map places the marker where clicked, and the marker is draggable.
-    (function initSpawnMarkerTool() {
-        var oldBtn = document.querySelector('.leaflet-draw-draw-marker');
-        if (!oldBtn || !oldBtn.parentNode) return;
-        var btn = oldBtn.cloneNode(true);
-        oldBtn.parentNode.replaceChild(btn, oldBtn);
-
-        var _spawnModeActive = false;
-
-        function setSpawnMode(active) {
-            _spawnModeActive = active;
-            btn.classList.toggle('leaflet-draw-toolbar-button-enabled', active);
-        }
-
-        function placeOrMoveSpawnMarker(latlng) {
-            var existingMarker = null;
-            drawnItems.eachLayer(function (l) {
-                if (l instanceof L.Marker) existingMarker = l;
-            });
-
-            if (existingMarker) {
-                existingMarker.setLatLng(latlng);
-                if (existingMarker.dragging) {
-                    existingMarker.dragging.enable();
-                }
-            } else {
-                var marker = L.marker(latlng, {
-                    icon: customMarkerIcon,
-                    draggable: true,
-                    autoPan: true
-                });
-                if (marker.dragging) {
-                    marker.dragging.enable();
-                }
-                marker.on('drag', function () {
-                    notifySpawnPointUpdate();
-                });
-                marker.on('dragend', function () {
-                    notifySpawnPointUpdate();
-                });
-                drawnItems.addLayer(marker);
-            }
-
-            notifySpawnPointUpdate();
-        }
-
-        L.DomEvent
-            .on(btn, 'mousedown dblclick', L.DomEvent.stopPropagation)
-            .on(btn, 'click', L.DomEvent.stop)
-            .on(btn, 'click', function () {
-                setSpawnMode(!_spawnModeActive);
-            });
-
-        // Tapping/clicking anywhere on the map while spawn mode is active places or moves the marker there
-        map.on('click', function (e) {
-            if (_spawnModeActive) {
-                placeOrMoveSpawnMarker(e.latlng);
-            }
-        });
-
-        // Turning on rectangle drawing or angle tool deactivates spawn mode
-        map.on('draw:drawstart', function () {
-            setSpawnMode(false);
-        });
-        if (typeof _angleToolBtn !== 'undefined' && _angleToolBtn) {
-            _angleToolBtn.addEventListener('click', function () {
-                setSpawnMode(false);
-            });
-        }
-    })();
-
     // Terrain preview button: usable once the selected bbox fits the 3D
     // preview size gate; clicking asks the parent to render the mini preview.
     (function addTerrainPreviewButton() {
@@ -2396,7 +2313,6 @@ $(document).ready(function () {
         }
 
         refreshBboxHandles();
-        notifySpawnPointUpdate();
     });
 
     map.on('draw:deleted', function (e) {
