@@ -1952,7 +1952,9 @@ fn gui_start_generation(
             let mc_spawn_point: Option<(i32, i32)> = if let Ok((transformer, pre_rot_bbox)) =
                 crate::projection::ProjectionSpec::from_args(&args).transformer(&bbox)
             {
-                let marker = spawn_point.and_then(|(lat, lng)| LLPoint::new(lat, lng).ok());
+                let marker = spawn_point
+                    .and_then(|(lat, lng)| LLPoint::new(lat, lng).ok())
+                    .filter(|llpoint| bbox.contains(llpoint));
                 match (marker, one_world_extending) {
                     (None, true) => None,
                     (marker, _) => {

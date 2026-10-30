@@ -1088,15 +1088,18 @@ pub fn generate_world_with_options(
     // Background writer for eviction; None unless eviction is active.
     let mut flush_worker: Option<FlushWorker> = None;
     // The spawn's region is kept resident (never evicted) so the finalize map-item lands on
-    // real ground. Resolved exactly like the finalize call; spawn doesn't change during generation.
-    // An explicit spawn wins over level.dat, which the CLI only updates after generation.
-    let spawn_region: Option<(i32, i32)> = place_branding.then(|| {
+    // real ground and spawn block height can be authoritatively inspected.
+    let spawn_region: Option<(i32, i32)> = {
         let (sx, sz) = options
             .spawn_point
             .or_else(|| crate::map_item::read_spawn_xz(&output_path))
-            .unwrap_or((xzbbox.min_x() + 1, xzbbox.min_z() + 1));
-        (sx >> 9, sz >> 9)
-    });
+            .unwrap_or_else(|| {
+                let x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
+                let z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
+                (x, z)
+            });
+        Some((sx >> 9, sz >> 9))
+    };
 
     // Decide between sequential and parallel processing based on world size.
     // Tile size is configurable (clamped to a minimum of 16 blocks, multiples of 16).
@@ -1922,7 +1925,11 @@ pub fn generate_world_with_options(
         let (sx, sz) = options
             .spawn_point
             .or_else(|| crate::map_item::read_spawn_xz(&output_path))
-            .unwrap_or((xzbbox.min_x() + 1, xzbbox.min_z() + 1));
+            .unwrap_or_else(|| {
+                let x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
+                let z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
+                (x, z)
+            });
         if wants_map_item {
             editor.place_map_item_frame(sx, sz, 0, 1);
         } else {

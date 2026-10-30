@@ -390,7 +390,7 @@ impl BedrockWriter {
             (mcworld_path, level_name)
         };
 
-        Self {
+        let writer = Self {
             output_dir,
             mcworld_path,
             level_name,
@@ -405,7 +405,9 @@ impl BedrockWriter {
             db: None,
             prepared: false,
             flushed_chunks_count: 0,
-        }
+        };
+        writer.cleanup_destination_pngs();
+        writer
     }
 
     /// Ensures the LevelDB database in the staging directory is open for streaming writes.
@@ -472,7 +474,7 @@ impl BedrockWriter {
         self.write_level_name()?;
 
         emit_gui_progress_update(91.0, "Saving Bedrock world...");
-        self.write_level_dat(xzbbox)?;
+        self.write_level_dat(world, xzbbox)?;
         self.ground = None;
 
         crate::world_utils::collect_memory(true);
@@ -539,20 +541,24 @@ impl BedrockWriter {
         Ok(())
     }
 
-    fn write_level_dat(&self, xzbbox: &XZBBox) -> Result<(), BedrockSaveError> {
+    fn write_level_dat(
+        &self,
+        world: &mut WorldToModify,
+        xzbbox: &XZBBox,
+    ) -> Result<(), BedrockSaveError> {
         // Create a complete level.dat for Bedrock with all required fields
         // The format is: 8 bytes header + NBT data
         // Header: version (4 bytes LE) + length (4 bytes LE)
 
         // Use custom spawn point if provided, otherwise center of bbox
-        let (spawn_x, spawn_z) = self.spawn_point.unwrap_or_else(|| {
+        let (mut spawn_x, mut spawn_z) = self.spawn_point.unwrap_or_else(|| {
             let x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
             let z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
             (x, z)
         });
 
-        // Calculate spawn Y from ground elevation data, or default to -61 (surface of standard Bedrock ground at -62)
-        let spawn_y = self
+        // Calculate baseline spawn Y from ground elevation data, or default to -60
+        let ground_lvl = self
             .ground
             .as_ref()
             .map(|ground| {
@@ -560,11 +566,62 @@ impl BedrockWriter {
                 let rel_x = spawn_x - xzbbox.min_x();
                 let rel_z = spawn_z - xzbbox.min_z();
                 let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
-                let lvl = ground.level(coord);
-                // Place player feet at lvl + 1 (standing directly on top of the ground block at lvl)
-                (lvl + 1).clamp(-63, 318)
+                ground.level(coord)
             })
-            .unwrap_or(-61);
+            .unwrap_or(-60);
+
+        // Find actual highest solid surface block at or near (spawn_x, spawn_z).
+        // Avoid spawning inside buildings/walls, underwater, or in the void.
+        let mut best_y = None;
+        let mut best_x = spawn_x;
+        let mut best_z = spawn_z;
+
+        'search: for r in 0..=16 {
+            for dx in -r..=r {
+                for dz in -r..=r {
+                    if dx.abs() != r && dz.abs() != r {
+                        continue;
+                    }
+                    let test_x = spawn_x + dx;
+                    let test_z = spawn_z + dz;
+
+                    for y in (ground_lvl.max(-60)..=318).rev() {
+                        if let Some(block) = world.get_block(test_x, y, test_z) {
+                            if block != crate::block_definitions::AIR
+                                && block != crate::block_definitions::WATER
+                            {
+                                best_y = Some(y);
+                                best_x = test_x;
+                                best_z = test_z;
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        spawn_x = best_x;
+        spawn_z = best_z;
+        let surface_y = best_y.unwrap_or(ground_lvl.max(-60));
+        let spawn_y = (surface_y + 1).clamp(-62, 317);
+
+        // Ensure 2 air blocks above surface for player body and head so Bedrock never detects obstruction
+        world.set_block(spawn_x, spawn_y, spawn_z, crate::block_definitions::AIR);
+        world.set_block(spawn_x, spawn_y + 1, spawn_z, crate::block_definitions::AIR);
+
+        // Guarantee solid footing beneath player feet
+        if world
+            .get_block(spawn_x, spawn_y - 1, spawn_z)
+            .map_or(true, |b| b == crate::block_definitions::AIR || b == crate::block_definitions::WATER)
+        {
+            world.set_block(
+                spawn_x,
+                spawn_y - 1,
+                spawn_z,
+                crate::block_definitions::STONE_BRICKS,
+            );
+        }
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -666,6 +723,8 @@ impl BedrockWriter {
             // Misc settings
             nether_scale: 8,
             spawn_radius: 0,
+            spawn_radius_camel: 0,
+            spawn_radius_pascal: 0,
             random_tick_speed: 1,
             function_command_limit: 10000,
             max_command_chain_length: 65535,
@@ -1222,6 +1281,7 @@ impl BedrockWriter {
         let mut buf_writer = writer.finish()?;
         IoWrite::flush(&mut buf_writer)?;
         drop(buf_writer);
+        self.cleanup_destination_pngs();
         crate::world_utils::collect_memory(true);
         Ok(())
     }
@@ -1232,11 +1292,37 @@ impl BedrockWriter {
             let _ = fs::remove_dir_all(&self.output_dir);
         }
         cleanup_orphaned_staging_dirs();
-        if let Some(stem) = self.mcworld_path.file_stem().and_then(|s| s.to_str()) {
-            let stale_png = self.mcworld_path.with_file_name(format!("{stem} map.png"));
-            let _ = fs::remove_file(stale_png);
-        }
+        self.cleanup_destination_pngs();
         Ok(())
+    }
+
+    /// Purges any leftover preview map PNG files from destination / download folder
+    fn cleanup_destination_pngs(&self) {
+        let parent = self.mcworld_path.parent();
+        let stem = self.mcworld_path.file_stem().and_then(|s| s.to_str()).unwrap_or("arnis_world");
+        Self::cleanup_png_in_dir(parent, stem);
+
+        #[cfg(target_os = "android")]
+        {
+            let download_dir = crate::world_utils::resolve_android_download_dir();
+            Self::cleanup_png_in_dir(Some(&download_dir), stem);
+        }
+    }
+
+    fn cleanup_png_in_dir(dir: Option<&Path>, stem: &str) {
+        if let Some(dir) = dir {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        if name.contains("map") || name.starts_with(stem) || name.starts_with("arnis_world") {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1564,6 +1650,10 @@ struct BedrockLevelDat {
     nether_scale: i32,
     #[serde(rename = "spawnradius")]
     spawn_radius: i32,
+    #[serde(rename = "spawnRadius")]
+    spawn_radius_camel: i32,
+    #[serde(rename = "SpawnRadius")]
+    spawn_radius_pascal: i32,
     #[serde(rename = "randomtickspeed")]
     random_tick_speed: i32,
     #[serde(rename = "functioncommandlimit")]
