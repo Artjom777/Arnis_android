@@ -1183,13 +1183,19 @@ function initSettings() {
 
   // Close the settings page
   function closeSettings() {
+    if (document.activeElement && typeof document.activeElement.blur === "function") {
+      document.activeElement.blur();
+    }
+    settingsModal.querySelectorAll('input, select, textarea').forEach((el) => {
+      if (typeof el.blur === 'function') el.blur();
+    });
+    if (window.getSelection) {
+      window.getSelection()?.removeAllRanges();
+    }
     settingsModal.style.display = "none";
     // Webview teardown events are not guaranteed, so commit here.
     flushSettingsStore();
     cancelSettingsResetConfirm();
-    if (focusBeforeSettings && typeof focusBeforeSettings.focus === "function") {
-      focusBeforeSettings.focus({ preventScroll: true });
-    }
     focusBeforeSettings = null;
   }
 
@@ -3363,8 +3369,8 @@ async function startGeneration() {
     var tile_size = 1024;
     if (customTileInput && customTileInput.value.trim() !== "") {
       let parsed = parseInt(customTileInput.value, 10);
-      if (!isNaN(parsed) && parsed >= 32) {
-        tile_size = Math.min(2048, Math.max(32, Math.round(parsed / 16) * 16));
+      if (!isNaN(parsed) && parsed >= 16) {
+        tile_size = Math.max(16, Math.round(parsed / 16) * 16);
       }
     }
 
@@ -3381,8 +3387,8 @@ async function startGeneration() {
     var leveldb_max_file_size_mb = 64;
     if (maxFileInput && maxFileInput.value.trim() !== "") {
       let parsed = parseInt(maxFileInput.value, 10);
-      if (!isNaN(parsed) && parsed >= 4) {
-        leveldb_max_file_size_mb = Math.min(512, Math.max(4, parsed));
+      if (!isNaN(parsed) && parsed >= 1) {
+        leveldb_max_file_size_mb = Math.max(1, parsed);
       }
     }
 
@@ -3390,8 +3396,8 @@ async function startGeneration() {
     var leveldb_write_buffer_size_mb = 64;
     if (writeBufferInput && writeBufferInput.value.trim() !== "") {
       let parsed = parseInt(writeBufferInput.value, 10);
-      if (!isNaN(parsed) && parsed >= 4) {
-        leveldb_write_buffer_size_mb = Math.min(512, Math.max(4, parsed));
+      if (!isNaN(parsed) && parsed >= 1) {
+        leveldb_write_buffer_size_mb = Math.max(1, parsed);
       }
     }
 
@@ -3399,8 +3405,8 @@ async function startGeneration() {
     var leveldb_cache_size_mb = 64;
     if (cacheInput && cacheInput.value.trim() !== "") {
       let parsed = parseInt(cacheInput.value, 10);
-      if (!isNaN(parsed) && parsed >= 8) {
-        leveldb_cache_size_mb = Math.min(1024, Math.max(8, parsed));
+      if (!isNaN(parsed) && parsed >= 1) {
+        leveldb_cache_size_mb = Math.max(1, parsed);
       }
     }
     var use_3d = document.getElementById("use-3d-toggle").checked;
@@ -3594,9 +3600,8 @@ function initCustomPerformanceSettings() {
 
   function clampTileSize(v) {
     let n = parseInt(v, 10);
-    if (isNaN(n) || n < 32) n = 32;
+    if (isNaN(n) || n < 16) n = 16;
     n = Math.round(n / 16) * 16;
-    if (n > 2048) n = 2048;
     return n;
   }
 
@@ -3606,10 +3611,10 @@ function initCustomPerformanceSettings() {
     return n;
   }
 
-  function clampDbOption(v, minVal, maxVal, defaultVal) {
+  function clampDbOption(v, minVal, defaultVal) {
     let n = parseInt(v, 10);
     if (isNaN(n)) n = defaultVal;
-    return Math.max(minVal, Math.min(maxVal, n));
+    return Math.max(minVal, n);
   }
 
   if (customTile) {
@@ -3633,7 +3638,7 @@ function initCustomPerformanceSettings() {
   if (maxFile) {
     const onMaxFileChange = () => {
       if (maxFile.value.trim() === "") return;
-      maxFile.value = clampDbOption(maxFile.value, 4, 512, 64);
+      maxFile.value = clampDbOption(maxFile.value, 1, 64);
     };
     maxFile.addEventListener("change", onMaxFileChange);
     maxFile.addEventListener("blur", onMaxFileChange);
@@ -3642,7 +3647,7 @@ function initCustomPerformanceSettings() {
   if (writeBuffer) {
     const onWriteBufferChange = () => {
       if (writeBuffer.value.trim() === "") return;
-      writeBuffer.value = clampDbOption(writeBuffer.value, 4, 512, 64);
+      writeBuffer.value = clampDbOption(writeBuffer.value, 1, 64);
     };
     writeBuffer.addEventListener("change", onWriteBufferChange);
     writeBuffer.addEventListener("blur", onWriteBufferChange);
@@ -3651,7 +3656,7 @@ function initCustomPerformanceSettings() {
   if (dbCache) {
     const onDbCacheChange = () => {
       if (dbCache.value.trim() === "") return;
-      dbCache.value = clampDbOption(dbCache.value, 8, 1024, 64);
+      dbCache.value = clampDbOption(dbCache.value, 1, 64);
     };
     dbCache.addEventListener("change", onDbCacheChange);
     dbCache.addEventListener("blur", onDbCacheChange);

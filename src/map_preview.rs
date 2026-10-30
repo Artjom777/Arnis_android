@@ -48,7 +48,7 @@ pub fn last_preview_result() -> Option<PreviewResult> {
     PREVIEW_STATE.lock().unwrap().1.clone()
 }
 
-/// Java: inside the world dir; Bedrock: "<name> map.png" next to the .mcworld.
+/// Java: inside the world dir; Bedrock: temporary directory to avoid cluttering user Downloads.
 pub fn preview_output_path(world_output: &Path, format: WorldFormat) -> PathBuf {
     match format {
         WorldFormat::BedrockMcWorld => {
@@ -56,7 +56,7 @@ pub fn preview_output_path(world_output: &Path, format: WorldFormat) -> PathBuf 
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("arnis_world");
-            world_output.with_file_name(format!("{stem} map.png"))
+            std::env::temp_dir().join(format!("{stem}_map.png"))
         }
         _ => world_output.join("arnis_world_map.png"),
     }

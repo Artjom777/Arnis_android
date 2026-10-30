@@ -96,14 +96,14 @@ static BEDROCK_CACHE_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
 
 /// Configures LevelDB options for Bedrock export in megabytes.
 pub fn set_bedrock_db_options(max_file_size_mb: usize, write_buffer_mb: usize, cache_mb: usize) {
-    if max_file_size_mb >= 4 {
-        BEDROCK_MAX_FILE_SIZE_MB.store(max_file_size_mb.clamp(4, 512), AtomicOrdering::Relaxed);
+    if max_file_size_mb >= 1 {
+        BEDROCK_MAX_FILE_SIZE_MB.store(max_file_size_mb, AtomicOrdering::Relaxed);
     }
-    if write_buffer_mb >= 4 {
-        BEDROCK_WRITE_BUFFER_SIZE_MB.store(write_buffer_mb.clamp(4, 512), AtomicOrdering::Relaxed);
+    if write_buffer_mb >= 1 {
+        BEDROCK_WRITE_BUFFER_SIZE_MB.store(write_buffer_mb, AtomicOrdering::Relaxed);
     }
-    if cache_mb >= 8 {
-        BEDROCK_CACHE_SIZE_MB.store(cache_mb.clamp(8, 1024), AtomicOrdering::Relaxed);
+    if cache_mb >= 1 {
+        BEDROCK_CACHE_SIZE_MB.store(cache_mb, AtomicOrdering::Relaxed);
     }
 }
 
@@ -119,10 +119,10 @@ fn bedrock_db_options() -> Options {
     let max_file_mb = BEDROCK_MAX_FILE_SIZE_MB.load(AtomicOrdering::Relaxed);
     let write_buffer_mb = BEDROCK_WRITE_BUFFER_SIZE_MB.load(AtomicOrdering::Relaxed);
     let cache_mb = BEDROCK_CACHE_SIZE_MB.load(AtomicOrdering::Relaxed);
-    opts.write_buffer_size = write_buffer_mb.max(4) * 1024 * 1024;
-    opts.max_file_size = max_file_mb.max(4) * 1024 * 1024;
+    opts.write_buffer_size = write_buffer_mb.max(1) * 1024 * 1024;
+    opts.max_file_size = max_file_mb.max(1) * 1024 * 1024;
     opts.max_open_files = 1000;
-    opts.block_cache_capacity_bytes = cache_mb.max(8) * 1024 * 1024;
+    opts.block_cache_capacity_bytes = cache_mb.max(1) * 1024 * 1024;
     opts
 }
 
@@ -1232,6 +1232,10 @@ impl BedrockWriter {
             let _ = fs::remove_dir_all(&self.output_dir);
         }
         cleanup_orphaned_staging_dirs();
+        if let Some(stem) = self.mcworld_path.file_stem().and_then(|s| s.to_str()) {
+            let stale_png = self.mcworld_path.with_file_name(format!("{stem} map.png"));
+            let _ = fs::remove_file(stale_png);
+        }
         Ok(())
     }
 }

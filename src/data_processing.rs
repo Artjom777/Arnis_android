@@ -1099,8 +1099,8 @@ pub fn generate_world_with_options(
     });
 
     // Decide between sequential and parallel processing based on world size.
-    // Tile size is configurable (clamped safely between 32 and 2048).
-    let tile_size = args.tile_size.clamp(32, 2048);
+    // Tile size is configurable (clamped to a minimum of 16 blocks, multiples of 16).
+    let tile_size = args.tile_size.max(16);
     let tiles = tile::create_tiles(&xzbbox, tile_size);
 
     // If tiled_generation is enabled (default) and there are 2 or more tiles,

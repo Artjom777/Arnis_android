@@ -248,14 +248,14 @@
   "settings_nav_performance": "RAM, tiles, LevelDB options",
   "settings_section_performance_desc": "Configure memory, tile size and Bedrock LevelDB storage parameters for large scale generation.",
   "custom_tile_size": "Tile Size (manual)",
-  "custom_tile_size_desc": "Size of each tile in blocks. Must be a multiple of 16 (range: 32–2048). Default: 1024.",
+  "custom_tile_size_desc": "Size of each tile in blocks. Must be a multiple of 16. Default: 1024.",
   "custom_ram_limit": "RAM Limit (MB)",
   "custom_ram_limit_desc": "Maximum RAM in MB (0 = auto, no upper limit). Default: Auto.",
   "leveldb_max_file_size": "LevelDB SSTable File Size (MB)",
-  "leveldb_max_file_size_desc": "Maximum size of each SST fragment in MB (multiple of 4: 4–512). Default: 64 MB.",
+  "leveldb_max_file_size_desc": "Maximum size of each SST fragment in MB (integer). Default: 64 MB.",
   "leveldb_write_buffer_size": "LevelDB Write Buffer (MB)",
-  "leveldb_write_buffer_size_desc": "In-memory write buffer before flushing chunks to disk (multiple of 4: 4–512). Default: 64 MB.",
+  "leveldb_write_buffer_size_desc": "In-memory write buffer before flushing chunks to disk in MB (integer). Default: 64 MB.",
   "leveldb_cache_size": "LevelDB Block Cache (MB)",
-  "leveldb_cache_size_desc": "Block read cache capacity in MB (multiple of 8: 8–1024). Default: 64 MB.",
+  "leveldb_cache_size_desc": "Block read cache capacity in MB (integer). Default: 64 MB.",
   "paste_from_clipboard": "Paste from clipboard"
 }

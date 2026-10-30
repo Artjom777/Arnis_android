@@ -37,8 +37,8 @@ impl TileBounds {
     }
 }
 
-/// Default tile size (512x512 = 1 Minecraft region = 32x32 chunks of 16 blocks each)
-pub const DEFAULT_TILE_SIZE: i32 = 512;
+/// Default tile size (1024x1024 = 2x2 Minecraft regions = 64x64 chunks of 16 blocks each)
+pub const DEFAULT_TILE_SIZE: i32 = 1024;
 
 /// Halo on each side of a tile editor's xzbbox during parallel processing.
 ///
@@ -58,8 +58,8 @@ const MAX_LINEAR_HALF_WIDTH_M: f64 = 40.0;
 pub fn create_tiles(xzbbox: &XZBBox, tile_size: i32) -> Vec<TileBounds> {
     let mut tiles = Vec::new();
 
-    // Guard tile_size to safe, valid bounds (32..=2048)
-    let safe_tile_size = tile_size.clamp(32, 2048);
+    // Guard tile_size to a valid positive minimum (multiple of 16 blocks)
+    let safe_tile_size = tile_size.max(16);
 
     // Align tile grid to tile_size boundaries using Euclidean division
     // to handle positive and negative world coordinates consistently

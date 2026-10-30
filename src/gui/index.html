@@ -1107,13 +1107,13 @@
                     <span class="setting-text">
                       <span class="setting-heading">
                         <span data-localize="custom_tile_size">Tile Size (blocks)</span>
-                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. Must be a multiple of 16 (chunk width). Default is 1024 (2×2 regions). Range: 32 to 2048.">?</span>
+                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. Must be a multiple of 16 (chunk width). Default is 1024. No upper limit.">?</span>
                       </span>
-                      <span class="setting-desc" data-localize="custom_tile_size_desc">Block size of each part (multiple of 16: 32, 64...2048). Default: 1024.</span>
+                      <span class="setting-desc" data-localize="custom_tile_size_desc">Block size of each part (multiple of 16). Default: 1024.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="custom-tile-size" name="custom-tile-size" min="32" max="2048" step="16" placeholder="1024">
+                    <input type="number" id="custom-tile-size" name="custom-tile-size" min="16" step="1" placeholder="1024">
                   </div>
                 </div>
 
@@ -1141,13 +1141,13 @@
                     <span class="setting-text">
                       <span class="setting-heading">
                         <span data-localize="leveldb_max_file_size">LevelDB Max File Size (MB)</span>
-                        <span class="tooltip-icon" data-tooltip="Maximum size of each SST file in Bedrock LevelDB. Default is 64 MB. Larger files reduce filesystem table count. Min 4 MB, max 512 MB.">?</span>
+                        <span class="tooltip-icon" data-tooltip="Maximum size of each SST file in Bedrock LevelDB in MB. Default is 64 MB. No upper limit.">?</span>
                       </span>
                       <span class="setting-desc" data-localize="leveldb_max_file_size_desc">Max SST fragment size for Bedrock. Default: 64 MB.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="leveldb-max-file-size" name="leveldb-max-file-size" min="4" max="512" step="4" placeholder="64">
+                    <input type="number" id="leveldb-max-file-size" name="leveldb-max-file-size" min="1" step="1" placeholder="64">
                   </div>
                 </div>
 
@@ -1158,13 +1158,13 @@
                     <span class="setting-text">
                       <span class="setting-heading">
                         <span data-localize="leveldb_write_buffer_size">LevelDB Write Buffer (MB)</span>
-                        <span class="tooltip-icon" data-tooltip="In-memory write buffer (MemTable) before flushing chunks to disk in Bedrock LevelDB. Default is 64 MB. Min 4 MB, max 512 MB.">?</span>
+                        <span class="tooltip-icon" data-tooltip="In-memory write buffer (MemTable) before flushing chunks to disk in Bedrock LevelDB in MB. Default is 64 MB. No upper limit.">?</span>
                       </span>
                       <span class="setting-desc" data-localize="leveldb_write_buffer_size_desc">RAM buffer for writing chunks before flush. Default: 64 MB.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="leveldb-write-buffer-size" name="leveldb-write-buffer-size" min="4" max="512" step="4" placeholder="64">
+                    <input type="number" id="leveldb-write-buffer-size" name="leveldb-write-buffer-size" min="1" step="1" placeholder="64">
                   </div>
                 </div>
 
@@ -1175,13 +1175,13 @@
                     <span class="setting-text">
                       <span class="setting-heading">
                         <span data-localize="leveldb_cache_size">LevelDB Block Cache (MB)</span>
-                        <span class="tooltip-icon" data-tooltip="Block cache capacity for reading and index structures in Bedrock LevelDB. Default is 64 MB. Min 8 MB, max 1024 MB.">?</span>
+                        <span class="tooltip-icon" data-tooltip="Block cache capacity for reading and index structures in Bedrock LevelDB in MB. Default is 64 MB. No upper limit.">?</span>
                       </span>
                       <span class="setting-desc" data-localize="leveldb_cache_size_desc">Block read cache for Bedrock LevelDB. Default: 64 MB.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="leveldb-cache-size" name="leveldb-cache-size" min="8" max="1024" step="8" placeholder="64">
+                    <input type="number" id="leveldb-cache-size" name="leveldb-cache-size" min="1" step="1" placeholder="64">
                   </div>
                 </div>
               </div>
