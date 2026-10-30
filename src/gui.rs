@@ -1817,7 +1817,7 @@ fn gui_start_generation(
                 projection: crate::projection::ProjectionKind::Local,
                 one_world: false,
                 tiled_generation: tiled_generation.unwrap_or(true),
-                tile_size: tile_size.unwrap_or(512).clamp(32, 2048),
+                tile_size: tile_size.unwrap_or(1024).clamp(32, 2048),
                 ram_limit_mb: ram_limit_mb.unwrap_or(0),
                 world_name: None,
                 one_world_run: None,

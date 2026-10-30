@@ -456,59 +456,6 @@
                   </div>
                 </div>
 
-                <!-- Tile Size Setting (part size) -->
-                <div class="settings-row setting-tile">
-                  <label for="tile-size-select" class="setting-label">
-                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-blocks"></use></svg>
-                    <span class="setting-text">
-                      <span class="setting-heading">
-                        <span data-localize="tile_size">Tile Size (part size)</span>
-                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. 32-128 uses ultra-low RAM (freeing memory for background apps like music/video). 512 is 1 Minecraft region (recommended). 1024-2048 is faster on high-RAM devices.">?</span>
-                      </span>
-                      <span class="setting-desc" data-localize="tile_size_desc">Block size of each part. Smaller sizes save RAM.</span>
-                    </span>
-                  </label>
-                  <div class="settings-control">
-                    <select id="tile-size-select" name="tile-size-select" class="settings-select">
-                      <option value="32" data-localize="tile_size_32">32×32 (2 chunks — ultra-low RAM)</option>
-                      <option value="64" data-localize="tile_size_64">64×64 (4 chunks — very low RAM)</option>
-                      <option value="128" data-localize="tile_size_128">128×128 (8 chunks — low RAM)</option>
-                      <option value="256" data-localize="tile_size_256">256×256 (16 chunks — minimal RAM)</option>
-                      <option value="512" selected data-localize="tile_size_512">512×512 (1 region — recommended)</option>
-                      <option value="768" data-localize="tile_size_768">768×768 (balanced)</option>
-                      <option value="1024" data-localize="tile_size_1024">1024×1024 (2×2 regions — high RAM)</option>
-                      <option value="1536" data-localize="tile_size_1536">1536×1536 (large)</option>
-                      <option value="2048" data-localize="tile_size_2048">2048×2048 (4×4 regions — maximum)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <!-- RAM Limit Setting -->
-                <div class="settings-row setting-tile">
-                  <label for="ram-limit-select" class="setting-label">
-                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-hard-drive"></use></svg>
-                    <span class="setting-text">
-                      <span class="setting-heading">
-                        <span data-localize="ram_limit">RAM Allocation Limit</span>
-                        <span class="tooltip-icon" data-tooltip="Maximum RAM allocated for Arnis. If generating a territory exceeds this limit, parts automatically stream to disk to prevent out-of-memory crashes.">?</span>
-                      </span>
-                      <span class="setting-desc" data-localize="ram_limit_desc">Memory limit for generation. Prevents out-of-memory.</span>
-                    </span>
-                  </label>
-                  <div class="settings-control">
-                    <select id="ram-limit-select" name="ram-limit-select" class="settings-select">
-                      <option value="0" selected data-localize="ram_limit_auto">Auto (device memory)</option>
-                      <option value="1024" data-localize="ram_limit_1gb">1 GB (ultra-low)</option>
-                      <option value="2048" data-localize="ram_limit_2gb">2 GB (low)</option>
-                      <option value="3072" data-localize="ram_limit_3gb">3 GB (standard mobile)</option>
-                      <option value="4096" data-localize="ram_limit_4gb">4 GB (balanced)</option>
-                      <option value="6144" data-localize="ram_limit_6gb">6 GB (powerful)</option>
-                      <option value="8192" data-localize="ram_limit_8gb">8 GB (high performance)</option>
-                      <option value="12288" data-localize="ram_limit_12gb">12 GB (maximum)</option>
-                    </select>
-                  </div>
-                </div>
-
                 <!-- Additional Buildings (Overture Maps ML-derived footprints) -->
                 <div class="settings-row setting-tile">
                   <label for="overture-toggle" class="setting-label">
@@ -1160,13 +1107,13 @@
                     <span class="setting-text">
                       <span class="setting-heading">
                         <span data-localize="custom_tile_size">Tile Size (blocks)</span>
-                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. Must be a multiple of 16 (chunk width). Default is 512 (1 region). Range: 32 to 2048.">?</span>
+                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. Must be a multiple of 16 (chunk width). Default is 1024 (2×2 regions). Range: 32 to 2048.">?</span>
                       </span>
-                      <span class="setting-desc" data-localize="custom_tile_size_desc">Block size of each part (multiple of 16: 32, 64...2048). Default 512.</span>
+                      <span class="setting-desc" data-localize="custom_tile_size_desc">Block size of each part (multiple of 16: 32, 64...2048). Default: 1024.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="custom-tile-size" name="custom-tile-size" min="32" max="2048" step="16" value="512">
+                    <input type="number" id="custom-tile-size" name="custom-tile-size" min="32" max="2048" step="16" placeholder="1024">
                   </div>
                 </div>
 
@@ -1177,13 +1124,13 @@
                     <span class="setting-text">
                       <span class="setting-heading">
                         <span data-localize="custom_ram_limit">RAM Allocation Limit (MB)</span>
-                        <span class="tooltip-icon" data-tooltip="Maximum RAM allocated for generation in MB. 0 enables auto-detection based on device RAM. Clamped to integer multiples of 256.">?</span>
+                        <span class="tooltip-icon" data-tooltip="Maximum RAM allocated for generation in MB. 0 enables auto-detection based on device RAM. Default: Auto.">?</span>
                       </span>
-                      <span class="setting-desc" data-localize="custom_ram_limit_desc">Memory limit for generation in MB (0 = auto-detect device RAM).</span>
+                      <span class="setting-desc" data-localize="custom_ram_limit_desc">Memory limit for generation in MB (0 = auto-detect device RAM). Default: Auto.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="custom-ram-limit" name="custom-ram-limit" min="0" max="65536" step="256" value="0">
+                    <input type="number" id="custom-ram-limit" name="custom-ram-limit" min="0" max="65536" step="256" placeholder="0 (Auto)">
                   </div>
                 </div>
 
@@ -1196,11 +1143,11 @@
                         <span data-localize="leveldb_max_file_size">LevelDB Max File Size (MB)</span>
                         <span class="tooltip-icon" data-tooltip="Maximum size of each SST file in Bedrock LevelDB. Default is 64 MB. Larger files reduce filesystem table count. Min 4 MB, max 512 MB.">?</span>
                       </span>
-                      <span class="setting-desc" data-localize="leveldb_max_file_size_desc">Max SST fragment size for Bedrock. Default 64 MB.</span>
+                      <span class="setting-desc" data-localize="leveldb_max_file_size_desc">Max SST fragment size for Bedrock. Default: 64 MB.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="leveldb-max-file-size" name="leveldb-max-file-size" min="4" max="512" step="4" value="64">
+                    <input type="number" id="leveldb-max-file-size" name="leveldb-max-file-size" min="4" max="512" step="4" placeholder="64">
                   </div>
                 </div>
 
@@ -1213,11 +1160,11 @@
                         <span data-localize="leveldb_write_buffer_size">LevelDB Write Buffer (MB)</span>
                         <span class="tooltip-icon" data-tooltip="In-memory write buffer (MemTable) before flushing chunks to disk in Bedrock LevelDB. Default is 64 MB. Min 4 MB, max 512 MB.">?</span>
                       </span>
-                      <span class="setting-desc" data-localize="leveldb_write_buffer_size_desc">RAM buffer for writing chunks before flush. Default 64 MB.</span>
+                      <span class="setting-desc" data-localize="leveldb_write_buffer_size_desc">RAM buffer for writing chunks before flush. Default: 64 MB.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="leveldb-write-buffer-size" name="leveldb-write-buffer-size" min="4" max="512" step="4" value="64">
+                    <input type="number" id="leveldb-write-buffer-size" name="leveldb-write-buffer-size" min="4" max="512" step="4" placeholder="64">
                   </div>
                 </div>
 
@@ -1230,11 +1177,11 @@
                         <span data-localize="leveldb_cache_size">LevelDB Block Cache (MB)</span>
                         <span class="tooltip-icon" data-tooltip="Block cache capacity for reading and index structures in Bedrock LevelDB. Default is 64 MB. Min 8 MB, max 1024 MB.">?</span>
                       </span>
-                      <span class="setting-desc" data-localize="leveldb_cache_size_desc">Block read cache for Bedrock LevelDB. Default 64 MB.</span>
+                      <span class="setting-desc" data-localize="leveldb_cache_size_desc">Block read cache for Bedrock LevelDB. Default: 64 MB.</span>
                     </span>
                   </label>
                   <div class="settings-control">
-                    <input type="number" id="leveldb-cache-size" name="leveldb-cache-size" min="8" max="1024" step="8" value="64">
+                    <input type="number" id="leveldb-cache-size" name="leveldb-cache-size" min="8" max="1024" step="8" placeholder="64">
                   </div>
                 </div>
               </div>

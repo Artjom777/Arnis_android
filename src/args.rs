@@ -70,8 +70,8 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub tiled_generation: bool,
 
-    /// Size of each tile in blocks for tiled generation (32..2048, default 512 = 1 Minecraft region).
-    #[arg(long, default_value_t = 512)]
+    /// Size of each tile in blocks for tiled generation (32..2048, default 1024 = 2x2 Minecraft regions).
+    #[arg(long, default_value_t = 1024)]
     pub tile_size: i32,
 
     /// User-configured RAM limit in megabytes (0 = auto-detect based on system memory).

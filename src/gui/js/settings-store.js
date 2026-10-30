@@ -24,8 +24,6 @@ const SETTINGS = [
   // Generation
   { id: 'generation-mode-select', kind: 'select', store: OWN },
   { id: 'tiled-generation-toggle', kind: 'checkbox', store: OWN },
-  { id: 'tile-size-select', kind: 'select', store: OWN },
-  { id: 'ram-limit-select', kind: 'select', store: OWN },
   { id: 'overture-toggle', kind: 'checkbox', store: OWN },
   { id: 'use-3d-toggle', kind: 'checkbox', store: OWN },
   { id: 'interior-toggle', kind: 'checkbox', store: OWN },
@@ -84,11 +82,11 @@ const SETTINGS = [
   { id: 'telemetry-toggle', kind: 'checkbox', store: EXTERNAL, revertable: false },
 
   // Performance & Memory
-  { id: 'custom-tile-size', kind: 'number', store: OWN },
-  { id: 'custom-ram-limit', kind: 'number', store: OWN },
-  { id: 'leveldb-max-file-size', kind: 'number', store: OWN },
-  { id: 'leveldb-write-buffer-size', kind: 'number', store: OWN },
-  { id: 'leveldb-cache-size', kind: 'number', store: OWN },
+  { id: 'custom-tile-size', kind: 'number', store: OWN, emptyDefault: true },
+  { id: 'custom-ram-limit', kind: 'number', store: OWN, emptyDefault: true },
+  { id: 'leveldb-max-file-size', kind: 'number', store: OWN, emptyDefault: true },
+  { id: 'leveldb-write-buffer-size', kind: 'number', store: OWN, emptyDefault: true },
+  { id: 'leveldb-cache-size', kind: 'number', store: OWN, emptyDefault: true },
 ];
 
 // Defaults the host resolves at runtime rather than from a DOM attribute.
@@ -177,6 +175,13 @@ function currentValue(entry) {
   const el = elementFor(entry);
   if (!el) return undefined;
 
+  if (entry.emptyDefault) {
+    const val = el.value.trim();
+    if (val === '') return '';
+    const n = parseFloat(val);
+    return Number.isFinite(n) ? n : '';
+  }
+
   switch (entry.kind) {
     case 'checkbox':
       return el.checked;
@@ -196,6 +201,10 @@ function currentValue(entry) {
 function defaultValue(entry) {
   const el = elementFor(entry);
   if (!el) return undefined;
+
+  if (entry.emptyDefault) {
+    return '';
+  }
 
   if (entry.dynamicDefault) {
     // Unresolved means unknown, so the revert button stays hidden rather than
@@ -233,6 +242,17 @@ function sanitize(entry, value) {
   const el = elementFor(entry);
   if (!el || value === undefined || value === null) return undefined;
 
+  if (entry.emptyDefault) {
+    if (value === '') return '';
+    const n = typeof value === 'number' ? value : parseFloat(value);
+    if (!Number.isFinite(n)) return '';
+    const min = parseFloat(el.min);
+    const max = parseFloat(el.max);
+    if (Number.isFinite(min) && n < min) return '';
+    if (Number.isFinite(max) && n > max) return '';
+    return n;
+  }
+
   switch (entry.kind) {
     case 'checkbox':
       return typeof value === 'boolean' ? value : undefined;
@@ -269,6 +289,15 @@ function sanitize(entry, value) {
 function writeValue(entry, value) {
   const el = elementFor(entry);
   if (!el || value === undefined) return;
+
+  if (entry.emptyDefault) {
+    const next = (value === '' || value === undefined || value === null) ? '' : String(value);
+    if (el.value === next) return;
+    el.value = next;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return;
+  }
 
   if (entry.kind === 'segmented') {
     // The group's click handler owns the active class, so click it. A greyed
@@ -313,6 +342,7 @@ function isModified(entry) {
   const current = currentValue(entry);
   const def = defaultValue(entry);
   if (current === undefined || def === undefined) return false;
+  if (entry.emptyDefault) return current !== '';
   if (entry.kind === 'number') return Math.abs(current - def) > 1e-9;
   return current !== def;
 }
@@ -327,6 +357,12 @@ function collectOwn() {
     if (entry.store !== OWN) continue;
     const value = currentValue(entry);
     if (value === undefined) continue;
+    if (entry.emptyDefault) {
+      if (value !== '') {
+        values[entry.id] = value;
+      }
+      continue;
+    }
     const def = defaultValue(entry);
     if (def !== undefined) {
       if (entry.kind === 'number') {
