@@ -559,10 +559,13 @@ fn add_localized_world_name(
     world_path
 }
 
-/// Calculates the default spawn point at X=1, Z=1 relative to the world origin.
+/// Calculates the default spawn point at the center of the bounding box.
 /// This is used when no spawn point is explicitly selected by the user.
 fn calculate_default_spawn(xzbbox: &XZBBox) -> (i32, i32) {
-    (xzbbox.min_x() + 1, xzbbox.min_z() + 1)
+    (
+        (xzbbox.min_x() + xzbbox.max_x()) / 2,
+        (xzbbox.min_z() + xzbbox.max_z()) / 2,
+    )
 }
 
 /// Sets the player spawn point in level.dat using Minecraft XZ coordinates.
@@ -971,6 +974,8 @@ fn clear_tile_caches_now() -> Result<String, String> {
     use crate::elevation::cache::clear_all_cached_tiles;
     use crate::land_cover::clear_land_cover_cache;
     use crate::models_3d::clear_model_caches;
+
+    crate::world_editor::bedrock::cleanup_orphaned_staging_dirs();
 
     let combined = clear_all_cached_tiles()
         .combined(clear_land_cover_cache())
@@ -1506,6 +1511,8 @@ fn gui_start_generation(
             return Err(msg);
         }
     };
+
+    crate::world_editor::bedrock::cleanup_orphaned_staging_dirs();
 
     progress::reset_progress_floor();
 

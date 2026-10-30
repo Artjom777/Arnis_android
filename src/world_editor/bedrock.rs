@@ -97,10 +97,10 @@ const DEFAULT_BEDROCK_COMPRESSION_LEVEL: u8 = 6;
 fn bedrock_db_options() -> Options {
     let mut opts = mcpe_options(DEFAULT_BEDROCK_COMPRESSION_LEVEL);
     opts.env = Rc::new(Box::new(MonotonicDiskEnv::new()));
-    opts.write_buffer_size = 4 * 1024 * 1024;
-    opts.max_file_size = 4 * 1024 * 1024;
+    opts.write_buffer_size = 64 * 1024 * 1024;
+    opts.max_file_size = 64 * 1024 * 1024;
     opts.max_open_files = 1000;
-    opts.block_cache_capacity_bytes = 16 * 1024 * 1024;
+    opts.block_cache_capacity_bytes = 64 * 1024 * 1024;
     opts
 }
 
@@ -486,6 +486,7 @@ impl BedrockWriter {
         if self.prepared {
             return Ok(());
         }
+        cleanup_orphaned_staging_dirs();
         if self.output_dir.exists() {
             if !is_arnis_staging_dir(&self.output_dir) {
                 return Err(BedrockSaveError::Io(std::io::Error::new(
@@ -1208,7 +1209,37 @@ impl BedrockWriter {
         if self.output_dir.exists() {
             let _ = fs::remove_dir_all(&self.output_dir);
         }
+        cleanup_orphaned_staging_dirs();
         Ok(())
+    }
+}
+
+/// Purges any orphaned staging directories leftover from previous runs across all candidate staging bases.
+pub fn cleanup_orphaned_staging_dirs() {
+    #[cfg(target_os = "android")]
+    {
+        let download_dir = crate::world_utils::resolve_android_download_dir();
+        let candidate_bases = [
+            std::env::var_os("TMPDIR").map(PathBuf::from),
+            Some(PathBuf::from("/data/data/com.louisdev.arnis/cache")),
+            Some(PathBuf::from("/data/user/0/com.louisdev.arnis/cache")),
+            dirs::cache_dir(),
+            Some(download_dir.join(".arnis_staging")),
+        ];
+        for base in candidate_bases.into_iter().flatten() {
+            if let Ok(entries) = fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        if name_str.starts_with("arnis_staging_") || name_str == ".arnis_staging" {
+                            let _ = fs::remove_dir_all(&path);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
