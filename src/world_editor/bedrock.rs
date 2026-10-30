@@ -893,12 +893,7 @@ impl BedrockWriter {
         // Write local player data to guarantee the player spawns at the exact coordinates
         // without triggering Bedrock's safe-spawn relocation algorithm.
         if let Some((sx, sy, sz)) = self.resolved_spawn {
-            let game_type = match self.game_mode {
-                crate::args::GameMode::Survival => 0,
-                crate::args::GameMode::Creative => 1,
-                crate::args::GameMode::Adventure => 2,
-                crate::args::GameMode::Spectator => 6,
-            };
+            let game_type = self.game_mode.bedrock_game_type();
             let player = BedrockLocalPlayer {
                 pos: vec![sx as f64 + 0.5, sy as f64, sz as f64 + 0.5],
                 rotation: vec![0.0, 0.0],
