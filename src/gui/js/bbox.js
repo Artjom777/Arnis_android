@@ -1586,13 +1586,12 @@ $(document).ready(function () {
         }
     });
 
-    // Custom icon for drawn markers with clear visibility and large touch target
-    var customMarkerIcon = L.divIcon({
-        className: 'custom-spawn-marker-container',
-        html: '<div style="width:32px;height:32px;background:#e74c3c;border:3px solid #ffffff;border-radius:50%;box-shadow:0 2px 8px rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;cursor:move;touch-action:none;"><svg viewBox=\'0 0 24 24\' width=\'18\' height=\'18\' fill=\'none\' stroke=\'white\' stroke-width=\'3\' stroke-linecap=\'round\' stroke-linejoin=\'round\'><circle cx=\'12\' cy=\'12\' r=\'3\'/><line x1=\'12\' y1=\'2\' x2=\'12\' y2=\'6\'/><line x1=\'12\' y1=\'18\' x2=\'12\' y2=\'22\'/><line x1=\'2\' y1=\'12\' x2=\'6\' y2=\'12\'/><line x1=\'18\' y1=\'12\' x2=\'22\' y2=\'12\'/></svg></div>',
-        iconSize: [32, 32],
-        iconAnchor: [16, 16],
-        popupAnchor: [0, -16]
+    // Custom icon for drawn markers
+    var customMarkerIcon = L.icon({
+        iconUrl: 'images/marker-icon.png',
+        iconSize: [20, 20],
+        iconAnchor: [10, 10],
+        popupAnchor: [0, -10]
     });
 
     // Calculate geographic angle between two lat/lng points (in degrees)
