@@ -2044,10 +2044,9 @@ $(document).ready(function () {
             });
     })();
 
-    // Single-click spawn point tool: clicking the marker button sets or re-centers
-    // the spawn marker at the bounding box center (or map center).
-    // It also allows tapping the map to move it, and dragging the marker freely.
-    (function makeSpawnMarkerOneClick() {
+    // Spawn point tool: clicking the button activates spawn placement mode (standard behavior).
+    // Tapping on the map places the marker where clicked, and the marker is draggable.
+    (function initSpawnMarkerTool() {
         var oldBtn = document.querySelector('.leaflet-draw-draw-marker');
         if (!oldBtn || !oldBtn.parentNode) return;
         var btn = oldBtn.cloneNode(true);
@@ -2058,17 +2057,6 @@ $(document).ready(function () {
         function setSpawnMode(active) {
             _spawnModeActive = active;
             btn.classList.toggle('leaflet-draw-toolbar-button-enabled', active);
-        }
-
-        function getTargetSpawnPoint() {
-            var rect = null;
-            drawnItems.eachLayer(function (l) {
-                if (l instanceof L.Rectangle) rect = l;
-            });
-            if (rect) {
-                return rect.getBounds().getCenter();
-            }
-            return map.getCenter();
         }
 
         function placeOrMoveSpawnMarker(latlng) {
@@ -2107,15 +2095,14 @@ $(document).ready(function () {
             .on(btn, 'mousedown dblclick', L.DomEvent.stopPropagation)
             .on(btn, 'click', L.DomEvent.stop)
             .on(btn, 'click', function () {
-                var target = getTargetSpawnPoint();
-                placeOrMoveSpawnMarker(target);
-                setSpawnMode(true);
+                setSpawnMode(!_spawnModeActive);
             });
 
-        // Tapping/clicking anywhere on the map while spawn mode is active moves the marker there
+        // Tapping/clicking anywhere on the map while spawn mode is active places the marker there
         map.on('click', function (e) {
             if (_spawnModeActive) {
                 placeOrMoveSpawnMarker(e.latlng);
+                setSpawnMode(false);
             }
         });
 
