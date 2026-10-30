@@ -291,6 +291,7 @@ pub struct BedrockWriter {
     db: Option<DB>,
     prepared: bool,
     flushed_chunks_count: usize,
+    resolved_spawn: Option<(i32, i32, i32)>,
 }
 
 impl BedrockWriter {
@@ -405,6 +406,7 @@ impl BedrockWriter {
             db: None,
             prepared: false,
             flushed_chunks_count: 0,
+            resolved_spawn: None,
         };
         writer.cleanup_destination_pngs();
         writer
@@ -542,8 +544,8 @@ impl BedrockWriter {
     }
 
     fn write_level_dat(
-        &self,
-        world: &mut WorldToModify,
+        &mut self,
+        world: &WorldToModify,
         xzbbox: &XZBBox,
     ) -> Result<(), BedrockSaveError> {
         // Create a complete level.dat for Bedrock with all required fields
@@ -583,27 +585,6 @@ impl BedrockWriter {
 
             let surface_y = highest_solid_y.unwrap_or(ground_lvl.max(-60));
             let sy = (surface_y + 1).clamp(-62, 317);
-
-            // Ensure solid footing (3x3 area) and clear air (3x3 area, 3 blocks high)
-            // so Bedrock never detects obstruction or unsafe ground at the user's chosen location
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    let px = sx + dx;
-                    let pz = sz + dz;
-
-                    // Solid footing beneath feet
-                    if world.get_block(px, sy - 1, pz).map_or(true, |b| {
-                        b == crate::block_definitions::AIR || b == crate::block_definitions::WATER
-                    }) {
-                        world.set_block(px, sy - 1, pz, crate::block_definitions::GRASS_BLOCK);
-                    }
-
-                    // Clear air for feet, body, and headroom
-                    world.set_block(px, sy, pz, crate::block_definitions::AIR);
-                    world.set_block(px, sy + 1, pz, crate::block_definitions::AIR);
-                    world.set_block(px, sy + 2, pz, crate::block_definitions::AIR);
-                }
-            }
 
             (sx, sz, sy)
         } else {
@@ -700,25 +681,10 @@ impl BedrockWriter {
                 best_coord.unwrap_or((fallback_x, fallback_z, ground_lvl.max(-60)));
             let sy = (surface_y + 1).clamp(-62, 317);
 
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    let px = sx + dx;
-                    let pz = sz + dz;
-
-                    if world.get_block(px, sy - 1, pz).map_or(true, |b| {
-                        b == crate::block_definitions::AIR || b == crate::block_definitions::WATER
-                    }) {
-                        world.set_block(px, sy - 1, pz, crate::block_definitions::GRASS_BLOCK);
-                    }
-
-                    world.set_block(px, sy, pz, crate::block_definitions::AIR);
-                    world.set_block(px, sy + 1, pz, crate::block_definitions::AIR);
-                    world.set_block(px, sy + 2, pz, crate::block_definitions::AIR);
-                }
-            }
-
             (sx, sz, sy)
         };
+
+        self.resolved_spawn = Some((spawn_x, spawn_y, spawn_z));
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -826,8 +792,8 @@ impl BedrockWriter {
             function_command_limit: 10000,
             max_command_chain_length: 65535,
             server_chunk_tick_range: 4,
-            limited_world_depth: 16,
-            limited_world_width: 16,
+            limited_world_depth: 0,
+            limited_world_width: 0,
             limited_world_origin_x: spawn_x,
             limited_world_origin_y: spawn_y,
             limited_world_origin_z: spawn_z,
@@ -923,6 +889,35 @@ impl BedrockWriter {
             DB::open(db_path.into_boxed_path(), opts)
                 .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?
         };
+
+        // Write local player data to guarantee the player spawns at the exact coordinates
+        // without triggering Bedrock's safe-spawn relocation algorithm.
+        if let Some((sx, sy, sz)) = self.resolved_spawn {
+            let game_type = match self.game_mode {
+                crate::args::GameMode::Survival => 0,
+                crate::args::GameMode::Creative => 1,
+                crate::args::GameMode::Adventure => 2,
+                crate::args::GameMode::Spectator => 6,
+            };
+            let player = BedrockLocalPlayer {
+                pos: vec![sx as f64 + 0.5, sy as f64, sz as f64 + 0.5],
+                rotation: vec![0.0, 0.0],
+                motion: vec![0.0, 0.0, 0.0],
+                dimension_id: 0,
+                dimension: 0,
+                spawn_x: sx,
+                spawn_y: sy,
+                spawn_z: sz,
+                spawn_dimension: 0,
+                fall_distance: 0.0,
+                on_ground: 1,
+                player_game_mode: game_type,
+            };
+            if let Ok(player_bytes) = nbtx::to_le_bytes(&player) {
+                db.put(b"~local_player", &player_bytes)
+                    .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+            }
+        }
 
         // Chunks per parallel-encode window: 64 on Android, 128 elsewhere.
         // Bounds transient memory burst while giving Rayon threads plenty of work.
@@ -1602,6 +1597,37 @@ fn value_to_i32(value: &Value) -> Option<i32> {
         Value::Double(v) => Some(*v as i32),
         _ => None,
     }
+}
+
+/// Local player entity structure saved into LevelDB key `~local_player`.
+/// Tells Minecraft Bedrock the player is already positioned at the designated coordinates,
+/// preventing the game from executing its safe-spawn relocation / danger avoidance algorithm.
+#[derive(serde::Serialize)]
+struct BedrockLocalPlayer {
+    #[serde(rename = "Pos")]
+    pos: Vec<f64>,
+    #[serde(rename = "Rotation")]
+    rotation: Vec<f32>,
+    #[serde(rename = "Motion")]
+    motion: Vec<f64>,
+    #[serde(rename = "DimensionId")]
+    dimension_id: i32,
+    #[serde(rename = "Dimension")]
+    dimension: i32,
+    #[serde(rename = "SpawnX")]
+    spawn_x: i32,
+    #[serde(rename = "SpawnY")]
+    spawn_y: i32,
+    #[serde(rename = "SpawnZ")]
+    spawn_z: i32,
+    #[serde(rename = "SpawnDimension")]
+    spawn_dimension: i32,
+    #[serde(rename = "FallDistance")]
+    fall_distance: f32,
+    #[serde(rename = "OnGround")]
+    on_ground: u8,
+    #[serde(rename = "PlayerGameMode")]
+    player_game_mode: i32,
 }
 
 /// Level.dat structure for Bedrock Edition
