@@ -3352,20 +3352,22 @@ async function startGeneration() {
     if (!oneWorld) notifyWorldChanged();
     if (oneWorld) setWorldNameLabel(oneWorldFolderName());
 
-    // Get spawn point coordinates: prefer real-time postMessage cache, fallback to direct iframe inspection
-    let spawnPoint = lastSelectedSpawnPoint;
-    if (!spawnPoint) {
-      try {
-        const mapFrame = document.querySelector('.map-container');
-        if (mapFrame && mapFrame.contentWindow && typeof mapFrame.contentWindow.getSpawnPointCoords === 'function') {
-          const coords = mapFrame.contentWindow.getSpawnPointCoords();
-          if (coords && typeof coords.lat === 'number' && typeof coords.lng === 'number') {
-            spawnPoint = [coords.lat, coords.lng];
-          }
+    // Get spawn point coordinates: directly check iframe first, fallback to postMessage cache
+    let spawnPoint = null;
+    try {
+      const mapFrame = document.querySelector('.map-container');
+      if (mapFrame && mapFrame.contentWindow && typeof mapFrame.contentWindow.getSpawnPointCoords === 'function') {
+        const coords = mapFrame.contentWindow.getSpawnPointCoords();
+        if (coords && typeof coords.lat === 'number' && typeof coords.lng === 'number') {
+          spawnPoint = [coords.lat, coords.lng];
+          lastSelectedSpawnPoint = spawnPoint;
         }
-      } catch (e) {
-        console.warn("Direct iframe access failed for spawn point:", e);
       }
+    } catch (e) {
+      console.warn("Direct iframe access failed for spawn point:", e);
+    }
+    if (!spawnPoint) {
+      spawnPoint = lastSelectedSpawnPoint;
     }
     console.log("Starting generation with spawnPoint:", spawnPoint);
 

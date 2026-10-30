@@ -1970,8 +1970,12 @@ fn gui_start_generation(
                     crate::projection::ProjectionSpec::from_args(&args).transformer(&bbox)
                 {
                     let marker = spawn_point.and_then(|(lat, lng)| {
-                        let clamped_lat = lat.clamp(bbox.min().lat(), bbox.max().lat());
-                        let clamped_lng = lng.clamp(bbox.min().lng(), bbox.max().lng());
+                        let min_lat = bbox.min().lat().min(bbox.max().lat());
+                        let max_lat = bbox.min().lat().max(bbox.max().lat());
+                        let min_lng = bbox.min().lng().min(bbox.max().lng());
+                        let max_lng = bbox.min().lng().max(bbox.max().lng());
+                        let clamped_lat = lat.clamp(min_lat, max_lat);
+                        let clamped_lng = lng.clamp(min_lng, max_lng);
                         LLPoint::new(clamped_lat, clamped_lng).ok()
                     });
                     let point = match (marker, one_world_extending) {
