@@ -1355,6 +1355,19 @@ impl WorldToModify {
     }
 
     #[inline]
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: Block) {
+        self.set_block_with_properties(
+            x,
+            y,
+            z,
+            BlockWithProperties {
+                block,
+                properties: None,
+            },
+        );
+    }
+
+    #[inline]
     pub fn set_block_with_properties(
         &mut self,
         x: i32,
