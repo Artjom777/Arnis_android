@@ -560,13 +560,18 @@ fn add_localized_world_name(
     world_path
 }
 
-/// Calculates the default spawn point at the center of the bounding box.
-/// This is used when no spawn point is explicitly selected by the user.
+/// Calculates the default spawn point starting from (0, 0),
+/// strictly non-negative (x >= 0, z >= 0), never on (0, 0), (0, 1), (1, 0), or (1, 1).
 fn calculate_default_spawn(xzbbox: &XZBBox) -> (i32, i32) {
-    (
-        (xzbbox.min_x() + xzbbox.max_x()) / 2,
-        (xzbbox.min_z() + xzbbox.max_z()) / 2,
-    )
+    let min_x = xzbbox.min_x().max(0);
+    let min_z = xzbbox.min_z().max(0);
+    let mut x = 2.max(min_x);
+    let mut z = 2.max(min_z);
+    if x <= 1 && z <= 1 {
+        x = 2;
+        z = 2;
+    }
+    (x, z)
 }
 
 /// Sets the player spawn point in level.dat using Minecraft XZ coordinates.
@@ -1598,12 +1603,25 @@ fn gui_start_generation(
                 calculate_default_spawn(&xzbbox)
             };
 
-            let (spawn_x, spawn_z) = map_transformation::rotate::rotate_xz_point(
+            let (mut spawn_x, mut spawn_z) = map_transformation::rotate::rotate_xz_point(
                 spawn_x,
                 spawn_z,
                 rotation_angle.clamp(-90.0, 90.0),
                 &xzbbox,
             );
+
+            if spawn_point.is_none() {
+                spawn_x = spawn_x.max(0);
+                spawn_z = spawn_z.max(0);
+                if (spawn_x == 0 && spawn_z == 0)
+                    || (spawn_x == 0 && spawn_z == 1)
+                    || (spawn_x == 1 && spawn_z == 0)
+                    || (spawn_x == 1 && spawn_z == 1)
+                {
+                    spawn_x = 2;
+                    spawn_z = 2;
+                }
+            }
 
             set_player_spawn_in_level_dat(&selected_world, spawn_x, spawn_z)
                 .map_err(|e| format!("Failed to set spawn point: {e}"))?;
@@ -1974,7 +1992,7 @@ fn gui_start_generation(
             generation_options.spawn_point = mc_spawn_point;
             // Y is corrected after generation.
             if one_world && !one_world_extending {
-                let (sx, sz) = mc_spawn_point.unwrap_or_else(|| {
+                let (mut sx, mut sz) = mc_spawn_point.unwrap_or_else(|| {
                     let (default_x, default_z) = calculate_default_spawn(&pre_rot_bbox);
                     map_transformation::rotate::rotate_xz_point(
                         default_x,
@@ -1983,6 +2001,18 @@ fn gui_start_generation(
                         &pre_rot_bbox,
                     )
                 });
+                if mc_spawn_point.is_none() {
+                    sx = sx.max(0);
+                    sz = sz.max(0);
+                    if (sx == 0 && sz == 0)
+                        || (sx == 0 && sz == 1)
+                        || (sx == 1 && sz == 0)
+                        || (sx == 1 && sz == 1)
+                    {
+                        sx = 2;
+                        sz = 2;
+                    }
+                }
                 if let Err(e) =
                     set_player_spawn_in_level_dat(&world_path.display().to_string(), sx, sz)
                 {

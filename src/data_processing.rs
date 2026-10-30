@@ -1094,8 +1094,8 @@ pub fn generate_world_with_options(
             .spawn_point
             .or_else(|| crate::map_item::read_spawn_xz(&output_path))
             .unwrap_or_else(|| {
-                let x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
-                let z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
+                let x = 2.max(xzbbox.min_x().max(0));
+                let z = 2.max(xzbbox.min_z().max(0));
                 (x, z)
             });
         Some((sx >> 9, sz >> 9))
@@ -1926,8 +1926,8 @@ pub fn generate_world_with_options(
             .spawn_point
             .or_else(|| crate::map_item::read_spawn_xz(&output_path))
             .unwrap_or_else(|| {
-                let x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
-                let z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
+                let x = 2.max(xzbbox.min_x().max(0));
+                let z = 2.max(xzbbox.min_z().max(0));
                 (x, z)
             });
         if wants_map_item {

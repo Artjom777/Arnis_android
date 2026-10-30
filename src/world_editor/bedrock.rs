@@ -607,66 +607,97 @@ impl BedrockWriter {
 
             (sx, sz, sy)
         } else {
-            // No custom spawn point selected: find the nearest normal place around center
-            let center_x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
-            let center_z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
+            // No custom spawn point selected:
+            // Count starting from (0, 0), strictly non-negative (x >= 0, z >= 0),
+            // and never spawn on (0, 0), (0, 1), (1, 0), or (1, 1).
+            let min_x = xzbbox.min_x().max(0);
+            let min_z = xzbbox.min_z().max(0);
+            let max_x = xzbbox.max_x().max(min_x);
+            let max_z = xzbbox.max_z().max(min_z);
 
             let ground_lvl = self
                 .ground
                 .as_ref()
                 .map(|ground| {
-                    let rel_x = center_x - xzbbox.min_x();
-                    let rel_z = center_z - xzbbox.min_z();
-                    let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
+                    let coord = crate::coordinate_system::cartesian::XZPoint::new(0, 0);
                     ground.level(coord)
                 })
                 .unwrap_or(-60);
 
             let mut best_coord = None;
+            let max_search_r = max_x.max(max_z).min(2048).max(16);
 
-            'search: for r in 0..=64 {
-                for dx in -r..=r {
-                    for dz in -r..=r {
-                        if dx.abs() != r && dz.abs() != r {
-                            continue;
+            // Search outwards starting from 0 ~ 0, skipping (0,0), (0,1), (1,0), (1,1)
+            'search: for r in 2..=max_search_r {
+                // Side 1: x = r, z in 0..=r
+                for z in 0..=r {
+                    let x = r;
+                    if x <= 1 && z <= 1 {
+                        continue;
+                    }
+                    if x < min_x || x > max_x || z < min_z || z > max_z {
+                        continue;
+                    }
+
+                    let ground_at = self
+                        .ground
+                        .as_ref()
+                        .map(|g| {
+                            let rel_x = x - xzbbox.min_x();
+                            let rel_z = z - xzbbox.min_z();
+                            g.level(crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z))
+                        })
+                        .unwrap_or(ground_lvl);
+
+                    for y in (ground_at.max(-60)..=318).rev() {
+                        if let Some(block) = world.get_block(x, y, z) {
+                            if block != crate::block_definitions::AIR
+                                && block != crate::block_definitions::WATER
+                            {
+                                best_coord = Some((x, z, y));
+                                break 'search;
+                            }
                         }
-                        let test_x = center_x + dx;
-                        let test_z = center_z + dz;
+                    }
+                }
 
-                        if test_x < xzbbox.min_x()
-                            || test_x > xzbbox.max_x()
-                            || test_z < xzbbox.min_z()
-                            || test_z > xzbbox.max_z()
-                        {
-                            continue;
-                        }
+                // Side 2: z = r, x in 0..r
+                for x in 0..r {
+                    let z = r;
+                    if x <= 1 && z <= 1 {
+                        continue;
+                    }
+                    if x < min_x || x > max_x || z < min_z || z > max_z {
+                        continue;
+                    }
 
-                        let ground_at = self
-                            .ground
-                            .as_ref()
-                            .map(|g| {
-                                let rel_x = test_x - xzbbox.min_x();
-                                let rel_z = test_z - xzbbox.min_z();
-                                g.level(crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z))
-                            })
-                            .unwrap_or(ground_lvl);
+                    let ground_at = self
+                        .ground
+                        .as_ref()
+                        .map(|g| {
+                            let rel_x = x - xzbbox.min_x();
+                            let rel_z = z - xzbbox.min_z();
+                            g.level(crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z))
+                        })
+                        .unwrap_or(ground_lvl);
 
-                        for y in (ground_at.max(-60)..=318).rev() {
-                            if let Some(block) = world.get_block(test_x, y, test_z) {
-                                if block != crate::block_definitions::AIR
-                                    && block != crate::block_definitions::WATER
-                                {
-                                    best_coord = Some((test_x, test_z, y));
-                                    break 'search;
-                                }
+                    for y in (ground_at.max(-60)..=318).rev() {
+                        if let Some(block) = world.get_block(x, y, z) {
+                            if block != crate::block_definitions::AIR
+                                && block != crate::block_definitions::WATER
+                            {
+                                best_coord = Some((x, z, y));
+                                break 'search;
                             }
                         }
                     }
                 }
             }
 
+            let fallback_x = 2.max(min_x);
+            let fallback_z = 2.max(min_z);
             let (sx, sz, surface_y) =
-                best_coord.unwrap_or((center_x, center_z, ground_lvl.max(-60)));
+                best_coord.unwrap_or((fallback_x, fallback_z, ground_lvl.max(-60)));
             let sy = (surface_y + 1).clamp(-62, 317);
 
             for dx in -1..=1 {
