@@ -1144,7 +1144,9 @@ impl BedrockWriter {
         let file = Self::open_mcworld_target(&self.mcworld_path)?;
         let buf_writer = BufWriter::with_capacity(64 * 1024, file);
         let mut writer = ZipWriter::new(buf_writer);
-        let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+        let options = FileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .large_file(true);
 
         // Add top-level files
         for file_name in ["levelname.txt", "metadata.json", "level.dat", "level.dat_old"] {
