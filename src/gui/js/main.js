@@ -3373,7 +3373,7 @@ async function startGeneration() {
     if (customRamInput && customRamInput.value.trim() !== "") {
       let parsed = parseInt(customRamInput.value, 10);
       if (!isNaN(parsed) && parsed >= 0) {
-        ram_limit_mb = Math.min(65536, Math.max(0, parsed));
+        ram_limit_mb = parsed;
       }
     }
 
@@ -3603,7 +3603,6 @@ function initCustomPerformanceSettings() {
   function clampRam(v) {
     let n = parseInt(v, 10);
     if (isNaN(n) || n < 0) n = 0;
-    if (n > 65536) n = 65536;
     return n;
   }
 

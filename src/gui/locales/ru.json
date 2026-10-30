@@ -250,7 +250,7 @@
   "custom_tile_size": "Размер плитки (вручную)",
   "custom_tile_size_desc": "Размер каждой плитки в блоках (кратно 16: 32–2048). По умолчанию: 1024.",
   "custom_ram_limit": "Лимит оперативной памяти (МБ)",
-  "custom_ram_limit_desc": "Максимальный объем ОЗУ в МБ (кратно 256). По умолчанию: авто.",
+  "custom_ram_limit_desc": "Максимальный объем ОЗУ в МБ (0 = авто, без ограничений). По умолчанию: авто.",
   "leveldb_max_file_size": "Размер файла LevelDB (SSTable, МБ)",
   "leveldb_max_file_size_desc": "Максимальный размер фрагмента .ldb в МБ (кратно 4: 4–512). По умолчанию: 64 МБ.",
   "leveldb_write_buffer_size": "Буфер записи LevelDB (MemTable, МБ)",

@@ -250,7 +250,7 @@
   "custom_tile_size": "Tile Size (manual)",
   "custom_tile_size_desc": "Size of each tile in blocks. Must be a multiple of 16 (range: 32–2048). Default: 1024.",
   "custom_ram_limit": "RAM Limit (MB)",
-  "custom_ram_limit_desc": "Maximum RAM allocated in MB (multiple of 256). Default: Auto.",
+  "custom_ram_limit_desc": "Maximum RAM in MB (0 = auto, no upper limit). Default: Auto.",
   "leveldb_max_file_size": "LevelDB SSTable File Size (MB)",
   "leveldb_max_file_size_desc": "Maximum size of each SST fragment in MB (multiple of 4: 4–512). Default: 64 MB.",
   "leveldb_write_buffer_size": "LevelDB Write Buffer (MB)",
