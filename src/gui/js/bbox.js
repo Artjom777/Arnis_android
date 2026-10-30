@@ -2098,11 +2098,10 @@ $(document).ready(function () {
                 setSpawnMode(!_spawnModeActive);
             });
 
-        // Tapping/clicking anywhere on the map while spawn mode is active places the marker there
+        // Tapping/clicking anywhere on the map while spawn mode is active places or moves the marker there
         map.on('click', function (e) {
             if (_spawnModeActive) {
                 placeOrMoveSpawnMarker(e.latlng);
-                setSpawnMode(false);
             }
         });
 
