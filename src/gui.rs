@@ -1586,10 +1586,9 @@ fn gui_start_generation(
                 .map_err(|e| format!("Failed to create coordinate transformer: {e}"))?;
 
             let (spawn_x, spawn_z) = if let Some(coords) = spawn_point {
-                let llpoint = LLPoint::new(coords.0, coords.1)
-                    .map_err(|e| format!("Failed to parse spawn point: {e}"))?;
-
-                if llbbox.contains(&llpoint) {
+                let clamped_lat = coords.0.clamp(llbbox.min().lat(), llbbox.max().lat());
+                let clamped_lng = coords.1.clamp(llbbox.min().lng(), llbbox.max().lng());
+                if let Ok(llpoint) = LLPoint::new(clamped_lat, clamped_lng) {
                     let xzpoint = transformer.transform_point(llpoint);
                     (xzpoint.x, xzpoint.z)
                 } else {
@@ -1947,31 +1946,27 @@ fn gui_start_generation(
             let args = args;
 
             // Calculate MC spawn coordinates from lat/lng if spawn point was provided
-            // Otherwise, default to X=1, Z=1 (relative to xzbbox min coordinates).
             // An extended One World keeps its spawn unless a marker was placed.
             let mc_spawn_point: Option<(i32, i32)> = if let Ok((transformer, pre_rot_bbox)) =
                 crate::projection::ProjectionSpec::from_args(&args).transformer(&bbox)
             {
-                let marker = spawn_point
-                    .and_then(|(lat, lng)| LLPoint::new(lat, lng).ok())
-                    .filter(|llpoint| bbox.contains(llpoint));
+                let marker = spawn_point.and_then(|(lat, lng)| {
+                    let clamped_lat = lat.clamp(bbox.min().lat(), bbox.max().lat());
+                    let clamped_lng = lng.clamp(bbox.min().lng(), bbox.max().lng());
+                    LLPoint::new(clamped_lat, clamped_lng).ok()
+                });
                 match (marker, one_world_extending) {
                     (None, true) => None,
-                    (marker, _) => {
-                        let (sx, sz) = match marker {
-                            Some(llpoint) => {
-                                let xzpoint = transformer.transform_point(llpoint);
-                                (xzpoint.x, xzpoint.z)
-                            }
-                            None => calculate_default_spawn(&pre_rot_bbox),
-                        };
+                    (Some(llpoint), _) => {
+                        let xzpoint = transformer.transform_point(llpoint);
                         Some(map_transformation::rotate::rotate_xz_point(
-                            sx,
-                            sz,
+                            xzpoint.x,
+                            xzpoint.z,
                             args.rotation,
                             &pre_rot_bbox,
                         ))
                     }
+                    (None, false) => None,
                 }
             } else {
                 None
@@ -1979,12 +1974,19 @@ fn gui_start_generation(
             generation_options.spawn_point = mc_spawn_point;
             // Y is corrected after generation.
             if one_world && !one_world_extending {
-                if let Some((sx, sz)) = mc_spawn_point {
-                    if let Err(e) =
-                        set_player_spawn_in_level_dat(&world_path.display().to_string(), sx, sz)
-                    {
-                        eprintln!("Warning: Failed to set spawn point: {e}");
-                    }
+                let (sx, sz) = mc_spawn_point.unwrap_or_else(|| {
+                    let (default_x, default_z) = calculate_default_spawn(&pre_rot_bbox);
+                    map_transformation::rotate::rotate_xz_point(
+                        default_x,
+                        default_z,
+                        args.rotation,
+                        &pre_rot_bbox,
+                    )
+                });
+                if let Err(e) =
+                    set_player_spawn_in_level_dat(&world_path.display().to_string(), sx, sz)
+                {
+                    eprintln!("Warning: Failed to set spawn point: {e}");
                 }
             }
 

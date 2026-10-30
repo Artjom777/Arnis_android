@@ -730,6 +730,9 @@ function setCelestialBody(body) {
   refreshBboxSelectionInfo();
 }
 
+// Track spawn point selected in map iframe
+var lastSelectedSpawnPoint = null;
+
 // Function to register the event listener for bbox updates from iframe
 function registerMessageEvent() {
   window.addEventListener('message', function (event) {
@@ -740,6 +743,17 @@ function registerMessageEvent() {
     if (bboxText && !event.data.type) {
       console.log("Updated BBOX Coordinates:", bboxText);
       displayBboxInfoText(bboxText);
+    }
+
+    // Spawn point placed or removed in map
+    if (event.data && event.data.type === 'spawnPointChanged') {
+      if (event.data.coords && typeof event.data.coords.lat === 'number' && typeof event.data.coords.lng === 'number') {
+        lastSelectedSpawnPoint = [event.data.coords.lat, event.data.coords.lng];
+        console.log("Received spawn point update:", lastSelectedSpawnPoint);
+      } else {
+        lastSelectedSpawnPoint = null;
+        console.log("Spawn point cleared");
+      }
     }
 
     // World toggled on the map toolbar
@@ -3338,17 +3352,22 @@ async function startGeneration() {
     if (!oneWorld) notifyWorldChanged();
     if (oneWorld) setWorldNameLabel(oneWorldFolderName());
 
-    // Get the map iframe reference
-    const mapFrame = document.querySelector('.map-container');
-    // Get spawn point coordinates if marker exists
-    let spawnPoint = null;
-    if (mapFrame && mapFrame.contentWindow && mapFrame.contentWindow.getSpawnPointCoords) {
-      const coords = mapFrame.contentWindow.getSpawnPointCoords();
-      // Convert object format to tuple format if coordinates exist
-      if (coords) {
-        spawnPoint = [coords.lat, coords.lng];
+    // Get spawn point coordinates: prefer real-time postMessage cache, fallback to direct iframe inspection
+    let spawnPoint = lastSelectedSpawnPoint;
+    if (!spawnPoint) {
+      try {
+        const mapFrame = document.querySelector('.map-container');
+        if (mapFrame && mapFrame.contentWindow && typeof mapFrame.contentWindow.getSpawnPointCoords === 'function') {
+          const coords = mapFrame.contentWindow.getSpawnPointCoords();
+          if (coords && typeof coords.lat === 'number' && typeof coords.lng === 'number') {
+            spawnPoint = [coords.lat, coords.lng];
+          }
+        }
+      } catch (e) {
+        console.warn("Direct iframe access failed for spawn point:", e);
       }
     }
+    console.log("Starting generation with spawnPoint:", spawnPoint);
 
     // Get generation mode from dropdown
     var generationMode = document.getElementById("generation-mode-select").value;

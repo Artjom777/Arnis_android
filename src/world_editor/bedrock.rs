@@ -550,78 +550,144 @@ impl BedrockWriter {
         // The format is: 8 bytes header + NBT data
         // Header: version (4 bytes LE) + length (4 bytes LE)
 
-        // Use custom spawn point if provided, otherwise center of bbox
-        let (mut spawn_x, mut spawn_z) = self.spawn_point.unwrap_or_else(|| {
-            let x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
-            let z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
-            (x, z)
-        });
+        // Use custom spawn point if provided (exact coordinates guaranteed),
+        // otherwise find the nearest safe dry ground around bbox center.
+        let (spawn_x, spawn_z, spawn_y) = if let Some((user_x, user_z)) = self.spawn_point {
+            // User explicitly picked a spawn point: guarantee exact X and Z coordinates under all conditions!
+            let sx = user_x;
+            let sz = user_z;
 
-        // Calculate baseline spawn Y from ground elevation data, or default to -60
-        let ground_lvl = self
-            .ground
-            .as_ref()
-            .map(|ground| {
-                // Ground elevation data expects coordinates relative to the XZ bbox origin
-                let rel_x = spawn_x - xzbbox.min_x();
-                let rel_z = spawn_z - xzbbox.min_z();
-                let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
-                ground.level(coord)
-            })
-            .unwrap_or(-60);
+            let ground_lvl = self
+                .ground
+                .as_ref()
+                .map(|ground| {
+                    let rel_x = sx - xzbbox.min_x();
+                    let rel_z = sz - xzbbox.min_z();
+                    let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
+                    ground.level(coord)
+                })
+                .unwrap_or(-60);
 
-        // Find actual highest solid surface block at or near (spawn_x, spawn_z).
-        // Avoid spawning inside buildings/walls, underwater, or in the void.
-        let mut best_y = None;
-        let mut best_x = spawn_x;
-        let mut best_z = spawn_z;
-
-        'search: for r in 0..=16 {
-            for dx in -r..=r {
-                for dz in -r..=r {
-                    if dx.abs() != r && dz.abs() != r {
-                        continue;
+            // Scan highest solid block at the exact (sx, sz) column
+            let mut highest_solid_y = None;
+            for y in (ground_lvl.max(-60)..=318).rev() {
+                if let Some(block) = world.get_block(sx, y, sz) {
+                    if block != crate::block_definitions::AIR
+                        && block != crate::block_definitions::WATER
+                    {
+                        highest_solid_y = Some(y);
+                        break;
                     }
-                    let test_x = spawn_x + dx;
-                    let test_z = spawn_z + dz;
+                }
+            }
 
-                    for y in (ground_lvl.max(-60)..=318).rev() {
-                        if let Some(block) = world.get_block(test_x, y, test_z) {
-                            if block != crate::block_definitions::AIR
-                                && block != crate::block_definitions::WATER
-                            {
-                                best_y = Some(y);
-                                best_x = test_x;
-                                best_z = test_z;
-                                break 'search;
+            let surface_y = highest_solid_y.unwrap_or(ground_lvl.max(-60));
+            let sy = (surface_y + 1).clamp(-62, 317);
+
+            // Ensure solid footing (3x3 area) and clear air (3x3 area, 3 blocks high)
+            // so Bedrock never detects obstruction or unsafe ground at the user's chosen location
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let px = sx + dx;
+                    let pz = sz + dz;
+
+                    // Solid footing beneath feet
+                    if world.get_block(px, sy - 1, pz).map_or(true, |b| {
+                        b == crate::block_definitions::AIR || b == crate::block_definitions::WATER
+                    }) {
+                        world.set_block(px, sy - 1, pz, crate::block_definitions::GRASS_BLOCK);
+                    }
+
+                    // Clear air for feet, body, and headroom
+                    world.set_block(px, sy, pz, crate::block_definitions::AIR);
+                    world.set_block(px, sy + 1, pz, crate::block_definitions::AIR);
+                    world.set_block(px, sy + 2, pz, crate::block_definitions::AIR);
+                }
+            }
+
+            (sx, sz, sy)
+        } else {
+            // No custom spawn point selected: find the nearest normal place around center
+            let center_x = (xzbbox.min_x() + xzbbox.max_x()) / 2;
+            let center_z = (xzbbox.min_z() + xzbbox.max_z()) / 2;
+
+            let ground_lvl = self
+                .ground
+                .as_ref()
+                .map(|ground| {
+                    let rel_x = center_x - xzbbox.min_x();
+                    let rel_z = center_z - xzbbox.min_z();
+                    let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
+                    ground.level(coord)
+                })
+                .unwrap_or(-60);
+
+            let mut best_coord = None;
+
+            'search: for r in 0..=64 {
+                for dx in -r..=r {
+                    for dz in -r..=r {
+                        if dx.abs() != r && dz.abs() != r {
+                            continue;
+                        }
+                        let test_x = center_x + dx;
+                        let test_z = center_z + dz;
+
+                        if test_x < xzbbox.min_x()
+                            || test_x > xzbbox.max_x()
+                            || test_z < xzbbox.min_z()
+                            || test_z > xzbbox.max_z()
+                        {
+                            continue;
+                        }
+
+                        let ground_at = self
+                            .ground
+                            .as_ref()
+                            .map(|g| {
+                                let rel_x = test_x - xzbbox.min_x();
+                                let rel_z = test_z - xzbbox.min_z();
+                                g.level(crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z))
+                            })
+                            .unwrap_or(ground_lvl);
+
+                        for y in (ground_at.max(-60)..=318).rev() {
+                            if let Some(block) = world.get_block(test_x, y, test_z) {
+                                if block != crate::block_definitions::AIR
+                                    && block != crate::block_definitions::WATER
+                                {
+                                    best_coord = Some((test_x, test_z, y));
+                                    break 'search;
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        spawn_x = best_x;
-        spawn_z = best_z;
-        let surface_y = best_y.unwrap_or(ground_lvl.max(-60));
-        let spawn_y = (surface_y + 1).clamp(-62, 317);
+            let (sx, sz, surface_y) =
+                best_coord.unwrap_or((center_x, center_z, ground_lvl.max(-60)));
+            let sy = (surface_y + 1).clamp(-62, 317);
 
-        // Ensure 2 air blocks above surface for player body and head so Bedrock never detects obstruction
-        world.set_block(spawn_x, spawn_y, spawn_z, crate::block_definitions::AIR);
-        world.set_block(spawn_x, spawn_y + 1, spawn_z, crate::block_definitions::AIR);
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let px = sx + dx;
+                    let pz = sz + dz;
 
-        // Guarantee solid footing beneath player feet
-        if world
-            .get_block(spawn_x, spawn_y - 1, spawn_z)
-            .map_or(true, |b| b == crate::block_definitions::AIR || b == crate::block_definitions::WATER)
-        {
-            world.set_block(
-                spawn_x,
-                spawn_y - 1,
-                spawn_z,
-                crate::block_definitions::STONE_BRICKS,
-            );
-        }
+                    if world.get_block(px, sy - 1, pz).map_or(true, |b| {
+                        b == crate::block_definitions::AIR || b == crate::block_definitions::WATER
+                    }) {
+                        world.set_block(px, sy - 1, pz, crate::block_definitions::GRASS_BLOCK);
+                    }
+
+                    world.set_block(px, sy, pz, crate::block_definitions::AIR);
+                    world.set_block(px, sy + 1, pz, crate::block_definitions::AIR);
+                    world.set_block(px, sy + 2, pz, crate::block_definitions::AIR);
+                }
+            }
+
+            (sx, sz, sy)
+        };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -1389,6 +1389,7 @@ $(document).ready(function () {
             drawnItems.eachLayer(function (layer) {
                 if (layer instanceof L.Marker) drawnItems.removeLayer(layer);
             });
+            notifySpawnPointUpdate();
         }
 
         var lyr = new L.Rectangle(new L.LatLngBounds([b[0], b[1]], [b[2], b[3]]), {
@@ -1418,6 +1419,11 @@ $(document).ready(function () {
         // Coordinates typed into the parent's bbox field
         if (event.data && event.data.type === 'setBbox') {
             applyBboxFromParent(event.data.bounds);
+        }
+
+        // Parent requests active spawn point
+        if (event.data && event.data.type === 'getSpawnPoint') {
+            notifySpawnPointUpdate();
         }
 
         // Earth / Moon / Mars picked in the settings modal
@@ -1550,6 +1556,24 @@ $(document).ready(function () {
     // Initialize the FeatureGroup to store editable layers
     drawnItems = new L.FeatureGroup();
     map.addLayer(drawnItems);
+
+    drawnItems.on('layeradd', function(e) {
+        if (e.layer instanceof L.Marker) {
+            if (e.layer.dragging) {
+                e.layer.dragging.enable();
+            }
+            e.layer.on('dragend', function() {
+                notifySpawnPointUpdate();
+            });
+            notifySpawnPointUpdate();
+        }
+    });
+
+    drawnItems.on('layerremove', function(e) {
+        if (e.layer instanceof L.Marker) {
+            notifySpawnPointUpdate();
+        }
+    });
 
     // Custom icon for drawn markers
     var customMarkerIcon = L.icon({
@@ -2325,6 +2349,7 @@ $(document).ready(function () {
         }
 
         refreshBboxHandles();
+        notifySpawnPointUpdate();
     });
 
     map.on('draw:edited', function (e) {
@@ -2347,6 +2372,7 @@ $(document).ready(function () {
         $('#boxbounds').text(formatBounds(bounds.getBounds(), '4326'));
         $('#boxboundsmerc').text(formatBounds(bounds.getBounds(), currentproj));
         notifyBboxUpdate();
+        notifySpawnPointUpdate();
         map.fitBounds(bounds.getBounds());
     });
 
@@ -2456,19 +2482,32 @@ function updateTerrainPreviewButton() {
 function getSpawnPointCoords() {
     // Check if there are any markers in drawn items
     const markers = [];
-    drawnItems.eachLayer(function(layer) {
-        if (layer instanceof L.Marker) {
-            const latLng = layer.getLatLng();
-            markers.push({
-                lat: latLng.lat,
-                lng: latLng.lng
-            });
-        }
-    });
+    if (typeof drawnItems !== 'undefined' && drawnItems) {
+        drawnItems.eachLayer(function(layer) {
+            if (layer instanceof L.Marker) {
+                const latLng = layer.getLatLng();
+                markers.push({
+                    lat: latLng.lat,
+                    lng: latLng.lng
+                });
+            }
+        });
+    }
 
     // Return the first marker found or null if none exists
     return markers.length > 0 ? markers[0] : null;
 }
 
-// Expose the function to the parent window
+// Notifies the parent window whenever the spawn point is added, moved, or removed
+function notifySpawnPointUpdate() {
+    var coords = getSpawnPointCoords();
+    try {
+        window.parent.postMessage({ type: 'spawnPointChanged', coords: coords }, '*');
+    } catch (e) {
+        console.warn("Could not postMessage spawn point to parent:", e);
+    }
+}
+
+// Expose the functions to the parent window
 window.getSpawnPointCoords = getSpawnPointCoords;
+window.notifySpawnPointUpdate = notifySpawnPointUpdate;
