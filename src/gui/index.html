@@ -75,6 +75,8 @@
     <symbol id="i-file-text" viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></symbol>
     <symbol id="i-tag" viewBox="0 0 24 24"><path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"/><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"/></symbol>
     <symbol id="i-external" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/><path d="M9 2v2"/><path d="M9 20v2"/></symbol>
+    <symbol id="i-clipboard" viewBox="0 0 24 24"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></symbol>
   </svg>
 
   <main class="container">
@@ -232,6 +234,14 @@
             <span class="settings-nav-text">
               <span class="settings-nav-title" data-localize="settings_section_advanced">Advanced</span>
               <span class="settings-nav-sub" data-localize="settings_nav_advanced">Build height, lighting, mods</span>
+            </span>
+            <span class="settings-nav-dot" aria-hidden="true"></span>
+          </button>
+          <button type="button" class="settings-nav-item" data-target="settings-section-performance">
+            <svg class="icon" aria-hidden="true"><use href="#i-cpu"></use></svg>
+            <span class="settings-nav-text">
+              <span class="settings-nav-title" data-localize="settings_section_performance">Performance &amp; Memory</span>
+              <span class="settings-nav-sub" data-localize="settings_nav_performance">Tiles, RAM, LevelDB buffers</span>
             </span>
             <span class="settings-nav-dot" aria-hidden="true"></span>
           </button>
@@ -736,8 +746,11 @@
                       <span class="setting-desc" data-localize="mapillary_token_desc">Free from mapillary.com/developer. Stays on this computer.</span>
                     </span>
                   </label>
-                  <div class="settings-control">
+                  <div class="settings-control input-action-group">
                     <input type="password" id="mapillary-token" name="mapillary-token" placeholder="MLY|..." autocomplete="off" spellcheck="false">
+                    <button type="button" class="field-paste-btn" data-target="mapillary-token" title="Вставить из буфера" aria-label="Вставить из буфера" data-localize-title="paste_from_clipboard">
+                      <svg class="icon"><use href="#i-clipboard"></use></svg>
+                    </button>
                   </div>
                 </div>
 
@@ -826,8 +839,11 @@
                       <span class="setting-desc" data-localize="custom_bounding_box_desc">Type exact coordinates instead of drawing on the map.</span>
                     </span>
                   </label>
-                  <div class="settings-control">
+                  <div class="settings-control input-action-group">
                     <input type="text" id="bbox-coords" name="bbox-coords" maxlength="55" placeholder="Format: lat,lng,lat,lng" autocomplete="off" spellcheck="false">
+                    <button type="button" class="field-paste-btn" data-target="bbox-coords" title="Вставить из буфера" aria-label="Вставить из буфера" data-localize-title="paste_from_clipboard">
+                      <svg class="icon"><use href="#i-clipboard"></use></svg>
+                    </button>
                   </div>
                 </div>
 
@@ -898,8 +914,11 @@
                       <span class="setting-desc" data-localize="custom_map_source_desc">Your own tile server, as a URL with {z}, {x} and {y}.</span>
                     </span>
                   </label>
-                  <div class="settings-control">
+                  <div class="settings-control input-action-group">
                     <input type="text" id="custom-tile-url" name="custom-tile-url" placeholder="https://example.com/{z}/{x}/{y}.png" autocomplete="off" spellcheck="false">
+                    <button type="button" class="field-paste-btn" data-target="custom-tile-url" title="Вставить из буфера" aria-label="Вставить из буфера" data-localize-title="paste_from_clipboard">
+                      <svg class="icon"><use href="#i-clipboard"></use></svg>
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1118,6 +1137,104 @@
                   </label>
                   <div class="settings-control">
                     <input type="checkbox" class="switch" id="enable-luanti-toggle" name="enable-luanti-toggle">
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- Performance & Memory -->
+            <section class="settings-section" id="settings-section-performance">
+              <header class="settings-section-head">
+                <span class="settings-section-icon" aria-hidden="true"><svg class="icon"><use href="#i-cpu"></use></svg></span>
+                <div>
+                  <h3 data-localize="settings_section_performance">Performance &amp; Memory</h3>
+                  <p data-localize="settings_section_performance_desc">Fine-tune generation tiles, memory allocation, and Bedrock LevelDB parameters.</p>
+                </div>
+              </header>
+
+              <div class="setting-grid">
+                <!-- Custom Tile Size (Part size, multiple of 16) -->
+                <div class="settings-row setting-tile">
+                  <label for="custom-tile-size" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-blocks"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="custom_tile_size">Tile Size (blocks)</span>
+                        <span class="tooltip-icon" data-tooltip="Size of each generation part in blocks. Must be a multiple of 16 (chunk width). Default is 512 (1 region). Range: 32 to 2048.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="custom_tile_size_desc">Block size of each part (multiple of 16: 32, 64...2048). Default 512.</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <input type="number" id="custom-tile-size" name="custom-tile-size" min="32" max="2048" step="16" value="512">
+                  </div>
+                </div>
+
+                <!-- Custom RAM Allocation Limit -->
+                <div class="settings-row setting-tile">
+                  <label for="custom-ram-limit" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-hard-drive"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="custom_ram_limit">RAM Allocation Limit (MB)</span>
+                        <span class="tooltip-icon" data-tooltip="Maximum RAM allocated for generation in MB. 0 enables auto-detection based on device RAM. Clamped to integer multiples of 256.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="custom_ram_limit_desc">Memory limit for generation in MB (0 = auto-detect device RAM).</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <input type="number" id="custom-ram-limit" name="custom-ram-limit" min="0" max="65536" step="256" value="0">
+                  </div>
+                </div>
+
+                <!-- Bedrock LevelDB Max SSTable File Size -->
+                <div class="settings-row setting-tile">
+                  <label for="leveldb-max-file-size" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-sliders"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="leveldb_max_file_size">LevelDB Max File Size (MB)</span>
+                        <span class="tooltip-icon" data-tooltip="Maximum size of each SST file in Bedrock LevelDB. Default is 64 MB. Larger files reduce filesystem table count. Min 4 MB, max 512 MB.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="leveldb_max_file_size_desc">Max SST fragment size for Bedrock. Default 64 MB.</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <input type="number" id="leveldb-max-file-size" name="leveldb-max-file-size" min="4" max="512" step="4" value="64">
+                  </div>
+                </div>
+
+                <!-- Bedrock LevelDB Write Buffer (MemTable) Size -->
+                <div class="settings-row setting-tile">
+                  <label for="leveldb-write-buffer-size" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-sliders"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="leveldb_write_buffer_size">LevelDB Write Buffer (MB)</span>
+                        <span class="tooltip-icon" data-tooltip="In-memory write buffer (MemTable) before flushing chunks to disk in Bedrock LevelDB. Default is 64 MB. Min 4 MB, max 512 MB.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="leveldb_write_buffer_size_desc">RAM buffer for writing chunks before flush. Default 64 MB.</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <input type="number" id="leveldb-write-buffer-size" name="leveldb-write-buffer-size" min="4" max="512" step="4" value="64">
+                  </div>
+                </div>
+
+                <!-- Bedrock LevelDB Block Cache Size -->
+                <div class="settings-row setting-tile is-wide">
+                  <label for="leveldb-cache-size" class="setting-label">
+                    <svg class="icon setting-icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+                    <span class="setting-text">
+                      <span class="setting-heading">
+                        <span data-localize="leveldb_cache_size">LevelDB Block Cache (MB)</span>
+                        <span class="tooltip-icon" data-tooltip="Block cache capacity for reading and index structures in Bedrock LevelDB. Default is 64 MB. Min 8 MB, max 1024 MB.">?</span>
+                      </span>
+                      <span class="setting-desc" data-localize="leveldb_cache_size_desc">Block read cache for Bedrock LevelDB. Default 64 MB.</span>
+                    </span>
+                  </label>
+                  <div class="settings-control">
+                    <input type="number" id="leveldb-cache-size" name="leveldb-cache-size" min="8" max="1024" step="8" value="64">
                   </div>
                 </div>
               </div>

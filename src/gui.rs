@@ -171,7 +171,8 @@ pub fn run_gui() -> Result<(), String> {
             gui_one_world_overlap,
             gui_get_one_world_overlays,
             gui_log,
-            gui_set_telemetry_consent
+            gui_set_telemetry_consent,
+            gui_set_bedrock_options
         ])
         .setup(|app| {
             let app_handle = app.handle();
@@ -1447,6 +1448,19 @@ impl Drop for BusySlot {
 // the tall-world datapack install - runs synchronously in this call, and a plain
 // `#[tauri::command]` would run all of it on the main thread with the window
 // stalled behind it. `(async)` puts it on the async runtime instead, so the GUI
+#[tauri::command]
+fn gui_set_bedrock_options(
+    max_file_size_mb: usize,
+    write_buffer_size_mb: usize,
+    cache_size_mb: usize,
+) {
+    crate::world_editor::bedrock::set_bedrock_db_options(
+        max_file_size_mb,
+        write_buffer_size_mb,
+        cache_size_mb,
+    );
+}
+
 // stays live from the click until the first progress event.
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
@@ -1494,9 +1508,20 @@ fn gui_start_generation(
     tiled_generation: Option<bool>,
     tile_size: Option<i32>,
     ram_limit_mb: Option<u64>,
+    leveldb_max_file_size_mb: Option<usize>,
+    leveldb_write_buffer_size_mb: Option<usize>,
+    leveldb_cache_size_mb: Option<usize>,
 ) -> Result<(), String> {
     use progress::emit_gui_error;
     use LLBBox;
+
+    if let (Some(max_f), Some(wb), Some(c)) = (
+        leveldb_max_file_size_mb,
+        leveldb_write_buffer_size_mb,
+        leveldb_cache_size_mb,
+    ) {
+        crate::world_editor::bedrock::set_bedrock_db_options(max_f, wb, c);
+    }
 
     // A One World is resolved inside the worker, once `Args` exist.
     let one_world = one_world && world_format == "java" && celestial_body_name == "earth";

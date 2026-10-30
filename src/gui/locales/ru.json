@@ -243,5 +243,19 @@
   "ram_limit_6gb": "6 ГБ (для мощных устройств)",
   "ram_limit_8gb": "8 ГБ (высокая производительность)",
   "ram_limit_12gb": "12 ГБ (максимум)",
-  "tiles_progress": "Плитки: {done} / {total}"
+  "tiles_progress": "Плитки: {done} / {total}",
+  "settings_section_performance": "Производительность и БД",
+  "settings_nav_performance": "ОЗУ, плитка, параметры LevelDB",
+  "settings_section_performance_desc": "Настройка плитки (тайлов), лимита ОЗУ и базы данных LevelDB для генерации больших территорий.",
+  "custom_tile_size": "Размер плитки (вручную)",
+  "custom_tile_size_desc": "Размер каждой плитки в блоках. Должен быть кратен 16 (диапазон: 32–2048).",
+  "custom_ram_limit": "Лимит оперативной памяти (МБ)",
+  "custom_ram_limit_desc": "Максимальный объем ОЗУ в мегабайтах (0 = автоматически). Например: 2048, 4096, 6144, 8192.",
+  "leveldb_max_file_size": "Размер файла LevelDB (SSTable, МБ)",
+  "leveldb_max_file_size_desc": "Максимальный размер одного файла .ldb в МБ (по умолчанию: 64 МБ, кратно 4: 4–512). Предотвращает исчерпание лимита открытых файлов в Android.",
+  "leveldb_write_buffer_size": "Буфер записи LevelDB (MemTable, МБ)",
+  "leveldb_write_buffer_size_desc": "Размер буфера записи в ОЗУ перед сбросом на диск в МБ (по умолчанию: 64 МБ, кратно 4: 4–512).",
+  "leveldb_cache_size": "Кэш блоков LevelDB (МБ)",
+  "leveldb_cache_size_desc": "Объем кэша блоков в ОЗУ в МБ (по умолчанию: 64 МБ, кратно 8: 8–1024).",
+  "paste_from_clipboard": "Вставить из буфера обмена"
 }

@@ -82,6 +82,13 @@ const SETTINGS = [
   // HTML default is off, so a revert or reset could only withdraw consent, which
   // is not their initial choice. No revert button, and reset leaves it alone.
   { id: 'telemetry-toggle', kind: 'checkbox', store: EXTERNAL, revertable: false },
+
+  // Performance & Memory
+  { id: 'custom-tile-size', kind: 'number', store: OWN },
+  { id: 'custom-ram-limit', kind: 'number', store: OWN },
+  { id: 'leveldb-max-file-size', kind: 'number', store: OWN },
+  { id: 'leveldb-write-buffer-size', kind: 'number', store: OWN },
+  { id: 'leveldb-cache-size', kind: 'number', store: OWN },
 ];
 
 // Defaults the host resolves at runtime rather than from a DOM attribute.

@@ -243,5 +243,19 @@
   "ram_limit_6gb": "6 GB (powerful)",
   "ram_limit_8gb": "8 GB (high performance)",
   "ram_limit_12gb": "12 GB (maximum)",
-  "tiles_progress": "Tiles: {done} / {total}"
+  "tiles_progress": "Tiles: {done} / {total}",
+  "settings_section_performance": "Performance & Database",
+  "settings_nav_performance": "RAM, tiles, LevelDB options",
+  "settings_section_performance_desc": "Configure memory, tile size and Bedrock LevelDB storage parameters for large scale generation.",
+  "custom_tile_size": "Tile Size (manual)",
+  "custom_tile_size_desc": "Size of each tile in blocks. Must be a multiple of 16 (range: 32–2048).",
+  "custom_ram_limit": "RAM Limit (MB)",
+  "custom_ram_limit_desc": "Maximum memory allocation in megabytes (0 = automatic). Examples: 2048, 4096, 6144, 8192.",
+  "leveldb_max_file_size": "LevelDB SSTable File Size (MB)",
+  "leveldb_max_file_size_desc": "Maximum size per .ldb table file in MB (default: 64 MB, step 4: 4–512). Prevents Android file descriptor exhaustion.",
+  "leveldb_write_buffer_size": "LevelDB Write Buffer (MB)",
+  "leveldb_write_buffer_size_desc": "In-memory write buffer before flushing to disk in MB (default: 64 MB, step 4: 4–512).",
+  "leveldb_cache_size": "LevelDB Block Cache (MB)",
+  "leveldb_cache_size_desc": "Block cache capacity in RAM in MB (default: 64 MB, step 8: 8–1024).",
+  "paste_from_clipboard": "Paste from clipboard"
 }

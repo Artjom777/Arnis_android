@@ -1025,3 +1025,11 @@ button,
   display: none !important;
 }
 
+input[type="text"],
+input[type="password"],
+input[type="number"] {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  -webkit-touch-callout: default !important;
+}
+

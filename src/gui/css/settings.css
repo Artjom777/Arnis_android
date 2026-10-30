@@ -707,6 +707,52 @@ label[for].setting-label {
   font-family: inherit;
   font-size: 13px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  -webkit-user-select: text !important;
+  user-select: text !important;
+  -webkit-touch-callout: default !important;
+}
+
+.settings-page .input-action-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 300px;
+}
+
+.settings-page .input-action-group input {
+  flex: 1 1 auto;
+  width: 0 !important;
+  min-width: 0;
+}
+
+.settings-page .field-paste-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--ui-field-border);
+  border-radius: 8px;
+  background-color: var(--ui-field);
+  color: var(--ui-accent);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+}
+
+.settings-page .field-paste-btn:hover,
+.settings-page .field-paste-btn:active {
+  background-color: rgba(254, 204, 68, 0.15);
+  border-color: var(--ui-accent);
+}
+
+.settings-page .field-paste-btn svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  fill: none;
 }
 
 .settings-page input[type="text"]:focus,
@@ -1056,7 +1102,8 @@ label[for].setting-label {
     box-sizing: border-box !important;
   }
 
-  .settings-page .save-path-control {
+  .settings-page .save-path-control,
+  .settings-page .input-action-group {
     width: 100% !important;
     max-width: 100% !important;
     min-width: 0 !important;

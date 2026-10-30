@@ -66,6 +66,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   initPrecomputeFacadesButton();
   initTooltips();
   handleBboxInput();
+  initCustomPerformanceSettings();
+  initClipboardPasteButtons();
   const localization = await getLocalization();
   await applyLocalization(localization);
   updateFormatToggleUI(selectedWorldFormat);
@@ -146,6 +148,14 @@ async function applyLocalization(localization) {
   // selector.
   document.querySelectorAll("#settings-modal [data-localize], .dialog [data-localize]").forEach((element) => {
     localizeElement(localization, { element }, element.dataset.localize);
+  });
+
+  document.querySelectorAll("[data-localize-title]").forEach((element) => {
+    const key = element.dataset.localizeTitle;
+    if (localization && localization[key]) {
+      element.title = localization[key];
+      element.setAttribute("aria-label", localization[key]);
+    }
   });
 
   // settings-store.js creates these buttons and owns their text.
@@ -2372,17 +2382,16 @@ function handleBboxInput() {
       return;
     }
 
-    // Regular expression to validate bbox input (supports both comma and space-separated formats)
-    const bboxPattern = /^(-?\d+(\.\d+)?)[,\s](-?\d+(\.\d+)?)[,\s](-?\d+(\.\d+)?)[,\s](-?\d+(\.\d+)?)$/;
+    // Clean input from enclosing brackets, parentheses, or "bbox:" prefix
+    const cleaned = input.replace(/^\[|\s*\]$/g, '').replace(/^\(|\s*\)$/g, '').replace(/^bbox:\s*/i, '').trim();
+    const parts = cleaned.split(/[\s,]+/).filter(Boolean);
 
-    if (bboxPattern.test(input)) {
-      const matches = input.match(bboxPattern);
-
+    if (parts.length === 4 && parts.every(p => /^-?\d+(\.\d+)?$/.test(p))) {
       // Extract coordinates (Lat / Lng order expected)
-      const lat1 = parseFloat(matches[1]);
-      const lng1 = parseFloat(matches[3]);
-      const lat2 = parseFloat(matches[5]);
-      const lng2 = parseFloat(matches[7]);
+      const lat1 = parseFloat(parts[0]);
+      const lng1 = parseFloat(parts[1]);
+      const lat2 = parseFloat(parts[2]);
+      const lng2 = parseFloat(parts[3]);
 
       // Validate latitude and longitude ranges in the expected Lat / Lng order
       if (
@@ -3351,9 +3360,35 @@ async function startGeneration() {
     var tiledGenToggle = document.getElementById("tiled-generation-toggle");
     var tiled_generation = tiledGenToggle ? tiledGenToggle.checked : true;
     var tileSizeSelect = document.getElementById("tile-size-select");
-    var tile_size = tileSizeSelect ? parseInt(tileSizeSelect.value, 10) : 512;
+    var customTileInput = document.getElementById("custom-tile-size");
+    var tile_size = 512;
+    if (customTileInput && customTileInput.value) {
+      let parsed = parseInt(customTileInput.value, 10);
+      if (!isNaN(parsed) && parsed >= 32) {
+        tile_size = Math.min(2048, Math.max(32, Math.round(parsed / 16) * 16));
+      }
+    } else if (tileSizeSelect) {
+      tile_size = parseInt(tileSizeSelect.value, 10) || 512;
+    }
+
     var ramLimitSelect = document.getElementById("ram-limit-select");
-    var ram_limit_mb = ramLimitSelect ? parseInt(ramLimitSelect.value, 10) : 0;
+    var customRamInput = document.getElementById("custom-ram-limit");
+    var ram_limit_mb = 0;
+    if (customRamInput && customRamInput.value !== "") {
+      let parsed = parseInt(customRamInput.value, 10);
+      if (!isNaN(parsed) && parsed >= 0) {
+        ram_limit_mb = Math.min(65536, Math.max(0, parsed));
+      }
+    } else if (ramLimitSelect) {
+      ram_limit_mb = parseInt(ramLimitSelect.value, 10) || 0;
+    }
+
+    var maxFileInput = document.getElementById("leveldb-max-file-size");
+    var leveldb_max_file_size_mb = maxFileInput ? (parseInt(maxFileInput.value, 10) || 64) : 64;
+    var writeBufferInput = document.getElementById("leveldb-write-buffer-size");
+    var leveldb_write_buffer_size_mb = writeBufferInput ? (parseInt(writeBufferInput.value, 10) || 64) : 64;
+    var cacheInput = document.getElementById("leveldb-cache-size");
+    var leveldb_cache_size_mb = cacheInput ? (parseInt(cacheInput.value, 10) || 64) : 64;
     var use_3d = document.getElementById("use-3d-toggle").checked;
     var heightLimitToggle = document.getElementById("disable-height-limit-toggle");
     // Disabled means unsupported for this body or format, so never send a stale tick.
@@ -3446,7 +3481,10 @@ async function startGeneration() {
         oneWorldName: oneWorld ? oneWorldFolderName() : "",
         tiledGeneration: tiled_generation,
         tileSize: tile_size,
-        ramLimitMb: ram_limit_mb
+        ramLimitMb: ram_limit_mb,
+        leveldbMaxFileSizeMb: leveldb_max_file_size_mb,
+        leveldbWriteBufferSizeMb: leveldb_write_buffer_size_mb,
+        leveldbCacheSizeMb: leveldb_cache_size_mb
     });
 
     console.log("Generation process started.");
@@ -3528,4 +3566,167 @@ async function loadWorldMapData() {
   } catch (error) {
     console.error("Failed to load world map data:", error);
   }
+}
+
+/**
+ * Initializes listeners and synchronization for custom performance, memory, and Bedrock LevelDB settings.
+ */
+function initCustomPerformanceSettings() {
+  const customTile = document.getElementById("custom-tile-size");
+  const tileSelect = document.getElementById("tile-size-select");
+  const customRam = document.getElementById("custom-ram-limit");
+  const ramSelect = document.getElementById("ram-limit-select");
+  const maxFile = document.getElementById("leveldb-max-file-size");
+  const writeBuffer = document.getElementById("leveldb-write-buffer-size");
+  const dbCache = document.getElementById("leveldb-cache-size");
+
+  function clampTileSize(v) {
+    let n = parseInt(v, 10);
+    if (isNaN(n) || n < 32) n = 32;
+    n = Math.round(n / 16) * 16;
+    if (n > 2048) n = 2048;
+    return n;
+  }
+
+  function clampRam(v) {
+    let n = parseInt(v, 10);
+    if (isNaN(n) || n < 0) n = 0;
+    if (n > 65536) n = 65536;
+    return n;
+  }
+
+  function clampDbOption(v, minVal, maxVal, defaultVal) {
+    let n = parseInt(v, 10);
+    if (isNaN(n)) n = defaultVal;
+    return Math.max(minVal, Math.min(maxVal, n));
+  }
+
+  if (customTile) {
+    const onTileChange = () => {
+      const clamped = clampTileSize(customTile.value);
+      customTile.value = clamped;
+      if (tileSelect) {
+        const match = Array.from(tileSelect.options).find(o => o.value === String(clamped));
+        if (match) {
+          tileSelect.value = String(clamped);
+        }
+      }
+    };
+    customTile.addEventListener("input", () => {
+      let n = parseInt(customTile.value, 10);
+      if (!isNaN(n) && tileSelect) {
+        let rounded = Math.round(n / 16) * 16;
+        const match = Array.from(tileSelect.options).find(o => o.value === String(rounded));
+        if (match) tileSelect.value = String(rounded);
+      }
+    });
+    customTile.addEventListener("change", onTileChange);
+    customTile.addEventListener("blur", onTileChange);
+  }
+
+  if (tileSelect && customTile) {
+    tileSelect.addEventListener("change", () => {
+      customTile.value = tileSelect.value;
+      customTile.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    if (tileSelect.value && (!customTile.value || customTile.value === "512")) {
+      customTile.value = tileSelect.value;
+    }
+  }
+
+  if (customRam) {
+    const onRamChange = () => {
+      const clamped = clampRam(customRam.value);
+      customRam.value = clamped;
+      if (ramSelect) {
+        const match = Array.from(ramSelect.options).find(o => o.value === String(clamped));
+        if (match) {
+          ramSelect.value = String(clamped);
+        }
+      }
+    };
+    customRam.addEventListener("input", () => {
+      let n = parseInt(customRam.value, 10);
+      if (!isNaN(n) && ramSelect) {
+        const match = Array.from(ramSelect.options).find(o => o.value === String(n));
+        if (match) ramSelect.value = String(n);
+      }
+    });
+    customRam.addEventListener("change", onRamChange);
+    customRam.addEventListener("blur", onRamChange);
+  }
+
+  if (ramSelect && customRam) {
+    ramSelect.addEventListener("change", () => {
+      customRam.value = ramSelect.value;
+      customRam.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    if (ramSelect.value && (!customRam.value || customRam.value === "0")) {
+      customRam.value = ramSelect.value;
+    }
+  }
+
+  if (maxFile) {
+    const onMaxFileChange = () => {
+      maxFile.value = clampDbOption(maxFile.value, 4, 512, 64);
+    };
+    maxFile.addEventListener("change", onMaxFileChange);
+    maxFile.addEventListener("blur", onMaxFileChange);
+  }
+
+  if (writeBuffer) {
+    const onWriteBufferChange = () => {
+      writeBuffer.value = clampDbOption(writeBuffer.value, 4, 512, 64);
+    };
+    writeBuffer.addEventListener("change", onWriteBufferChange);
+    writeBuffer.addEventListener("blur", onWriteBufferChange);
+  }
+
+  if (dbCache) {
+    const onDbCacheChange = () => {
+      dbCache.value = clampDbOption(dbCache.value, 8, 1024, 64);
+    };
+    dbCache.addEventListener("change", onDbCacheChange);
+    dbCache.addEventListener("blur", onDbCacheChange);
+  }
+}
+
+/**
+ * Initializes click handlers for all dedicated clipboard paste buttons (.field-paste-btn).
+ */
+function initClipboardPasteButtons() {
+  document.querySelectorAll('.field-paste-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const targetId = btn.dataset.target;
+      if (!targetId) return;
+      const targetInput = document.getElementById(targetId);
+      if (!targetInput) return;
+
+      try {
+        let text = "";
+        if (navigator.clipboard && navigator.clipboard.readText) {
+          text = await navigator.clipboard.readText();
+        }
+        if (!text) return;
+        text = text.trim();
+
+        if (targetId === 'bbox-coords') {
+          // Normalize coordinates
+          const cleaned = text.replace(/^\[|\s*\]$/g, '').replace(/^\(|\s*\)$/g, '').replace(/^bbox:\s*/i, '').trim();
+          const parts = cleaned.split(/[\s,]+/).filter(Boolean);
+          if (parts.length === 4) {
+            text = parts.join(',');
+          }
+        }
+
+        targetInput.value = text;
+        targetInput.focus();
+        targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+        targetInput.dispatchEvent(new Event('change', { bubbles: true }));
+      } catch (err) {
+        console.warn("Failed to read from clipboard:", err);
+      }
+    });
+  });
 }
