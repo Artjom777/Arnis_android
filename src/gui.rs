@@ -1520,8 +1520,6 @@ fn gui_start_generation(
     use progress::emit_gui_error;
     use LLBBox;
 
-    println!("gui_start_generation: received spawn_point = {:?}", spawn_point);
-
     if let (Some(max_f), Some(wb), Some(c)) = (
         leveldb_max_file_size_mb,
         leveldb_write_buffer_size_mb,
@@ -1972,29 +1970,20 @@ fn gui_start_generation(
                     crate::projection::ProjectionSpec::from_args(&args).transformer(&bbox)
                 {
                     let marker = spawn_point.and_then(|(lat, lng)| {
-                        let min_lat = bbox.min().lat().min(bbox.max().lat());
-                        let max_lat = bbox.min().lat().max(bbox.max().lat());
-                        let min_lng = bbox.min().lng().min(bbox.max().lng());
-                        let max_lng = bbox.min().lng().max(bbox.max().lng());
-                        let clamped_lat = lat.clamp(min_lat, max_lat);
-                        let clamped_lng = lng.clamp(min_lng, max_lng);
+                        let clamped_lat = lat.clamp(bbox.min().lat(), bbox.max().lat());
+                        let clamped_lng = lng.clamp(bbox.min().lng(), bbox.max().lng());
                         LLPoint::new(clamped_lat, clamped_lng).ok()
                     });
                     let point = match (marker, one_world_extending) {
                         (None, true) => None,
                         (Some(llpoint), _) => {
                             let xzpoint = transformer.transform_point(llpoint);
-                            let rotated = map_transformation::rotate::rotate_xz_point(
+                            Some(map_transformation::rotate::rotate_xz_point(
                                 xzpoint.x,
                                 xzpoint.z,
                                 args.rotation,
                                 &pre_rot_bbox,
-                            );
-                            println!(
-                                "gui_start_generation: calculated mc_spawn_point from lat/lng {:?} -> ({}, {})",
-                                spawn_point, rotated.0, rotated.1
-                            );
-                            Some(rotated)
+                            ))
                         }
                         (None, false) => None,
                     };
