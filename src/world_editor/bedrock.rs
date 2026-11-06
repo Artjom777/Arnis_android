@@ -402,6 +402,36 @@ pub struct BedrockWriter {
     addon: Option<crate::bedrock_addon::Addon>,
 }
 
+
+/// Local player entity structure saved into LevelDB key `~local_player`.
+/// Tells Minecraft Bedrock the player is already positioned at the designated coordinates,
+/// preventing the game from executing its safe-spawn relocation / danger avoidance algorithm.
+#[derive(serde::Serialize)]
+struct BedrockLocalPlayer {
+    #[serde(rename = "Pos")]
+    pos: Vec<f64>,
+    #[serde(rename = "Rotation")]
+    rotation: Vec<f32>,
+    #[serde(rename = "Motion")]
+    motion: Vec<f64>,
+    #[serde(rename = "Dimension")]
+    dimension: i32,
+    #[serde(rename = "SpawnX")]
+    spawn_x: i32,
+    #[serde(rename = "SpawnY")]
+    spawn_y: i32,
+    #[serde(rename = "SpawnZ")]
+    spawn_z: i32,
+    #[serde(rename = "SpawnDimension")]
+    spawn_dimension: i32,
+    #[serde(rename = "FallDistance")]
+    fall_distance: f32,
+    #[serde(rename = "OnGround")]
+    on_ground: u8,
+    #[serde(rename = "PlayerGameMode")]
+    player_game_mode: i32,
+}
+
 impl BedrockWriter {
     /// Creates a new BedrockWriter
     #[allow(clippy::too_many_arguments)]
@@ -526,34 +556,6 @@ impl BedrockWriter {
         Err(failure.expect("at least one staging candidate"))
     }
 
-/// Local player entity structure saved into LevelDB key `~local_player`.
-/// Tells Minecraft Bedrock the player is already positioned at the designated coordinates,
-/// preventing the game from executing its safe-spawn relocation / danger avoidance algorithm.
-#[derive(serde::Serialize)]
-struct BedrockLocalPlayer {
-    #[serde(rename = "Pos")]
-    pos: Vec<f64>,
-    #[serde(rename = "Rotation")]
-    rotation: Vec<f32>,
-    #[serde(rename = "Motion")]
-    motion: Vec<f64>,
-    #[serde(rename = "Dimension")]
-    dimension: i32,
-    #[serde(rename = "SpawnX")]
-    spawn_x: i32,
-    #[serde(rename = "SpawnY")]
-    spawn_y: i32,
-    #[serde(rename = "SpawnZ")]
-    spawn_z: i32,
-    #[serde(rename = "SpawnDimension")]
-    spawn_dimension: i32,
-    #[serde(rename = "FallDistance")]
-    fall_distance: f32,
-    #[serde(rename = "OnGround")]
-    on_ground: u8,
-    #[serde(rename = "PlayerGameMode")]
-    player_game_mode: i32,
-}
 
     fn resolve_spawn(&self, world: &WorldToModify, xzbbox: &XZBBox) -> (i32, i32, i32) {
         if let Some((user_x, user_z)) = self.spawn_point {

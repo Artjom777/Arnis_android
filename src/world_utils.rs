@@ -386,7 +386,6 @@ pub fn build_bedrock_output_with_name(
         counter += 1;
     }
 }
-}
 
 /// Creates a new Java Edition world in the given base directory.
 ///
