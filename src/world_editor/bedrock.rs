@@ -288,7 +288,7 @@ impl Env for MonotonicDiskEnv {
     }
     fn lock(&self, p: &Path) -> rusty_leveldb::Result<FileLock> {
         // Creating the lock file can meet the same holds; a held lock is LockError.
-        retry_while(
+        let res = retry_while(
             || self.inner.lock(p),
             |e| {
                 cfg!(windows)
@@ -298,10 +298,36 @@ impl Env for MonotonicDiskEnv {
                             | rusty_leveldb::StatusCode::IOError
                     )
             },
-        )
+        );
+        #[cfg(target_os = "android")]
+        if let Err(ref e) = res {
+            // Android FUSE mounts (/sdcard, /storage/emulated/0) return ENOSYS (code 38: Function not implemented)
+            // for flock / fcntl lock operations. Since Arnis creates a private, isolated
+            // staging directory per world, an OS-level flock failure is harmless.
+            let err_str = format!("{e:?}");
+            if err_str.contains("Function not implemented")
+                || err_str.contains("code: 38")
+                || err_str.contains("unknown lock error")
+            {
+                let _ = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(p);
+                return Ok(FileLock {
+                    id: p.to_string_lossy().to_string(),
+                });
+            }
+        }
+        res
     }
     fn unlock(&self, l: FileLock) -> rusty_leveldb::Result<()> {
-        self.inner.unlock(l)
+        let res = self.inner.unlock(l);
+        #[cfg(target_os = "android")]
+        if res.is_err() {
+            return Ok(());
+        }
+        res
     }
     fn new_logger(&self, p: &Path) -> rusty_leveldb::Result<Logger> {
         self.inner.new_logger(p)
