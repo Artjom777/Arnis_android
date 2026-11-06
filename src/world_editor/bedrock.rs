@@ -149,12 +149,37 @@ const SAVED_WITH_PROTOCOL: i32 = 859;
 /// Fixed upstream after 4.0.1; drop this once bedrockrs moves to a fixed release.
 const LEVELDB_MAX_OPEN_FILES: usize = 11;
 
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+static BEDROCK_MAX_FILE_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
+static BEDROCK_WRITE_BUFFER_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
+static BEDROCK_CACHE_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
+
+/// Configures LevelDB options for Bedrock export in megabytes.
+pub fn set_bedrock_db_options(max_file_size_mb: usize, write_buffer_mb: usize, cache_mb: usize) {
+    if max_file_size_mb >= 4 {
+        BEDROCK_MAX_FILE_SIZE_MB.store(max_file_size_mb.clamp(4, 512), AtomicOrdering::Relaxed);
+    }
+    if write_buffer_mb >= 4 {
+        BEDROCK_WRITE_BUFFER_SIZE_MB.store(write_buffer_mb.clamp(4, 512), AtomicOrdering::Relaxed);
+    }
+    if cache_mb >= 8 {
+        BEDROCK_CACHE_SIZE_MB.store(cache_mb.clamp(8, 1024), AtomicOrdering::Relaxed);
+    }
+}
+
 /// LevelDB options for writing a Bedrock world. `mcpe_options` sets the
 /// compressors; this adds the workarounds for rusty-leveldb panics.
 fn bedrock_db_options() -> Options {
     let mut opts = mcpe_options(DEFAULT_BEDROCK_COMPRESSION_LEVEL);
     opts.env = Rc::new(Box::new(MonotonicDiskEnv::new()));
     opts.max_open_files = LEVELDB_MAX_OPEN_FILES;
+    let max_file_mb = BEDROCK_MAX_FILE_SIZE_MB.load(AtomicOrdering::Relaxed);
+    let write_buffer_mb = BEDROCK_WRITE_BUFFER_SIZE_MB.load(AtomicOrdering::Relaxed);
+    let cache_mb = BEDROCK_CACHE_SIZE_MB.load(AtomicOrdering::Relaxed);
+    opts.write_buffer_size = write_buffer_mb.max(4) * 1024 * 1024;
+    opts.max_file_size = max_file_mb.max(4) * 1024 * 1024;
+    opts.block_cache_capacity_bytes = cache_mb.max(8) * 1024 * 1024;
     opts
 }
 
@@ -1459,6 +1484,35 @@ impl BedrockWriter {
 
         writer.finish()?.sync_all()?;
         Ok(())
+    }
+}
+
+/// Purges any orphaned staging directories leftover from previous runs across all candidate staging bases.
+pub fn cleanup_orphaned_staging_dirs() {
+    #[cfg(target_os = "android")]
+    {
+        let download_dir = crate::world_utils::resolve_android_download_dir();
+        let candidate_bases = [
+            std::env::var_os("TMPDIR").map(PathBuf::from),
+            Some(PathBuf::from("/data/data/com.louisdev.arnis/cache")),
+            Some(PathBuf::from("/data/user/0/com.louisdev.arnis/cache")),
+            dirs::cache_dir(),
+            Some(download_dir.join(".arnis_staging")),
+        ];
+        for base in candidate_bases.into_iter().flatten() {
+            if let Ok(entries) = fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        if name_str.starts_with("arnis_staging_") || name_str == ".arnis_staging" {
+                            let _ = fs::remove_dir_all(&path);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

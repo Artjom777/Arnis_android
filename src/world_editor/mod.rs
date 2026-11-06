@@ -1334,50 +1334,6 @@ impl<'a> WorldEditor<'a> {
         }
     }
 
-    /// Creates a BedrockWriter configured for this world's output directory and settings.
-    pub(crate) fn create_bedrock_writer(&self) -> BedrockWriter {
-        let level_name = self.bedrock_level_name.clone().unwrap_or_else(|| {
-            self.world_dir
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Arnis World")
-                .to_string()
-        });
-        BedrockWriter::new(
-            self.world_dir.clone(),
-            level_name,
-            self.bedrock_spawn_point,
-            self.ground.clone(),
-            self.bedrock_extend_height,
-            self.projection.clone(),
-            self.scale,
-            self.game_mode,
-            self.world_time,
-            self.start_with_map,
-        )
-    }
-
-    /// Evict one Bedrock region (stream-to-disk): encode its chunks and write them directly
-    /// into the staging LevelDB, then drop the region to keep resident memory flat.
-    pub(crate) fn flush_bedrock_region_via(
-        &mut self,
-        writer: &mut BedrockWriter,
-        rx: i32,
-        rz: i32,
-    ) -> Result<bool, String> {
-        if self.format != WorldFormat::BedrockMcWorld {
-            return Ok(false);
-        }
-        let Some(region) = self.world.regions.remove(&(rx, rz)) else {
-            return Ok(false);
-        };
-        writer
-            .flush_single_region(rx, rz, region)
-            .map_err(|e| format!("Failed to flush Bedrock region ({rx}, {rz}): {e:?}"))?;
-        self.flushed_regions.insert((rx, rz));
-        Ok(true)
-    }
-
     /// Merge another WorldToModify into this editor's world with authoritative bounds.
     /// Blocks within the authoritative region always overwrite; blocks outside only
     /// write if the target position is currently AIR (empty).
