@@ -47,12 +47,14 @@ pub enum ShieldStyle {
     Blue,
     /// Yellow plate, black text (German Bundesstrasse, Dutch N-roads style).
     Yellow,
-    /// Green plate, white text (UK primary routes, some European E-roads).
+    /// Green plate, yellow number (UK and Irish primary routes).
     Green,
     /// US interstate look: red-white-blue shield.
     Interstate,
     /// White shield with black text (US highways).
     White,
+    /// White plate, black text (UK and Irish roads off the primary network).
+    WhitePlate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -79,6 +81,9 @@ pub enum DecalKey {
     Poster(u8),
     /// Advertising column poster variant, 1x2 tiles.
     ColumnPoster(u8),
+    /// Front of an ATM, ticket or vending machine by asset name, 1x2 tiles, or 1x1 for a
+    /// small dispenser.
+    Machine(&'static str),
     /// "You are here" board centred on a world position, 2x2 tiles.
     LocalMap {
         x: i32,
@@ -104,6 +109,7 @@ impl DecalKey {
             DecalKey::Text { cols, .. } => (*cols as u32, 1),
             DecalKey::Poster(_) => super::posters::BILLBOARD_TILES,
             DecalKey::ColumnPoster(_) => super::posters::COLUMN_TILES,
+            DecalKey::Machine(name) => super::machines::tiles(name),
             DecalKey::LocalMap { .. } => (2, 2),
             _ => (1, 1),
         }
@@ -142,8 +148,9 @@ pub struct DecalRegistry {
 }
 
 impl DecalRegistry {
-    /// Ids 0 and 1 belong to the world preview map and the branding map.
-    pub const FIRST_ID: i32 = 2;
+    /// In a new world, the first two ids belong to the world preview map and the branding map.
+    #[cfg(test)]
+    pub const FIRST_ID: i32 = crate::map_item::FIRST_MAP_ID + 2;
 
     /// Assigns ids to `keys` in their sorted order.
     #[cfg(test)]
@@ -221,17 +228,24 @@ mod tests {
         let reg = DecalRegistry::from_keys(keys);
         assert_eq!(reg.len(), 3);
         // Ordering follows the enum: Pictogram < Text < Poster.
+        let first = DecalRegistry::FIRST_ID;
         let ids: Vec<i32> = reg.iter().map(|(_, e)| e.base_id).collect();
-        assert_eq!(ids[0], DecalRegistry::FIRST_ID);
-        assert_eq!(reg.get(&DecalKey::Pictogram("cafe")).unwrap().base_id, 2);
+        assert_eq!(ids[0], first);
+        assert_eq!(
+            reg.get(&DecalKey::Pictogram("cafe")).unwrap().base_id,
+            first
+        );
         let text = reg
             .get(&DecalKey::text(TextStyle::Fascia, "Bakery", 2))
             .unwrap();
-        assert_eq!((text.base_id, text.cols, text.rows), (3, 2, 1));
+        assert_eq!((text.base_id, text.cols, text.rows), (first + 1, 2, 1));
         let poster = reg.get(&DecalKey::Poster(0)).unwrap();
-        assert_eq!((poster.base_id, poster.cols, poster.rows), (5, 3, 2));
-        assert_eq!(poster.tile_id(2, 1), 5 + 5);
-        assert_eq!(reg.max_id(), 10);
+        assert_eq!(
+            (poster.base_id, poster.cols, poster.rows),
+            (first + 3, 3, 2)
+        );
+        assert_eq!(poster.tile_id(2, 1), first + 3 + 5);
+        assert_eq!(reg.max_id(), first + 8);
         assert_eq!(reg.tile_count(), 9);
     }
 

@@ -5,7 +5,10 @@ use crate::deterministic_rng::element_rng;
 use crate::element_processing::bridges::BridgeSurfaceMap;
 use crate::element_processing::surfaces::get_blocks_for_surface;
 use crate::element_processing::tree::Tree;
-use crate::floodfill_cache::{is_oversized_ring, BuildingFootprintBitmap, FloodFillCache};
+use crate::floodfill_cache::{
+    edge_in_hole, in_hole, is_oversized_ring, without_holes, BuildingFootprintBitmap,
+    FloodFillCache, Holes, InnerRings,
+};
 use crate::osm_parser::{ProcessedMemberRole, ProcessedRelation, ProcessedWay};
 use crate::world_editor::WorldEditor;
 use rand::Rng;
@@ -18,21 +21,45 @@ pub fn generate_leisure(
     building_footprints: &BuildingFootprintBitmap,
     bridge_surface: &BridgeSurfaceMap,
 ) {
+    leisure_area(
+        editor,
+        element,
+        args,
+        flood_fill_cache,
+        building_footprints,
+        bridge_surface,
+        None,
+    );
+}
+
+/// A leisure area less the cells of `holes`.
+fn leisure_area(
+    editor: &mut WorldEditor,
+    element: &ProcessedWay,
+    args: &Args,
+    flood_fill_cache: &FloodFillCache,
+    building_footprints: &BuildingFootprintBitmap,
+    bridge_surface: &BridgeSurfaceMap,
+    holes: Option<&Holes>,
+) {
     if let Some(leisure_type) = element.tags.get("leisure") {
+        // A reserve is a boundary around whatever grows there, which the land cover draws.
+        if leisure_type == "nature_reserve" {
+            return;
+        }
         let mut previous_node: Option<(i32, i32)> = None;
         let mut corner_count: i32 = 0;
         let mut current_leisure: Vec<(i32, i32)> = vec![];
 
         // Determine block type based on leisure type
         let mut block_type: Block = match leisure_type.as_str() {
-            "park" | "nature_reserve" | "garden" | "disc_golf_course" | "golf_course" => {
-                GRASS_BLOCK
-            }
+            "park" | "garden" | "disc_golf_course" | "golf_course" => GRASS_BLOCK,
             "schoolyard" => BLACK_CONCRETE,
             "playground" | "recreation_ground" | "pitch" | "beach_resort" | "dog_park" => {
                 GREEN_STAINED_HARDENED_CLAY
             }
-            "swimming_pool" | "swimming_area" => WATER, // Swimming area: Area in a larger body of water for swimming
+            // Area in a larger body of water. Pools have their own basin in swimming_pools.rs.
+            "swimming_area" => WATER,
             "marina" => WATER, // A sort of parking lot for small watercraft
             "bathing_place" => SMOOTH_SANDSTONE, // Could be sand or concrete
             "outdoor_seating" => SMOOTH_STONE, //Usually stone or stone bricks
@@ -51,6 +78,7 @@ pub fn generate_leisure(
 
         // Resolve the fill before painting the edge, for the same reason as in natural.rs:
         // a closed ring the fill refused must not leave a border around unfilled ground.
+        // Hole cells are skipped where read, so the shared fill is not copied.
         let filled_area = flood_fill_cache.get_or_compute(element, args.timeout.as_ref());
         if filled_area.is_empty() && is_oversized_ring(element) {
             return;
@@ -63,6 +91,9 @@ pub fn generate_leisure(
                 let bresenham_points: Vec<(i32, i32, i32)> =
                     bresenham_line(prev.0, 0, prev.1, node.x, 0, node.z);
                 for (bx, _, bz) in bresenham_points {
+                    if edge_in_hole(holes, bx, bz) {
+                        continue;
+                    }
                     editor.set_block(
                         block_type,
                         bx,
@@ -92,6 +123,9 @@ pub fn generate_leisure(
             let mut rng = element_rng(element.id);
 
             for &(x, z) in filled_area.iter() {
+                if in_hole(holes, x, z) {
+                    continue;
+                }
                 if leisure_type == "schoolyard" && editor.nested_area_owns(x, z) {
                     continue;
                 }
@@ -103,7 +137,7 @@ pub fn generate_leisure(
                 // read as grass here and only the mask tells them apart. Halo cells
                 // are left to the tile that owns them, whose own random sequence
                 // decides what grows there.
-                if matches!(leisure_type.as_str(), "park" | "garden" | "nature_reserve")
+                if matches!(leisure_type.as_str(), "park" | "garden")
                     && editor.owns(x, z)
                     && editor.check_for_block(x, 0, z, Some(&[GRASS_BLOCK]))
                     && !editor.surface_is_sealed(x, z)
@@ -113,15 +147,12 @@ pub fn generate_leisure(
 
                     match random_choice {
                         0..30 => {
-                            // Plants
-                            let setting = if leisure_type == "nature_reserve" {
-                                crate::ground_decoration::FlowerSetting::Meadow
-                            } else {
-                                crate::ground_decoration::FlowerSetting::Garden
-                            };
                             if random_choice < 22 {
                                 crate::ground_decoration::place_scattered_flower(
-                                    editor, x, z, setting,
+                                    editor,
+                                    x,
+                                    z,
+                                    crate::ground_decoration::FlowerSetting::Garden,
                                 );
                             } else {
                                 editor.set_block(FERN, x, 1, z, None, None);
@@ -160,12 +191,18 @@ pub fn generate_leisure(
 
             // Stamp bundled playground structures (replaces the old procedural props).
             if matches!(leisure_type.as_str(), "playground" | "recreation_ground") {
+                let filled_area = without_holes(&filled_area, holes);
                 crate::structures::playground::scatter_playgrounds(editor, filled_area.as_slice());
             }
 
             if leisure_type == "pitch" {
-                // Clear park/ground vegetation scattered onto the pitch before marking.
+                let filled_area = without_holes(&filled_area, holes);
+                // Clear park/ground vegetation scattered onto the pitch before marking,
+                // but not the hedge around it.
                 for &(x, z) in filled_area.iter() {
+                    if editor.is_hedge(x, z) {
+                        continue;
+                    }
                     editor.set_block(
                         AIR,
                         x,
@@ -199,21 +236,24 @@ pub fn generate_leisure_from_relation(
         // We intentionally do not combine all outer nodes into one mega-way,
         // because that creates a nonsensical polygon spanning the whole relation
         // extent, misses the flood fill cache, and can cause multi-GB allocations.
+        let inners = InnerRings::of(rel);
         for member in &rel.members {
             if member.role == ProcessedMemberRole::Outer {
+                let holes = flood_fill_cache.holes_in(&member.way, &inners, args.timeout.as_ref());
                 // Use relation tags so the member inherits the relation's leisure=* type
                 let way_with_rel_tags = ProcessedWay {
                     id: member.way.id,
                     nodes: member.way.nodes.clone(),
                     tags: rel.tags.clone(),
                 };
-                generate_leisure(
+                leisure_area(
                     editor,
                     &way_with_rel_tags,
                     args,
                     flood_fill_cache,
                     building_footprints,
                     bridge_surface,
+                    holes.as_ref(),
                 );
             }
         }

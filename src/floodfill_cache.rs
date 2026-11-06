@@ -1,14 +1,17 @@
-//! Pre-computed flood fill cache for parallel polygon filling.
+//! Flood fill cache shared by the element handlers and the tile threads.
 //!
-//! This module provides a way to pre-compute all flood fill operations in parallel
-//! before the main element processing loop, then retrieve cached results during
-//! sequential processing.
+//! Fills are computed on first read and released after their last reader, so only the
+//! fills of the tiles in flight are held at once.
 
+use crate::bresenham::bresenham_line;
 use crate::coordinate_system::cartesian::XZBBox;
+use crate::element_processing::highways::{aeroway_area, aeroway_area_block};
+use crate::element_processing::RelationArea;
 use crate::floodfill::{flood_fill_area, MAX_FLOOD_FILL_AREA};
 use crate::osm_parser::{ProcessedElement, ProcessedMemberRole, ProcessedWay};
 use fnv::FnvHashMap;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -363,7 +366,8 @@ fn is_sealed_surface_way(way: &ProcessedWay) -> bool {
     }
     // Pedestrian plazas and other highway=* areas are flood-filled, not stamped
     // along a centerline, so the road mask does not cover them.
-    way.tags.contains_key("highway") && way.tags.get("area").is_some_and(|v| v == "yes")
+    (way.tags.contains_key("highway") && way.tags.get("area").is_some_and(|v| v == "yes"))
+        || aeroway_area_block(way).is_some()
 }
 
 /// Paving that yields to planted areas mapped inside it. Pitches, tracks and
@@ -375,6 +379,7 @@ fn paving_yields_to_nested_areas(way: &ProcessedWay) -> bool {
             .get("amenity")
             .is_some_and(|v| SEALED_AMENITY.contains(&v.as_str()))
         || way.tags.get("leisure").map(String::as_str) == Some("schoolyard")
+        || aeroway_area_block(way).is_some()
 }
 
 const PLANTED_LANDUSE: &[&str] = &[
@@ -412,12 +417,44 @@ fn is_planted_way(way: &ProcessedWay) -> bool {
         )
 }
 
-/// A cache of pre-computed flood fill results, keyed by element ID.
+/// A cached way fill: computed on first read, dropped once its last reader is done.
+enum CachedFill {
+    Pending,
+    Ready(FloodFillResult),
+    Released,
+}
+
+/// A way's ring and the fill made from it.
+struct WayFill {
+    ring: Box<[(i32, i32)]>,
+    fill: Mutex<CachedFill>,
+}
+
+/// Fills prepared per pass, so a pre-pass never holds every fill of the world at once.
+const PREPASS_BATCH: usize = 512;
+/// Cells a pass that applies fills in order holds at once (8 bytes each).
+const PREPASS_BATCH_CELLS: usize = 1 << 22;
+
+/// Flood fills shared between handlers and tiles, keyed by way ID.
+///
+/// Each fill is computed on first read and kept until released, so a large world holds
+/// only the fills of the tiles in flight rather than every fill at once.
 pub struct FloodFillCache {
-    /// Cached results: element_id -> filled coordinates (shared via Arc so handler
-    /// fetches are O(1) refcount bumps instead of deep clones).
-    /// Releasable through `&self`, so tile threads can free fills mid-run.
-    way_cache: FnvHashMap<u64, Mutex<Option<FloodFillResult>>>,
+    /// Ring and fill per way (shared via Arc so handler fetches are O(1) refcount bumps
+    /// instead of deep clones). Releasable through `&self`, so tile threads can free
+    /// fills mid-run.
+    way_cache: FnvHashMap<u64, WayFill>,
+    timeout: Option<Duration>,
+}
+
+/// Fills a ring, sharing one allocation for every empty result.
+fn fill_ring(ring: &[(i32, i32)], timeout: Option<&Duration>) -> FloodFillResult {
+    let filled = flood_fill_area(ring, timeout);
+    if filled.is_empty() {
+        Arc::clone(empty_flood_fill_result())
+    } else {
+        Arc::new(filled)
+    }
 }
 
 impl FloodFillCache {
@@ -425,12 +462,11 @@ impl FloodFillCache {
     pub fn new() -> Self {
         Self {
             way_cache: FnvHashMap::default(),
+            timeout: None,
         }
     }
 
-    /// Pre-computes flood fills for all elements that need them.
-    ///
-    /// This runs in parallel using Rayon, taking advantage of multiple CPU cores.
+    /// Registers every way whose fill a handler may read. Nothing is filled yet.
     pub fn precompute(elements: &[ProcessedElement], timeout: Option<&Duration>) -> Self {
         // Collect all ways that need flood fill
         let mut ways_needing_fill: Vec<&ProcessedWay> = elements
@@ -458,56 +494,67 @@ impl FloodFillCache {
             if !Self::relation_fills_members(rel) {
                 continue;
             }
+            // Inner rings too: their fills cut the holes out of the outer ones.
             for member in &rel.members {
-                if member.role == ProcessedMemberRole::Outer && seen.insert(member.way.id) {
+                let wanted = matches!(
+                    member.role,
+                    ProcessedMemberRole::Outer | ProcessedMemberRole::Inner
+                );
+                if wanted && seen.insert(member.way.id) {
                     ways_needing_fill.push(&member.way);
                 }
             }
         }
 
-        // Compute all way flood fills in parallel
-        let way_results: Vec<(u64, Vec<(i32, i32)>)> = ways_needing_fill
-            .par_iter()
+        let way_cache = ways_needing_fill
+            .into_iter()
             .map(|way| {
-                let polygon_coords: Vec<(i32, i32)> =
-                    way.nodes.iter().map(|n| (n.x, n.z)).collect();
-                let filled = flood_fill_area(&polygon_coords, timeout);
-                (way.id, filled)
+                let ring = way.nodes.iter().map(|n| (n.x, n.z)).collect();
+                let fill = Mutex::new(CachedFill::Pending);
+                (way.id, WayFill { ring, fill })
             })
             .collect();
-
-        // Build the cache. Empty flood-fill results (degenerate rings or
-        // flood-fill timeouts) reuse the process-wide empty sentinel so a
-        // noisy input doesn't spawn many distinct empty allocations.
-        let mut cache = Self::new();
-        for (id, filled) in way_results {
-            let entry = if filled.is_empty() {
-                Arc::clone(empty_flood_fill_result())
-            } else {
-                Arc::new(filled)
-            };
-            cache.way_cache.insert(id, Mutex::new(Some(entry)));
+        Self {
+            way_cache,
+            timeout: timeout.copied(),
         }
-
-        cache
     }
 
-    /// Cached fill for a way id, None when absent or released (no computation).
+    /// Fill for a registered way id, computed on first read; None when absent or released.
+    /// Concurrent readers of a fill still being computed wait for it instead of repeating it.
     pub fn get_cached(&self, way_id: u64) -> Option<FloodFillResult> {
-        self.way_cache
-            .get(&way_id)
-            .and_then(|e| e.lock().unwrap_or_else(|p| p.into_inner()).clone())
+        let way = self.way_cache.get(&way_id)?;
+        let mut slot = way.fill.lock().unwrap_or_else(|p| p.into_inner());
+        match &*slot {
+            CachedFill::Ready(fill) => Some(Arc::clone(fill)),
+            CachedFill::Released => None,
+            CachedFill::Pending => {
+                let fill = fill_ring(&way.ring, self.timeout.as_ref());
+                *slot = CachedFill::Ready(Arc::clone(&fill));
+                Some(fill)
+            }
+        }
     }
 
-    /// Whether a fill was precomputed for this way id, released or not.
+    /// A registered way's fill for a pre-pass: shared if a reader already made it,
+    /// otherwise computed without being kept.
+    fn transient_fill(&self, way_id: u64) -> Option<FloodFillResult> {
+        let way = self.way_cache.get(&way_id)?;
+        if let CachedFill::Ready(fill) = &*way.fill.lock().unwrap_or_else(|p| p.into_inner()) {
+            return Some(Arc::clone(fill));
+        }
+        Some(fill_ring(&way.ring, self.timeout.as_ref()))
+    }
+
+    /// Whether a fill is registered for this way id, released or not.
     pub fn contains(&self, way_id: u64) -> bool {
         self.way_cache.contains_key(&way_id)
     }
 
     /// Frees a way's fill once nothing reads it again; `get_cached` is None afterwards.
     pub fn release(&self, way_id: u64) {
-        if let Some(e) = self.way_cache.get(&way_id) {
-            e.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(way) = self.way_cache.get(&way_id) {
+            *way.fill.lock().unwrap_or_else(|p| p.into_inner()) = CachedFill::Released;
         }
     }
 
@@ -541,6 +588,61 @@ impl FloodFillCache {
         }
     }
 
+    /// The holes the inner rings cut in `outer`, or None when none of them do.
+    ///
+    /// An inner ring around the outer one (an island in a lake) leaves it whole. The masks
+    /// cover the holes whole, not one tile, so every tile drops the same cells.
+    pub fn holes_in(
+        &self,
+        outer: &ProcessedWay,
+        inners: &InnerRings,
+        timeout: Option<&Duration>,
+    ) -> Option<Holes> {
+        if inners.rings.is_empty() {
+            return None;
+        }
+        let ob = ring_bounds(&outer.nodes, node_xz)?;
+        let (ox0, oz0, ox1, oz1) = ob;
+        let cutting: Vec<(&ProcessedWay, Bounds)> = inners
+            .rings
+            .iter()
+            .copied()
+            .filter(|&(inner, ib)| {
+                let (x0, z0, x1, z1) = ib;
+                x0 <= ox1
+                    && x1 >= ox0
+                    && z0 <= oz1
+                    && z1 >= oz0
+                    && !vertices_inside(&outer.nodes, ob, &inner.nodes, ib, node_xz)
+            })
+            .collect();
+        if cutting.is_empty() {
+            return None;
+        }
+        let (mut x0, mut z0, mut x1, mut z1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for &(_, (a, b, c, d)) in &cutting {
+            (x0, z0, x1, z1) = (x0.min(a), z0.min(b), x1.max(c), z1.max(d));
+        }
+        let bounds =
+            XZBBox::rect_from_min_max(x0.max(ox0), z0.max(oz0), x1.min(ox1), z1.min(oz1)).ok()?;
+        let mut holes = Holes {
+            cells: CoordinateBitmap::new(&bounds),
+            edges: CoordinateBitmap::new(&bounds),
+        };
+        for (inner, _) in cutting {
+            for &(x, z) in self.get_or_compute(inner, timeout).iter() {
+                holes.cells.set(x, z);
+            }
+            for pair in inner.nodes.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                for (x, _, z) in bresenham_line(a.x, 0, a.z, b.x, 0, b.z) {
+                    holes.edges.set(x, z);
+                }
+            }
+        }
+        (!holes.cells.is_empty() || !holes.edges.is_empty()).then_some(holes)
+    }
+
     /// Gets cached flood fill result for a ProcessedElement (Way only).
     /// For Nodes/Relations, returns a process-wide shared empty vec (no alloc).
     pub fn get_or_compute_element(
@@ -556,10 +658,8 @@ impl FloodFillCache {
 
     /// Determines if a way element needs flood fill based on its tags.
     ///
-    /// This checks for tag presence (not specific values) because:
-    /// - Only some values within each tag type actually use flood fill
-    /// - But caching extra results is harmless (small memory overhead)
-    /// - And avoids duplicating value-checking logic from processors
+    /// Mostly tag presence, so most values are cached whether read or not; the big
+    /// polygons whose fill is never read are left out by `fill_goes_unread`.
     ///
     /// Covered cases:
     /// - building/building:part -> buildings::generate_buildings (includes bridge)
@@ -568,8 +668,9 @@ impl FloodFillCache {
     /// - amenity -> amenities::generate_amenities
     /// - natural (except tree and tree_row) -> natural::generate_natural
     /// - highway with area=yes -> highways::generate_highways (area fill)
+    /// - aeroway areas (aprons, runway and taxiway areas) -> highways::generate_aeroway
     fn way_needs_flood_fill(way: &ProcessedWay) -> bool {
-        way.tags.contains_key("building")
+        (way.tags.contains_key("building")
             || way.tags.contains_key("building:part")
             || way.tags.contains_key("landuse")
             || way.tags.contains_key("leisure")
@@ -582,41 +683,62 @@ impl FloodFillCache {
             // Highway areas (like pedestrian plazas) use flood fill when area=yes
             || (way.tags.contains_key("highway")
                 && way.tags.get("area").map(|v| v == "yes").unwrap_or(false))
+            // Aprons and other airport areas -> highways::generate_aeroway
+            || aeroway_area(way).is_some()
             // Historic tomb polygons (e.g. tomb=pyramid)
             || way.tags.get("tomb").map(|v| v == "pyramid").unwrap_or(false)
+            // Pier and breakwater areas -> waterfront
+            || Self::is_waterfront(&way.tags)
             // Solar farm areas -> power::generate_solar_farm
             || (way.tags.get("power").map(String::as_str) == Some("generator")
-                && way.tags.get("generator:source").map(String::as_str) == Some("solar"))
+                && way.tags.get("generator:source").map(String::as_str) == Some("solar")))
+            && !Self::fill_goes_unread(way)
     }
 
-    /// Relations `process_element` renders by filling each outer member: natural, landuse
-    /// that paints ground, and parks. Mirrors its dispatch; keep the two in sync.
-    fn relation_fills_members(rel: &crate::osm_parser::ProcessedRelation) -> bool {
-        let tags = &rel.tags;
-        if tags.contains_key("building")
-            || tags.contains_key("building:part")
-            || tags.get("type").map(String::as_str) == Some("building")
-            || tags.contains_key("water")
-            || matches!(
-                tags.get("natural").map(String::as_str),
-                Some("water" | "bay")
-            )
+    /// Ways `process_element` hands to a branch that never reads their fill, and no pre-pass
+    /// reads either. Residential and commercial landuse are the largest polygons around.
+    fn fill_goes_unread(way: &ProcessedWay) -> bool {
+        let tags = &way.tags;
+        if ["building", "building:part", "highway", "power"]
+            .iter()
+            .any(|k| tags.contains_key(*k))
+            || Self::is_waterfront(tags)
+            || is_sealed_surface_way(way)
         {
             return false;
         }
-        if tags.contains_key("natural") {
-            return true;
-        }
         if let Some(landuse) = tags.get("landuse") {
-            // generate_landuse returns before filling these.
-            return !matches!(landuse.as_str(), "residential" | "commercial");
+            return crate::element_processing::LANDUSE_FROM_LAND_COVER.contains(&landuse.as_str());
         }
-        tags.get("leisure").map(String::as_str) == Some("park")
+        if tags.contains_key("natural")
+            && tags.get("amenity").map(String::as_str) != Some("fountain")
+        {
+            return false;
+        }
+        tags.get("amenity").is_some_and(|amenity| {
+            !matches!(
+                amenity.as_str(),
+                "bicycle_parking" | "shelter" | "fountain" | "parking"
+            )
+        })
     }
 
-    /// Collects all building footprint coordinates from the pre-computed cache.
-    ///
-    /// This should be called after precompute() and before elements are processed.
+    /// Relations `process_element` renders by filling each outer member: natural, landuse
+    /// that paints ground, parks, piers and breakwaters.
+    fn relation_fills_members(rel: &crate::osm_parser::ProcessedRelation) -> bool {
+        RelationArea::of(&rel.tags).is_some_and(|area| area.fills_members(&rel.tags))
+    }
+
+    /// Piers, breakwaters and groynes, which the waterfront code fills as decks and mounds.
+    fn is_waterfront(tags: &std::collections::HashMap<String, String>) -> bool {
+        matches!(
+            tags.get("man_made").map(String::as_str),
+            Some("pier" | "breakwater" | "groyne")
+        )
+    }
+
+    /// Collects all building footprint coordinates, filling in batches that are dropped
+    /// after use. Call before elements are processed.
     /// Returns a memory-efficient bitmap of all (x, z) coordinates that are part of buildings.
     ///
     /// The bitmap uses only 1 bit per coordinate in the world bounds, compared to ~24 bytes
@@ -638,25 +760,55 @@ impl FloodFillCache {
                 if !is_building {
                     continue;
                 }
-                for_relation_ring_cells(rel, ProcessedMemberRole::Outer, xzbbox, |x, z| {
-                    footprints.set(x, z)
-                });
-                for_relation_ring_cells(rel, ProcessedMemberRole::Inner, xzbbox, |x, z| {
-                    footprints.clear(x, z)
-                });
+                // Each outer less the courtyards that cut it, so a keep mapped as an outer in
+                // a courtyard, or another building standing in one, keeps its footprint.
+                let outers = relation_rings(rel, ProcessedMemberRole::Outer, xzbbox);
+                let courtyards = relation_rings(rel, ProcessedMemberRole::Inner, xzbbox);
+                for (members, cutting) in hole_groups(&outers, &courtyards, |&p| p) {
+                    let mut courtyard = CoordinateBitmap::new_empty();
+                    let cells = cutting.iter().flat_map(|&i| courtyards[i].iter().copied());
+                    if let Some(bounds) = points_bounds(cells) {
+                        courtyard = CoordinateBitmap::new(&bounds);
+                        for &i in &cutting {
+                            for (x, z) in flood_fill_area(&courtyards[i], None) {
+                                courtyard.set(x, z);
+                            }
+                        }
+                    }
+                    for &o in &members {
+                        for (x, z) in flood_fill_area(&outers[o], None) {
+                            if !courtyard.contains(x, z) {
+                                footprints.set(x, z);
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        for element in elements {
-            if let ProcessedElement::Way(way) = element {
-                if (way.tags.contains_key("building") || way.tags.contains_key("building:part"))
-                    && !crate::element_processing::buildings::is_underground_building(&way.tags)
+        let buildings: Vec<u64> = elements
+            .iter()
+            .filter_map(|element| match element {
+                ProcessedElement::Way(way)
+                    if (way.tags.contains_key("building")
+                        || way.tags.contains_key("building:part"))
+                        && !crate::element_processing::buildings::is_underground_building(
+                            &way.tags,
+                        ) =>
                 {
-                    if let Some(cached) = self.get_cached(way.id) {
-                        for &(x, z) in cached.iter() {
-                            footprints.set(x, z);
-                        }
-                    }
+                    Some(way.id)
+                }
+                _ => None,
+            })
+            .collect();
+        for batch in buildings.chunks(PREPASS_BATCH) {
+            let fills: Vec<Option<FloodFillResult>> = batch
+                .par_iter()
+                .map(|&id| self.transient_fill(id))
+                .collect();
+            for fill in fills.iter().flatten() {
+                for &(x, z) in fill.iter() {
+                    footprints.set(x, z);
                 }
             }
         }
@@ -670,73 +822,109 @@ impl FloodFillCache {
     ///
     /// Returns `None` when no such area contributes a column the roads do not
     /// already own, so the caller can share the road mask instead of paying for a
-    /// second full-world bitmap. Runs off the pre-computed cache, so no extra
-    /// flood fill is done here.
+    /// second full-world bitmap. Only fill sizes are kept between passes: each fill is made
+    /// again, a bounded batch at a time, when its layer is applied.
     pub fn collect_sealed_surfaces(
         &self,
         elements: &[ProcessedElement],
         roads: &RoadMaskBitmap,
     ) -> Option<SealedSurfaceBitmap> {
-        let mut managed: Vec<FloodFillResult> = Vec::new();
-        let mut paving: Vec<FloodFillResult> = Vec::new();
-        let mut planted: Vec<FloodFillResult> = Vec::new();
+        let mut planted_ids: Vec<u64> = Vec::new();
+        let mut sealed_ids: Vec<(u64, bool)> = Vec::new();
         for element in elements {
             let ProcessedElement::Way(w) = element else {
                 continue;
             };
-            let Some(fill) = self.get_cached(w.id) else {
+            if !self.contains(w.id) {
                 continue;
-            };
+            }
             if is_sealed_surface_way(w) {
-                if paving_yields_to_nested_areas(w) {
-                    paving.push(fill);
-                } else {
-                    managed.push(fill);
-                }
+                sealed_ids.push((w.id, paving_yields_to_nested_areas(w)));
             } else if is_planted_way(w) {
-                planted.push(fill);
+                planted_ids.push(w.id);
             }
         }
 
         // A tagged area whose fill came back empty (degenerate ring, fill timeout) or that
         // sits entirely on columns the roads already own would clone a full second bitmap
-        // for nothing, so bail out before allocating. Short-circuits on the first new cell.
-        if !managed
-            .iter()
-            .chain(&paving)
-            .any(|f| f.iter().any(|&(x, z)| roads.is_unset_in_bounds(x, z)))
-        {
+        // for nothing, so bail out before allocating.
+        let off_roads = AtomicBool::new(false);
+        let sealed_lens: Vec<Option<usize>> = sealed_ids
+            .par_iter()
+            .map(|&(id, _)| {
+                let fill = self.transient_fill(id)?;
+                if !off_roads.load(Ordering::Relaxed)
+                    && fill.iter().any(|&(x, z)| roads.is_unset_in_bounds(x, z))
+                {
+                    off_roads.store(true, Ordering::Relaxed);
+                }
+                Some(fill.len())
+            })
+            .collect();
+        if !off_roads.into_inner() {
             return None;
         }
-
-        let mut mask = roads.clone();
-        // Largest first, so each column takes the state of the smallest area over it.
-        // Anything as large as all the paving changes nothing, and paving wins a tie.
-        let largest = paving.iter().map(|f| f.len()).max().unwrap_or(0);
-        let mut layers: Vec<(usize, bool, &FloodFillResult)> = paving
-            .iter()
-            .map(|f| (f.len(), true, f))
-            .chain(
-                planted
-                    .iter()
-                    .filter(|f| f.len() < largest)
-                    .map(|f| (f.len(), false, f)),
-            )
-            .collect();
-        layers.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        for (_, paved, fill) in layers {
-            for &(x, z) in fill.iter() {
-                if paved {
-                    mask.set(x, z);
-                } else if !roads.contains(x, z) {
-                    mask.clear(x, z);
-                }
+        // (cells, paved, way id)
+        let mut layers: Vec<(usize, bool, u64)> = Vec::new();
+        let mut managed: Vec<(usize, bool, u64)> = Vec::new();
+        for (&(id, yields), len) in sealed_ids.iter().zip(sealed_lens) {
+            match len {
+                Some(len) if yields => layers.push((len, true, id)),
+                Some(len) => managed.push((len, true, id)),
+                None => {}
             }
         }
-        for fill in managed {
-            for &(x, z) in fill.iter() {
-                mask.set(x, z);
+
+        // Anything as large as all the paving changes nothing, so planted areas that big are
+        // dropped as soon as their size is known.
+        let largest = layers.iter().map(|l| l.0).max().unwrap_or(0);
+        if largest > 0 {
+            let planted_lens: Vec<Option<usize>> = planted_ids
+                .par_iter()
+                .map(|&id| self.transient_fill(id).map(|f| f.len()))
+                .collect();
+            layers.extend(
+                planted_ids
+                    .iter()
+                    .zip(planted_lens)
+                    .filter_map(|(&id, len)| {
+                        len.filter(|&len| len < largest).map(|len| (len, false, id))
+                    }),
+            );
+        }
+
+        // Largest first, so each column takes the state of the smallest area over it; paving
+        // wins a tie. The other sealed areas pave their whole footprint after that.
+        layers.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        layers.extend(managed);
+
+        let mut mask = roads.clone();
+        let mut rest = &layers[..];
+        while !rest.is_empty() {
+            let mut cells = 0;
+            let n = rest
+                .iter()
+                .take_while(|l| {
+                    cells += l.0;
+                    cells <= PREPASS_BATCH_CELLS
+                })
+                .count()
+                .max(1);
+            let (batch, tail) = rest.split_at(n);
+            let fills: Vec<Option<FloodFillResult>> = batch
+                .par_iter()
+                .map(|&(_, _, id)| self.transient_fill(id))
+                .collect();
+            for (&(_, paved, _), fill) in batch.iter().zip(fills) {
+                for &(x, z) in fill.iter().flat_map(|f| f.iter()) {
+                    if paved {
+                        mask.set(x, z);
+                    } else if !roads.contains(x, z) {
+                        mask.clear(x, z);
+                    }
+                }
             }
+            rest = tail;
         }
 
         Some(mask)
@@ -756,13 +944,178 @@ impl Default for FloodFillCache {
     }
 }
 
-/// Applies a callback to the flood-filled cells of a relation's merged, clipped, closed rings.
-fn for_relation_ring_cells(
+/// A relation's inner rings with their bounds, gathered once for all its outer rings.
+pub struct InnerRings<'a> {
+    rings: Vec<(&'a ProcessedWay, Bounds)>,
+}
+
+impl<'a> InnerRings<'a> {
+    pub fn of(rel: &'a crate::osm_parser::ProcessedRelation) -> Self {
+        let rings = rel
+            .members
+            .iter()
+            .filter(|m| m.role == ProcessedMemberRole::Inner)
+            .filter_map(|m| Some((m.way.as_ref(), ring_bounds(&m.way.nodes, node_xz)?)))
+            .collect();
+        Self { rings }
+    }
+}
+
+/// The holes inner rings cut in an outer ring: the cells inside them, and their outlines.
+pub struct Holes {
+    cells: CoordinateBitmap,
+    edges: CoordinateBitmap,
+}
+
+impl Holes {
+    /// Whether a cell lies inside a hole. The outline stays with the area, as its edge.
+    pub fn contains(&self, x: i32, z: i32) -> bool {
+        self.cells.contains(x, z)
+    }
+
+    /// Whether a cell lies inside a hole or on its outline, where no edge of the outer ring
+    /// may run, as one clipped along the world edge across a hole would.
+    pub fn covers(&self, x: i32, z: i32) -> bool {
+        self.cells.contains(x, z) || self.edges.contains(x, z)
+    }
+}
+
+/// Whether a cell lies inside a hole.
+pub fn in_hole(holes: Option<&Holes>, x: i32, z: i32) -> bool {
+    holes.is_some_and(|h| h.contains(x, z))
+}
+
+/// Whether an edge of the outer ring at a cell would run through a hole.
+pub fn edge_in_hole(holes: Option<&Holes>, x: i32, z: i32) -> bool {
+    holes.is_some_and(|h| h.covers(x, z))
+}
+
+/// A fill less the cells inside its holes, for the callers that need the cells as a list.
+/// Copies only when there are holes.
+pub fn without_holes(fill: &FloodFillResult, holes: Option<&Holes>) -> FloodFillResult {
+    match holes {
+        Some(h) => Arc::new(
+            fill.iter()
+                .copied()
+                .filter(|&(x, z)| !h.contains(x, z))
+                .collect(),
+        ),
+        None => Arc::clone(fill),
+    }
+}
+
+pub fn node_xz(node: &crate::osm_parser::ProcessedNode) -> (i32, i32) {
+    (node.x, node.z)
+}
+
+type Bounds = (i32, i32, i32, i32);
+
+fn ring_bounds<T>(ring: &[T], xz: impl Fn(&T) -> (i32, i32)) -> Option<Bounds> {
+    let (x, z) = xz(ring.first()?);
+    Some(
+        ring.iter()
+            .map(xz)
+            .fold((x, z, x, z), |(x0, z0, x1, z1), (x, z)| {
+                (x0.min(x), z0.min(z), x1.max(x), z1.max(z))
+            }),
+    )
+}
+
+/// Whether most vertices of `ring` lie inside `around`, as an island's lie inside its lake.
+pub fn mostly_inside<T>(ring: &[T], around: &[T], xz: impl Fn(&T) -> (i32, i32) + Copy) -> bool {
+    match (ring_bounds(ring, xz), ring_bounds(around, xz)) {
+        (Some(r), Some(a)) => vertices_inside(ring, r, around, a, xz),
+        _ => false,
+    }
+}
+
+fn vertices_inside<T>(
+    ring: &[T],
+    (rx0, rz0, rx1, rz1): Bounds,
+    around: &[T],
+    (ax0, az0, ax1, az1): Bounds,
+    xz: impl Fn(&T) -> (i32, i32),
+) -> bool {
+    // A ring inside another fits in its bounds, which spares the big rings a vertex test.
+    if around.len() < 3 || rx0 < ax0 - 1 || rz0 < az0 - 1 || rx1 > ax1 + 1 || rz1 > az1 + 1 {
+        return false;
+    }
+    // A vertex on the other ring's outline counts as neither: an island touching its hole,
+    // or both rings clipped along the same world edge.
+    let (mut inside, mut outside) = (0usize, 0usize);
+    for p in ring {
+        let (x, z) = xz(p);
+        let (mut hit, mut on_edge) = (false, false);
+        let mut j = around.len() - 1;
+        for i in 0..around.len() {
+            let ((ax, az), (bx, bz)) = (xz(&around[i]), xz(&around[j]));
+            j = i;
+            let cross = (bx - ax) as i64 * (z - az) as i64 - (bz - az) as i64 * (x - ax) as i64;
+            if cross == 0
+                && (ax.min(bx)..=ax.max(bx)).contains(&x)
+                && (az.min(bz)..=az.max(bz)).contains(&z)
+            {
+                on_edge = true;
+                break;
+            }
+            if (az > z) != (bz > z)
+                && (x as f64) < (bx - ax) as f64 * (z - az) as f64 / (bz - az) as f64 + ax as f64
+            {
+                hit = !hit;
+            }
+        }
+        match (on_edge, hit) {
+            (true, _) => {}
+            (false, true) => inside += 1,
+            (false, false) => outside += 1,
+        }
+    }
+    inside > outside
+}
+
+/// Outer rings grouped by the inner rings that cut them, as (outers, cutting inners) index
+/// lists. An outer ring inside an inner one, an island in a lake's hole, is not cut by it,
+/// so it fills again. Usually there is one group with every inner ring.
+pub fn hole_groups<T, R: AsRef<[T]>>(
+    outers: &[R],
+    inners: &[R],
+    xz: impl Fn(&T) -> (i32, i32) + Copy,
+) -> Vec<(Vec<usize>, Vec<usize>)> {
+    let inner_bounds: Vec<Option<Bounds>> =
+        inners.iter().map(|r| ring_bounds(r.as_ref(), xz)).collect();
+    let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+    for (o, outer) in outers.iter().enumerate() {
+        let outer = outer.as_ref();
+        let bounds = ring_bounds(outer, xz);
+        let cutting: Vec<usize> = (0..inners.len())
+            .filter(|&i| match (bounds, inner_bounds[i]) {
+                (Some(ob), Some(ib)) => !vertices_inside(outer, ob, inners[i].as_ref(), ib, xz),
+                _ => true,
+            })
+            .collect();
+        match groups.iter_mut().find(|(_, c)| *c == cutting) {
+            Some((members, _)) => members.push(o),
+            None => groups.push((vec![o], cutting)),
+        }
+    }
+    groups
+}
+
+fn points_bounds(mut points: impl Iterator<Item = (i32, i32)>) -> Option<XZBBox> {
+    let (x, z) = points.next()?;
+    let (x0, z0, x1, z1) = points.fold((x, z, x, z), |(x0, z0, x1, z1), (x, z)| {
+        (x0.min(x), z0.min(z), x1.max(x), z1.max(z))
+    });
+    XZBBox::rect_from_min_max(x0, z0, x1, z1).ok()
+}
+
+/// A relation's merged, clipped, closed rings of one role.
+fn relation_rings(
     rel: &crate::osm_parser::ProcessedRelation,
     role: ProcessedMemberRole,
     xzbbox: &XZBBox,
-    mut apply: impl FnMut(i32, i32),
-) {
+) -> Vec<Vec<(i32, i32)>> {
+    let mut closed = Vec::new();
     let mut rings: Vec<Vec<crate::osm_parser::ProcessedNode>> = rel
         .members
         .iter()
@@ -786,10 +1139,9 @@ fn for_relation_ring_cells(
                 continue;
             }
         }
-        for (x, z) in flood_fill_area(&coords, None) {
-            apply(x, z);
-        }
+        closed.push(coords);
     }
+    closed
 }
 
 /// Configures the global Rayon thread pool with a CPU usage cap.
@@ -1058,5 +1410,99 @@ mod tests {
         for skipped in [103, 104, 105] {
             assert!(cache.get_cached(skipped).is_none(), "member {skipped}");
         }
+    }
+
+    fn ring(id: u64, x0: i32, z0: i32, x1: i32, z1: i32) -> ProcessedWay {
+        let mut way = tagged_way(id, &[(x0, z0), (x1, z0), (x1, z1), (x0, z1), (x0, z0)], &[]);
+        way.tags.clear();
+        way
+    }
+
+    #[test]
+    fn inner_rings_cut_holes_but_islands_stay_whole() {
+        let outer = ring(1, 0, 0, 60, 60);
+        let lake = ring(2, 15, 15, 45, 45);
+        let island = ring(3, 25, 25, 35, 35);
+        let elements = vec![ProcessedElement::Relation(
+            crate::osm_parser::ProcessedRelation {
+                id: 9,
+                tags: [("natural".to_string(), "wood".to_string())].into(),
+                members: [
+                    (ProcessedMemberRole::Outer, &outer),
+                    (ProcessedMemberRole::Inner, &lake),
+                    (ProcessedMemberRole::Outer, &island),
+                ]
+                .into_iter()
+                .map(|(role, way)| crate::osm_parser::ProcessedMember {
+                    role,
+                    way: Arc::new(way.clone()),
+                })
+                .collect(),
+            },
+        )];
+        let cache = FloodFillCache::precompute(&elements, None);
+        assert!(
+            cache.contains(2),
+            "the inner fill is shared like the outer ones"
+        );
+
+        let ProcessedElement::Relation(rel) = &elements[0] else {
+            unreachable!()
+        };
+        let inners = InnerRings::of(rel);
+        let holes = cache
+            .holes_in(&outer, &inners, None)
+            .expect("the lake cuts the wood");
+        assert!(holes.contains(20, 20) && holes.contains(30, 30) && !holes.contains(5, 5));
+        assert!(
+            !holes.contains(15, 30) && holes.covers(15, 30),
+            "the lake's outline"
+        );
+        let kept = without_holes(&cache.get_or_compute(&outer, None), Some(&holes));
+        assert!(kept.contains(&(5, 5)) && !kept.contains(&(20, 20)));
+        assert!(
+            cache.holes_in(&island, &inners, None).is_none(),
+            "an island in the lake is wood again"
+        );
+    }
+
+    #[test]
+    fn an_island_clipped_at_the_world_edge_stays_whole() {
+        // Both rings cut off by the east edge at x = 100, as the clipper leaves them.
+        let hole = [(80, 20), (100, 20), (100, 80), (80, 80), (80, 20)];
+        let island = [(100, 60), (90, 60), (90, 40), (100, 40), (100, 60)];
+        assert!(mostly_inside(&island, &hole, |&p| p));
+        assert!(!mostly_inside(&hole, &island, |&p| p));
+    }
+
+    #[test]
+    fn a_keep_in_its_own_courtyard_keeps_its_footprint() {
+        let xzbbox = XZBBox::rect_from_min_max(0, 0, 99, 99).unwrap();
+        let member = |role, id, x0: i32, x1: i32| crate::osm_parser::ProcessedMember {
+            role,
+            way: Arc::new(ring(id, x0, x0, x1, x1)),
+        };
+        let castle = ProcessedElement::Relation(crate::osm_parser::ProcessedRelation {
+            id: 9,
+            tags: [("building".to_string(), "castle".to_string())].into(),
+            members: vec![
+                member(ProcessedMemberRole::Outer, 1, 10, 90),
+                member(ProcessedMemberRole::Inner, 2, 20, 80),
+                member(ProcessedMemberRole::Outer, 3, 40, 60),
+            ],
+        });
+        let footprints = FloodFillCache::new().collect_building_footprints(&[castle], &xzbbox);
+        assert!(footprints.contains(15, 15), "the wall");
+        assert!(!footprints.contains(30, 30), "the courtyard");
+        assert!(footprints.contains(50, 50), "the keep");
+    }
+
+    #[test]
+    fn a_pond_on_an_island_is_not_cut_by_the_island() {
+        let square = |x0: i32, x1: i32| vec![(x0, x0), (x1, x0), (x1, x1), (x0, x1), (x0, x0)];
+        let (lake, pond) = (square(0, 60), square(25, 35));
+        let (island, islet) = (square(15, 45), square(28, 32));
+        let groups = hole_groups(&[lake, pond], &[island, islet], |&p| p);
+        assert_eq!(groups, vec![(vec![0], vec![0, 1]), (vec![1], vec![1])]);
     }
 }

@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -179,11 +179,11 @@ impl<'a> WorldEditor<'a> {
             self.void_world,
             self.preview.as_deref(),
             self.voxy.as_deref(),
+            self.dh.as_deref(),
             region_x,
             region_z,
             region_to_modify,
             &self.region_write_mode(),
-            self.climate_lat(),
             (self.ground_origin_x, self.ground_origin_z),
         )
     }
@@ -334,41 +334,130 @@ fn strip_stale_side_chunks(
     }
 }
 
-/// Open (truncating) a fresh `r.X.Z.mca` under `world_dir/region`. A flat world starts
-/// from the template; a void world starts empty, since nothing outside the area is written.
-fn create_region_file(
-    world_dir: &std::path::Path,
-    region_x: i32,
-    region_z: i32,
-    void_world: bool,
-) -> Result<Region<File>, Box<dyn std::error::Error + Send + Sync>> {
-    let region_dir = world_dir.join("region");
-    let out_path = region_dir.join(format!("r.{}.{}.mca", region_x, region_z));
-    std::fs::create_dir_all(&region_dir)?;
+/// Where a region's chunks go.
+///
+/// A fresh region is assembled in memory and written with one call: fastanvil seeks and
+/// writes about eight times per chunk, and a fresh file holds nothing an interrupted save
+/// could cost. Its file is opened up front all the same, so a path that cannot be created
+/// fails the save before any chunk is built; a full disk shows at the write.
+///
+/// A merge writes in place, as fastanvil does: the file holds the chunks of other areas,
+/// and rewriting it whole would put all of them at stake on every save.
+enum RegionSink {
+    Fresh {
+        region: Region<Cursor<Vec<u8>>>,
+        file: File,
+    },
+    Merge(Region<File>),
+}
 
-    let mut region_file: File = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&out_path)?;
-    if void_world {
-        return Ok(Region::create(region_file)?);
+impl RegionSink {
+    /// A fresh `r.X.Z.mca` under `world_dir/region`. It starts empty for either world type:
+    /// a flat world writes every slot (the filler where the area has nothing), and a void
+    /// world leaves the slots outside the area to the void generator.
+    fn create(
+        world_dir: &std::path::Path,
+        region_x: i32,
+        region_z: i32,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let region_dir = world_dir.join("region");
+        let out_path = region_dir.join(format!("r.{}.{}.mca", region_x, region_z));
+        std::fs::create_dir_all(&region_dir)?;
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&out_path)?;
+        Ok(Self::Fresh {
+            region: Region::create(Cursor::new(Vec::new()))?,
+            file,
+        })
     }
-    const REGION_TEMPLATE: &[u8] = include_bytes!("../../assets/minecraft/region.template");
-    region_file.write_all(REGION_TEMPLATE)?;
-    Ok(Region::from_stream(region_file)?)
+
+    fn write_chunk(&mut self, x: usize, z: usize, zlib: &[u8]) -> fastanvil::Result<()> {
+        let scheme = fastanvil::CompressionScheme::Zlib;
+        match self {
+            Self::Fresh { region, .. } => region.write_compressed_chunk(x, z, scheme, zlib),
+            Self::Merge(region) => region.write_compressed_chunk(x, z, scheme, zlib),
+        }
+    }
+
+    /// Writes a fresh region out. A merge went to its file chunk by chunk.
+    fn finish(self) -> std::io::Result<()> {
+        match self {
+            Self::Fresh { region, mut file } => file.write_all(region.into_inner()?.get_ref()),
+            Self::Merge(_) => Ok(()),
+        }
+    }
+}
+
+/// Largest compressed chunk fastanvil stores: 255 sectors of 4 KiB, less its 5-byte header.
+const MAX_COMPRESSED_CHUNK: usize = 255 * 4096 - 5;
+
+/// Zlib-compresses `raw` into `out[..n]` and returns `n`.
+///
+/// One compressor serves a region's chunks; fastanvil's `write_chunk` builds a fresh one,
+/// state tables and all, for every chunk. `out` keeps its length between calls, since
+/// flate2's `compress_vec` zero-fills the whole spare capacity on each one.
+fn compress_chunk(
+    compressor: &mut flate2::Compress,
+    raw: &[u8],
+    out: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    compressor.reset();
+    let room = raw.len() / 2 + 64;
+    if out.len() < room {
+        out.resize(room, 0);
+    }
+    loop {
+        let read = compressor.total_in() as usize;
+        let written = compressor.total_out() as usize;
+        let status = compressor
+            .compress(
+                &raw[read..],
+                &mut out[written..],
+                flate2::FlushCompress::Finish,
+            )
+            .map_err(std::io::Error::other)?;
+        let now_written = compressor.total_out() as usize;
+        if status == flate2::Status::StreamEnd {
+            return Ok(now_written);
+        }
+        if now_written == out.len() {
+            out.resize(out.len() * 2, 0);
+        } else if now_written == written && compressor.total_in() as usize == read {
+            return Err(std::io::Error::other(
+                "zlib stopped making progress on a chunk",
+            ));
+        }
+    }
+}
+
+/// [`compress_chunk`] at the fast level, or at the default one for a chunk the fast level
+/// would leave too large to store. zlib-rs's fast level codes with fixed Huffman tables
+/// only, so data that does not compress grows by about 5% instead of being stored as is.
+fn compress_chunk_to_fit(
+    compressor: &mut flate2::Compress,
+    raw: &[u8],
+    out: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    let len = compress_chunk(compressor, raw, out)?;
+    if len <= MAX_COMPRESSED_CHUNK {
+        return Ok(len);
+    }
+    let mut thorough = flate2::Compress::new(flate2::Compression::default(), true);
+    compress_chunk(&mut thorough, raw, out)
 }
 
 /// Serialize one region's chunks to its `.mca`. Shared by the synchronous save
 /// path and the background flush worker (hence free-standing, not `&self`).
 /// Every in-bbox region passes here exactly once, so the map preview and the
-/// voxy LOD cache are both fed here.
+/// voxy and Distant Horizons LOD caches are all fed here.
 ///
 /// Chunks are visited in Morton (quadtree) order. The `.mca` does not care -
-/// it allocates sectors as chunks land - but the voxy builder does: it finishes
-/// a level-`n` LOD column every `4^n` chunk columns, which is what keeps its
-/// working set at a handful of megabytes instead of a whole region's worth.
+/// it allocates sectors as chunks land - but the LOD builders do: each finishes
+/// a coarser section every few chunk columns, which is what keeps their
+/// working sets at a handful of megabytes instead of a whole region's worth.
 #[allow(clippy::too_many_arguments)]
 fn write_region_to_disk(
     world_dir: &std::path::Path,
@@ -378,11 +467,11 @@ fn write_region_to_disk(
     void_world: bool,
     preview: Option<&crate::map_renderer::PreviewAccumulator>,
     voxy: Option<&crate::voxy::VoxyWriter>,
+    dh: Option<&crate::distant_horizons::DhWriter>,
     region_x: i32,
     region_z: i32,
     region_to_modify: &super::common::RegionToModify,
     mode: &RegionWriteMode,
-    climate_lat: Option<f64>,
     ground_origin: (i32, i32),
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Some(preview) = preview {
@@ -395,15 +484,17 @@ fn write_region_to_disk(
     };
     let merge = merge_dir.is_some();
     let mut region = match &merge_dir {
-        Some(dir) => open_region_file_for_merge(dir, region_x, region_z)?,
-        None => create_region_file(world_dir, region_x, region_z, void_world)?,
+        Some(dir) => RegionSink::Merge(open_region_file_for_merge(dir, region_x, region_z)?),
+        None => RegionSink::create(world_dir, region_x, region_z)?,
     };
     let mut ser_buffer = Vec::with_capacity(8192);
+    let mut compressor = flate2::Compress::new(flate2::Compression::fast(), true);
+    let mut compressed = Vec::new();
     let mut written_chunks: Vec<(i32, i32)> = Vec::new();
 
     // World-center latitude drives temperature-based biome variants (taiga
     // vs forest vs jungle) at chunk-build time. Cheap to recompute.
-    let center_lat = climate_lat.unwrap_or((llbbox.min().lat() + llbbox.max().lat()) * 0.5);
+    let center_lat = (llbbox.min().lat() + llbbox.max().lat()) * 0.5;
 
     // Filler chunks all share one set of sections, so they share their light too. A void
     // world has none: what the area does not touch is left to the void generator.
@@ -424,6 +515,7 @@ fn write_region_to_disk(
             live_lod_sections(region_to_modify, region_x, region_z),
         )
     });
+    let mut dh_lod = dh.map(|writer| writer.region_lod());
 
     for column in 0..256usize {
         let (sx, sz) = morton_16(column);
@@ -438,14 +530,9 @@ fn write_region_to_disk(
                 }
                 let mut existing = region_to_modify.get_chunk(chunk_x, chunk_z);
 
-                // A chunk that is present but holds nothing is left unwritten,
-                // as it was before this loop was reordered. A merge fills it.
-                if existing.is_some_and(|c| c.sections.is_empty() && c.other.is_empty()) {
-                    if merge {
-                        existing = None;
-                    } else {
-                        continue;
-                    }
+                // A chunk that is present but holds nothing is written like an absent one.
+                if existing.is_some_and(holds_nothing) {
+                    existing = None;
                 }
                 // A fresh void region holds only the chunks the area touches; the void
                 // generator makes the rest. A merge stays inside its area anyway.
@@ -493,6 +580,23 @@ fn write_region_to_disk(
                         &biome_names,
                     );
                 }
+                if let Some(lod) = dh_lod.as_mut() {
+                    lod.ingest_chunk(
+                        abs_chunk_x,
+                        abs_chunk_z,
+                        &sections,
+                        (span.0 as i32, span.1 as i32),
+                        lighting.as_deref(),
+                        &biome_names,
+                    );
+                }
+
+                crate::datapack::disasters::record_chunk(
+                    abs_chunk_x,
+                    abs_chunk_z,
+                    &sections,
+                    &biome_names,
+                );
 
                 let chunk = Chunk {
                     sections,
@@ -504,7 +608,15 @@ fn write_region_to_disk(
                 let chunk_nbt = create_chunk_nbt_with_lighting(&chunk, lighting, &biome_value);
                 ser_buffer.clear();
                 fastnbt::to_writer(&mut ser_buffer, &chunk_nbt)?;
-                region.write_chunk(chunk_x as usize, chunk_z as usize, &ser_buffer)?;
+                let len = compress_chunk_to_fit(&mut compressor, &ser_buffer, &mut compressed)?;
+                if len > MAX_COMPRESSED_CHUNK {
+                    return Err(format!(
+                        "chunk ({abs_chunk_x}, {abs_chunk_z}) compresses to {len} bytes, more \
+                         than the {MAX_COMPRESSED_CHUNK} a region file can hold"
+                    )
+                    .into());
+                }
+                region.write_chunk(chunk_x as usize, chunk_z as usize, &compressed[..len])?;
                 if merge {
                     written_chunks.push((chunk_x, chunk_z));
                 }
@@ -514,14 +626,23 @@ fn write_region_to_disk(
         if let Some(lod) = lod.as_mut() {
             lod.end_column(column);
         }
+        if let Some(lod) = dh_lod.as_mut() {
+            lod.end_column(column);
+        }
     }
+
+    // Before the LOD caches finish, so a region that fails to reach disk leaves them
+    // unfinished, as a chunk that failed to write does.
+    region.finish()?;
 
     if let Some(mut lod) = lod {
         lod.finish();
     }
+    if let Some(mut lod) = dh_lod {
+        lod.finish();
+    }
 
     if let Some(dir) = merge_dir.filter(|_| !written_chunks.is_empty()) {
-        drop(region);
         strip_stale_side_chunks(&dir, region_x, region_z, &written_chunks);
     }
 
@@ -529,7 +650,7 @@ fn write_region_to_disk(
 }
 
 /// Morton (Z-order) index into a 16x16 grid of 2x2-chunk columns.
-fn morton_16(index: usize) -> (i32, i32) {
+pub(crate) fn morton_16(index: usize) -> (i32, i32) {
     let mut x = 0i32;
     let mut z = 0i32;
     for bit in 0..4 {
@@ -554,6 +675,12 @@ fn morton_16(index: usize) -> (i32, i32) {
 /// above the tallest roof is never marked here, yet it still gets ingested,
 /// because the level-1..4 sections it falls into are live from the content
 /// below it. That is what `region_content_span`'s `+ 1` relies on.
+/// A chunk present in the region but holding nothing to write. The writer gives it what an
+/// absent chunk gets, so everything that predicts the written chunks must read it that way.
+fn holds_nothing(chunk: &ChunkToModify) -> bool {
+    chunk.sections.is_empty() && chunk.other.is_empty()
+}
+
 fn live_lod_sections(
     region: &super::common::RegionToModify,
     region_x: i32,
@@ -566,13 +693,13 @@ fn live_lod_sections(
             let chunk_x = region_x * 32 + local_x;
             let chunk_z = region_z * 32 + local_z;
             match region.get_chunk(local_x, local_z) {
-                Some(chunk) => {
-                    for &section_y in chunk.sections.keys() {
+                Some(chunk) if !holds_nothing(chunk) => {
+                    for section_y in chunk.sections.keys() {
                         crate::voxy::mark_live(&mut live, chunk_x, section_y as i32, chunk_z);
                     }
                 }
                 // Filler chunks are a flat plane at the terrain base.
-                None => crate::voxy::mark_live(&mut live, chunk_x, base_section_y, chunk_z),
+                _ => crate::voxy::mark_live(&mut live, chunk_x, base_section_y, chunk_z),
             }
         }
     }
@@ -590,7 +717,7 @@ fn region_content_span(region: &super::common::RegionToModify) -> (i32, i32) {
     let mut min_y = base_section_y.min(-4);
     let mut max_y = base_section_y;
     for chunk in region.chunks.values() {
-        for &section_y in chunk.sections.keys() {
+        for section_y in chunk.sections.keys() {
             min_y = min_y.min(section_y as i32);
             max_y = max_y.max(section_y as i32);
         }
@@ -613,8 +740,8 @@ pub(crate) struct RegionWriteCtx {
     void_world: bool,
     preview: Option<std::sync::Arc<crate::map_renderer::PreviewAccumulator>>,
     voxy: Option<std::sync::Arc<crate::voxy::VoxyWriter>>,
+    dh: Option<std::sync::Arc<crate::distant_horizons::DhWriter>>,
     mode: RegionWriteMode,
-    climate_lat: Option<f64>,
     ground_origin: (i32, i32),
 }
 
@@ -628,8 +755,8 @@ impl RegionWriteCtx {
         void_world: bool,
         preview: Option<std::sync::Arc<crate::map_renderer::PreviewAccumulator>>,
         voxy: Option<std::sync::Arc<crate::voxy::VoxyWriter>>,
+        dh: Option<std::sync::Arc<crate::distant_horizons::DhWriter>>,
         mode: RegionWriteMode,
-        climate_lat: Option<f64>,
         ground_origin: (i32, i32),
     ) -> Self {
         Self {
@@ -640,8 +767,8 @@ impl RegionWriteCtx {
             void_world,
             preview,
             voxy,
+            dh,
             mode,
-            climate_lat,
             ground_origin,
         }
     }
@@ -660,11 +787,11 @@ impl RegionWriteCtx {
             self.void_world,
             self.preview.as_deref(),
             self.voxy.as_deref(),
+            self.dh.as_deref(),
             region_x,
             region_z,
             region_to_modify,
             &self.mode,
-            self.climate_lat,
             self.ground_origin,
         )
     }
@@ -686,7 +813,7 @@ impl RegionWriteCtx {
 /// odds of two colliding are percents, not nothing. A collision here is silent
 /// entity loss, which is the defect this key exists to fix.
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
-enum EntityIdentity {
+pub(super) enum EntityIdentity {
     Uuid([i32; 4]),
     /// Block entities carry no UUID; `Facing` separates the ones that share a
     /// cell, and -1 stands for an entity that has neither.
@@ -694,7 +821,9 @@ enum EntityIdentity {
 }
 
 #[inline]
-fn get_entity_coords(entity: &HashMap<String, Value>) -> Option<(i32, i32, i32, EntityIdentity)> {
+pub(super) fn get_entity_coords(
+    entity: &HashMap<String, Value>,
+) -> Option<(i32, i32, i32, EntityIdentity)> {
     let facing = match entity.get("UUID") {
         Some(Value::IntArray(uuid)) if uuid.len() == 4 => {
             EntityIdentity::Uuid([uuid[0], uuid[1], uuid[2], uuid[3]])
@@ -762,6 +891,10 @@ fn block_light_emission(name: &str, props: Option<&Value>) -> u8 {
         "minecraft:glow_lichen" => 7,
         "minecraft:redstone_torch" | "minecraft:redstone_wall_torch" if !unlit => 7,
         "minecraft:sculk_catalyst" => 6,
+        // The invisible light block carries its level; 15 unless stated.
+        "minecraft:light" => prop_str(props, "level")
+            .and_then(|l| l.parse::<u8>().ok())
+            .map_or(15, |l| l.min(15)),
         "minecraft:magma_block" => 3,
         "minecraft:brewing_stand" | "minecraft:brown_mushroom" => 1,
         _ => 0,
@@ -774,7 +907,7 @@ fn is_light_transparent(name: &str) -> bool {
     if n == "tinted_glass" {
         return false; // tinted glass blocks all light, unlike other glass
     }
-    if n.ends_with("air") || n.ends_with("leaves") || n.contains("glass") {
+    if n.ends_with("air") || n == "light" || n.ends_with("leaves") || n.contains("glass") {
         return true;
     }
     const EXACT: &[&str] = &[
@@ -819,6 +952,7 @@ fn is_light_transparent(name: &str) -> bool {
         "wheat",
         "carrots",
         "potatoes",
+        "beetroots",
         "lily_pad",
         "sea_pickle",
         "cobweb",
@@ -2070,8 +2204,8 @@ mod merge_tests {
     ) -> RegionToModify {
         let mut region = RegionToModify::default();
         for &(cx, cz) in chunks {
-            let chunk = region.chunks.entry((cx, cz)).or_default();
-            let section = chunk.sections.entry(0).or_default();
+            let chunk = region.get_or_create_chunk(cx, cz);
+            let section = chunk.sections.get_or_default(0);
             section.storage.set(0, block);
         }
         region
@@ -2086,11 +2220,11 @@ mod merge_tests {
             false,
             None,
             None,
+            None,
             0,
             0,
             region,
             &mode,
-            None,
             (0, 0),
         )
         .unwrap();
@@ -2271,6 +2405,178 @@ mod merge_tests {
         );
     }
 
+    /// The `xPos`/`zPos` chunk `(cx, cz)` of `r.0.0.mca` says it is at, and its sections.
+    fn stored_chunk(dir: &std::path::Path, cx: usize, cz: usize) -> ((i32, i32), Value) {
+        let file = File::open(dir.join("region").join("r.0.0.mca")).unwrap();
+        let mut region = Region::from_stream(file).unwrap();
+        let data = region.read_chunk(cx, cz).unwrap().unwrap();
+        let Value::Compound(root) = fastnbt::from_bytes(&data).unwrap() else {
+            panic!("chunk ({cx}, {cz}) is not a compound");
+        };
+        let (Some(Value::Int(x)), Some(Value::Int(z))) = (root.get("xPos"), root.get("zPos"))
+        else {
+            panic!("chunk ({cx}, {cz}) has no position");
+        };
+        ((*x, *z), root["sections"].clone())
+    }
+
+    #[test]
+    fn a_fresh_flat_write_gives_an_empty_chunk_the_filler_not_a_template_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut region = region_with(&[(5, 5)], STONE);
+        // Present but holding nothing, as a write dropped above the ceiling leaves one.
+        region.get_or_create_chunk(6, 6);
+        write(dir.path(), &region, RegionWriteMode::Fresh);
+        let (position, sections) = stored_chunk(dir.path(), 6, 6);
+        assert_eq!(position, (6, 6));
+        // Untouched, so it got the filler.
+        assert_eq!(sections, stored_chunk(dir.path(), 7, 7).1);
+    }
+
+    #[test]
+    fn a_fresh_void_write_holds_only_the_chunks_the_area_touches() {
+        let dir = tempfile::tempdir().unwrap();
+        write_region_to_disk(
+            dir.path(),
+            &llbbox(),
+            None,
+            false,
+            true,
+            None,
+            None,
+            None,
+            0,
+            0,
+            &region_with(&[(5, 5), (31, 0)], STONE),
+            &RegionWriteMode::Fresh,
+            (0, 0),
+        )
+        .unwrap();
+        assert_eq!(present_chunks(dir.path()), vec![(31, 0), (5, 5)]);
+        assert_eq!(
+            base_block_name(dir.path(), 31, 0).as_deref(),
+            Some("minecraft:stone")
+        );
+    }
+
+    /// Bytes that do not compress.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x: u32 = 0x9E37_79B9;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    fn inflate(zlib: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut back = Vec::new();
+        flate2::read::ZlibDecoder::new(zlib)
+            .read_to_end(&mut back)
+            .unwrap();
+        back
+    }
+
+    #[test]
+    fn a_reused_compressor_round_trips_every_chunk() {
+        // Noise outgrows the first reservation; the small ones follow it into a buffer
+        // longer than they need, so only the returned length may be read.
+        let inputs = [b"short".to_vec(), vec![7u8; 100_000], noise(300_000)];
+        let mut compressor = flate2::Compress::new(flate2::Compression::fast(), true);
+        let mut out = Vec::new();
+        // Twice over, so every input also follows a different one through the compressor.
+        for raw in inputs.iter().chain(inputs.iter()) {
+            let len = compress_chunk(&mut compressor, raw, &mut out).unwrap();
+            assert_eq!(&inflate(&out[..len]), raw);
+        }
+    }
+
+    #[test]
+    fn a_chunk_the_fast_level_would_leave_too_large_still_fits() {
+        // Just under the limit raw, so it only fits if stored about as is.
+        let raw = noise(1_000_000);
+        let mut compressor = flate2::Compress::new(flate2::Compression::fast(), true);
+        let mut out = Vec::new();
+        // Without this the test would pass on a backend that never needs the retry.
+        let fast = compress_chunk(&mut compressor, &raw, &mut out).unwrap();
+        assert!(fast > MAX_COMPRESSED_CHUNK, "fast level fits: {fast} bytes");
+        let len = compress_chunk_to_fit(&mut compressor, &raw, &mut out).unwrap();
+        assert!(len <= MAX_COMPRESSED_CHUNK, "{len} bytes");
+        assert_eq!(inflate(&out[..len]), raw);
+        // The region's compressor is left fit for the next chunk.
+        let len = compress_chunk_to_fit(&mut compressor, b"next", &mut out).unwrap();
+        assert_eq!(inflate(&out[..len]), b"next");
+    }
+
+    #[test]
+    fn a_chunk_too_large_to_store_fails_the_write_and_names_the_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut region = region_with(&[(5, 5)], STONE);
+        let junk = noise(1_200_000).into_iter().map(|b| b as i8).collect();
+        region
+            .get_or_create_chunk(3, 4)
+            .other
+            .insert("junk".to_string(), Value::ByteArray(ByteArray::new(junk)));
+        let err = write_region_to_disk(
+            dir.path(),
+            &llbbox(),
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+            0,
+            0,
+            &region,
+            &RegionWriteMode::Fresh,
+            (0, 0),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("chunk (3, 4)"), "{err}");
+    }
+
+    #[test]
+    fn a_fresh_flat_region_is_written_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut region = region_with(&[(5, 5)], STONE);
+        // Several sectors, so a start from the template would have moved it and left a gap.
+        let junk = noise(10_000).into_iter().map(|b| b as i8).collect();
+        region
+            .get_or_create_chunk(5, 5)
+            .other
+            .insert("junk".to_string(), Value::ByteArray(ByteArray::new(junk)));
+        write(dir.path(), &region, RegionWriteMode::Fresh);
+        // Header plus each chunk's own sectors, with no template chunk left in a gap.
+        let file = File::open(dir.path().join("region").join("r.0.0.mca")).unwrap();
+        let header = {
+            use std::io::Read;
+            let mut header = vec![0u8; 4096];
+            (&file).read_exact(&mut header).unwrap();
+            header
+        };
+        let sectors: u64 = header.chunks(4).map(|loc| u64::from(loc[3])).sum();
+        assert_eq!(file.metadata().unwrap().len(), (2 + sectors) * 4096);
+    }
+
+    #[test]
+    fn an_empty_chunk_feeds_the_voxy_lod_like_an_absent_one() {
+        let mut with_empty = region_with(&[(5, 5)], STONE);
+        // A whole 2x2 group, since one absent neighbour would mark the group anyway.
+        for (cx, cz) in [(6, 6), (6, 7), (7, 6), (7, 7)] {
+            with_empty.get_or_create_chunk(cx, cz);
+        }
+        assert_eq!(
+            live_lod_sections(&with_empty, 0, 0),
+            live_lod_sections(&region_with(&[(5, 5)], STONE), 0, 0)
+        );
+    }
+
     #[test]
     fn a_merge_drops_rewritten_chunks_from_the_entity_regions() {
         let dir = tempfile::tempdir().unwrap();
@@ -2350,5 +2656,19 @@ mod merge_tests {
         assert!(!m.writes_chunk(-3, 0));
         assert!(!m.writes_chunk(0, 1));
         assert!(RegionWriteMode::Fresh.writes_chunk(1000, -1000));
+    }
+
+    #[test]
+    fn invisible_light_block_lights_and_passes_light() {
+        use super::{block_light_emission, light_opacity};
+        assert_eq!(block_light_emission("minecraft:light", None), 15);
+        let level = Value::Compound(HashMap::from([(
+            "level".to_string(),
+            Value::String("9".to_string()),
+        )]));
+        assert_eq!(block_light_emission("minecraft:light", Some(&level)), 9);
+        assert_eq!(light_opacity("minecraft:light"), 0);
+        // Names merely containing "light" keep their own behaviour.
+        assert_eq!(light_opacity("minecraft:light_gray_concrete"), 15);
     }
 }

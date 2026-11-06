@@ -6,18 +6,19 @@
 
 use crate::coordinate_system::geographic::LLBBox;
 use crate::elevation::cache::get_cache_dir;
-use crate::elevation::provider::{ElevationProvider, RawElevationGrid};
+use crate::elevation::provider::{ElevationProvider, RawElevationGrid, SourcePixels, SourceRow};
 use crate::elevation::providers::tile_math::MAX_TILES_PER_FETCH;
 use fnv::{FnvHashMap, FnvHashSet};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
-use super::tile_math::{bbox_dimensions_m, blend_finite_samples};
+use super::tile_math::{
+    decode_terrarium, grid_cell_m, in_tile, pixel_m, sample_pixels, SMOOTH_PIXEL_CELLS,
+};
 
 const MAPTERHORN_URL: &str = "https://tiles.mapterhorn.com/{z}/{x}/{y}.webp";
 /// 512px tiles, so one zoom lower fetches the same ground resolution as AWS 256px.
 const TILE_PX: u32 = 512;
-const TERRARIUM_OFFSET: f64 = 32768.0;
 /// z17 (~0.4 m/px) is only reachable with --scale > 1 over sub-meter source regions.
 const MAX_ZOOM: u8 = 17;
 /// Pyramid floor; any land tile exists at z6, only mid-ocean is absent there.
@@ -89,10 +90,12 @@ impl ElevationProvider for Mapterhorn {
             grid_height
         );
 
-        let height_grid = sample_grid(bbox, zoom, &outcome, &cache_dir, grid_width, grid_height);
+        let (height_grid, source_pixels) =
+            sample_grid(bbox, zoom, &outcome, &cache_dir, grid_width, grid_height);
 
         Ok(RawElevationGrid {
             heights_meters: height_grid,
+            source_pixels: Some(source_pixels),
         })
     }
 }
@@ -101,11 +104,8 @@ impl ElevationProvider for Mapterhorn {
 
 /// Smallest zoom whose pixels match the grid cell size, within budget.
 fn choose_zoom(bbox: &LLBBox, grid_width: usize, grid_height: usize) -> u8 {
-    let (w_m, h_m) = bbox_dimensions_m(bbox);
-    let cell_x = w_m / (grid_width.saturating_sub(1)).max(1) as f64;
-    let cell_y = h_m / (grid_height.saturating_sub(1)).max(1) as f64;
     // Finer axis wins so thin strips don't get under-resolved.
-    let cell_m = cell_x.min(cell_y).max(0.05);
+    let cell_m = grid_cell_m(bbox, grid_width, grid_height);
 
     let mid_lat = (bbox.min().lat() + bbox.max().lat()) * 0.5;
     let cos_lat = mid_lat.to_radians().cos().abs().max(1e-6);
@@ -577,10 +577,6 @@ fn download_tile(
 // ─── Sampling ──────────────────────────────────────────────────────────
 
 #[inline]
-fn decode_terrarium(pixel: &image::Rgb<u8>) -> f64 {
-    (pixel[0] as f64 * 256.0 + pixel[1] as f64 + pixel[2] as f64 / 256.0) - TERRARIUM_OFFSET
-}
-
 fn row_lat(bbox: &LLBBox, gy: usize, grid_height: usize) -> f64 {
     bbox.max().lat()
         - (gy as f64 / (grid_height - 1).max(1) as f64) * (bbox.max().lat() - bbox.min().lat())
@@ -588,6 +584,26 @@ fn row_lat(bbox: &LLBBox, gy: usize, grid_height: usize) -> f64 {
 
 fn norm_y_for_lat(lat: f64) -> f64 {
     (1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0
+}
+
+/// The macrotile zoom: Mapterhorn builds finer levels only for z12 tiles a finer source
+/// touches, so where a sample falls back to z12 or below, only GLO-30 is there.
+const GLO30_TOP_ZOOM: u8 = 12;
+/// GLO-30's own resolution, coarser than the z12 pixels it is resampled into.
+const GLO30_M: f64 = 30.0;
+
+/// Source resolution behind a sample read at zoom `z` when the grid asked for `top_zoom`.
+/// A sample that fell back to the GLO-30 levels counts at 30 m. One read at the zoom asked
+/// for counts at its pixel size: up to z12 that level is also LiDAR averaged down where a
+/// macrotile has it, and above it the part of a macrotile its LiDAR misses is GLO-30
+/// painted in at that zoom. Both err towards the finer source, never the coarser.
+fn source_pixel_m(bbox: &LLBBox, z: u8, top_zoom: u8) -> f64 {
+    let px = pixel_m(bbox, z, TILE_PX);
+    if z < top_zoom && z <= GLO30_TOP_ZOOM {
+        px.max(GLO30_M)
+    } else {
+        px
+    }
 }
 
 /// Sample the grid in row chunks, decoding only the tiles each chunk needs,
@@ -599,10 +615,15 @@ fn sample_grid(
     cache_dir: &Path,
     grid_width: usize,
     grid_height: usize,
-) -> Vec<Vec<f64>> {
+) -> (Vec<Vec<f64>>, SourcePixels) {
     let floor = MIN_ZOOM.min(zoom);
+    let smooth_below = smooth_below(bbox, zoom, grid_width, grid_height);
     let mut height_grid: Vec<Vec<f64>> = Vec::with_capacity(grid_height);
     let mut unreadable: FnvHashSet<TileKey> = FnvHashSet::default();
+    let mut source: Vec<SourceRow> = Vec::with_capacity(grid_height);
+    let level_m: Vec<f32> = (0..=zoom)
+        .map(|z| source_pixel_m(bbox, z, zoom) as f32)
+        .collect();
 
     for chunk_start in (0..grid_height).step_by(SAMPLE_CHUNK_ROWS) {
         let chunk_end = (chunk_start + SAMPLE_CHUNK_ROWS).min(grid_height);
@@ -618,20 +639,26 @@ fn sample_grid(
             &mut unreadable,
         );
 
-        let mut rows: Vec<Vec<f64>> = (chunk_start..chunk_end)
+        let rows: Vec<(Vec<f64>, SourceRow)> = (chunk_start..chunk_end)
             .into_par_iter()
             .map(|gy| {
                 let lat = row_lat(bbox, gy, grid_height);
                 let norm_y = norm_y_for_lat(lat);
                 let mut row = vec![f64::NAN; grid_width];
+                let mut pixels = SourceRow::default();
                 for (gx, cell) in row.iter_mut().enumerate() {
                     let lng = bbox.min().lng()
                         + (gx as f64 / (grid_width - 1).max(1) as f64)
                             * (bbox.max().lng() - bbox.min().lng());
                     let norm_x = (lng + 180.0) / 360.0;
 
-                    *cell = match sample_height(&tiles, zoom, norm_x, norm_y) {
-                        Some(v) => v,
+                    let sample = sample_height(&tiles, zoom, smooth_below, norm_x, norm_y);
+                    pixels.push(
+                        gx,
+                        sample.map_or(f32::INFINITY, |(_, z)| level_m[z as usize]),
+                    );
+                    *cell = match sample {
+                        Some((v, _)) => v,
                         // Confirmed-404 floor ancestor means ocean (0.0);
                         // otherwise a download failed and NaN lets the caller judge.
                         None => {
@@ -644,17 +671,45 @@ fn sample_grid(
                         }
                     };
                 }
-                row
+                (row, pixels)
             })
             .collect();
-        height_grid.append(&mut rows);
+        for (row, pixels) in rows {
+            height_grid.push(row);
+            source.push(pixels);
+        }
     }
 
-    height_grid
+    (height_grid, SourcePixels::new(source))
+}
+
+/// Levels below the returned zoom have pixels coarser than `SMOOTH_PIXEL_CELLS` grid
+/// cells and are B-spline sampled.
+fn smooth_below(bbox: &LLBBox, zoom: u8, grid_width: usize, grid_height: usize) -> u8 {
+    let cell_m = grid_cell_m(bbox, grid_width, grid_height);
+    (0..=zoom)
+        .find(|&z| pixel_m(bbox, z, TILE_PX) <= SMOOTH_PIXEL_CELLS * cell_m)
+        .unwrap_or(zoom + 1)
+}
+
+/// Pixels a sample can read either side of its position: the spline's outer taps.
+const TAP_REACH_PX: f64 = 3.0;
+
+/// Tile indices at zoom `z` whose pixels the samples between `lo` and `hi` (normalized
+/// mercator) can read.
+fn tap_tile_range(z: u8, lo: f64, hi: f64) -> (u32, u32) {
+    let n_tiles = 1i64 << z;
+    let world_px = n_tiles as f64 * TILE_PX as f64;
+    let tile = |norm: f64, reach: f64| {
+        (((norm * world_px + reach) / TILE_PX as f64).floor() as i64).clamp(0, n_tiles - 1) as u32
+    };
+    (
+        tile(lo.min(hi), -TAP_REACH_PX),
+        tile(lo.max(hi), TAP_REACH_PX),
+    )
 }
 
 /// Decode the available tiles a row chunk can touch, across all pyramid levels.
-/// Bilinear crossings only ever go +1 tile, so only the max side needs margin.
 #[allow(clippy::too_many_arguments)]
 fn load_chunk_tiles(
     outcome: &FetchOutcome,
@@ -669,16 +724,13 @@ fn load_chunk_tiles(
 ) -> FnvHashMap<TileKey, TileImage> {
     let norm_y_top = norm_y_for_lat(row_lat(bbox, chunk_start, grid_height));
     let norm_y_bot = norm_y_for_lat(row_lat(bbox, chunk_end.saturating_sub(1), grid_height));
+    let norm_x_min = (bbox.min().lng() + 180.0) / 360.0;
+    let norm_x_max = (bbox.max().lng() + 180.0) / 360.0;
 
     let mut tiles: FnvHashMap<TileKey, TileImage> = FnvHashMap::default();
     for z in floor..=zoom {
-        let n_tiles = (1i64 << z).max(1);
-        let ty_top = tile_key_at(z, 0.0, norm_y_top).y as i64;
-        let ty_bot = tile_key_at(z, 0.0, norm_y_bot).y as i64;
-        let ty_min = ty_top.min(ty_bot) as u32;
-        let ty_max = (ty_top.max(ty_bot) + 1).clamp(0, n_tiles - 1) as u32;
-        let (tx_min, x2, _, _) = covering_tile_range(bbox, z);
-        let tx_max = (x2 as i64 + 1).clamp(0, n_tiles - 1) as u32;
+        let (ty_min, ty_max) = tap_tile_range(z, norm_y_top, norm_y_bot);
+        let (tx_min, tx_max) = tap_tile_range(z, norm_x_min, norm_x_max);
 
         for ty in ty_min..=ty_max {
             for tx in tx_min..=tx_max {
@@ -704,47 +756,37 @@ fn load_chunk_tiles(
     tiles
 }
 
-/// Bilinear sample walking the pyramid top-down; None means no tile covers it.
+/// Sample walking the pyramid top-down, with the zoom it was read at; None means no tile
+/// covers it. Levels below `smooth_below` are B-spline sampled, the rest bilinear.
 fn sample_height(
     tiles: &FnvHashMap<TileKey, TileImage>,
     top_zoom: u8,
+    smooth_below: u8,
     norm_x: f64,
     norm_y: f64,
-) -> Option<f64> {
+) -> Option<(f64, u8)> {
     let floor = MIN_ZOOM.min(top_zoom);
     for z in (floor..=top_zoom).rev() {
         let key = tile_key_at(z, norm_x, norm_y);
-        if !tiles.contains_key(&key) {
+        let Some(tile) = tiles.get(&key) else {
             continue;
-        }
+        };
 
         let n = 2.0_f64.powi(z as i32);
-        let fx = norm_x * n * TILE_PX as f64;
-        let fy = norm_y * n * TILE_PX as f64;
-        // At the exact +180/south world edge the clamped key leaves px/py
-        // at TILE_PX; snap to the last real pixel instead of NaN.
-        let mut px = fx - key.x as f64 * TILE_PX as f64;
-        let mut py = fy - key.y as f64 * TILE_PX as f64;
-        if px >= TILE_PX as f64 {
-            px = TILE_PX as f64 - 1.0;
-        }
-        if py >= TILE_PX as f64 {
-            py = TILE_PX as f64 - 1.0;
-        }
-        let x0 = px.floor() as i32;
-        let y0 = py.floor() as i32;
-        let dx = (px - x0 as f64).clamp(0.0, 1.0);
-        let dy = (py - y0 as f64).clamp(0.0, 1.0);
-
-        let v00 = sample_tile_pixel(tiles, &key, x0, y0);
-        let v10 = sample_tile_pixel(tiles, &key, x0 + 1, y0);
-        let v01 = sample_tile_pixel(tiles, &key, x0, y0 + 1);
-        let v11 = sample_tile_pixel(tiles, &key, x0 + 1, y0 + 1);
-
-        // NaN corners (absent neighbor tiles) drop out of the blend weighting.
-        let value = blend_finite_samples(v00, v10, v01, v11, dx, dy);
+        let size = TILE_PX as f64;
+        let px = in_tile(norm_x * n * size, key.x as f64 * size, TILE_PX);
+        let py = in_tile(norm_y * n * size, key.y as f64 * size, TILE_PX);
+        let (w, h) = (tile.width() as i32, tile.height() as i32);
+        // Taps inside this tile read it directly; only edge taps look up a neighbour.
+        let value = sample_pixels(px, py, z < smooth_below, |x, y| {
+            if (0..w).contains(&x) && (0..h).contains(&y) {
+                decode_terrarium(tile.get_pixel(x as u32, y as u32))
+            } else {
+                sample_tile_pixel(tiles, &key, x, y)
+            }
+        });
         if value.is_finite() {
-            return Some(value);
+            return Some((value, z));
         }
     }
     None
@@ -790,7 +832,9 @@ fn sample_tile_pixel(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tile_math::bbox_dimensions_m;
     use super::*;
+    use crate::elevation::providers::tile_math::TERRARIUM_OFFSET;
 
     fn flat_tile(height_m: f64) -> TileImage {
         let raw = (height_m + TERRARIUM_OFFSET).round() as u32;
@@ -882,7 +926,8 @@ mod tests {
         );
         let norm_x = (2138.0 + 0.5) / 4096.0;
         let norm_y = (1430.0 + 0.5) / 4096.0;
-        let v = sample_height(&tiles, 12, norm_x, norm_y).unwrap();
+        let (v, z) = sample_height(&tiles, 12, 12, norm_x, norm_y).unwrap();
+        assert_eq!(z, 12);
         assert!((v - 1000.0).abs() < 0.51, "got {v}");
     }
 
@@ -899,14 +944,148 @@ mod tests {
         );
         let norm_x = (2138.0 + 0.5) / 4096.0;
         let norm_y = (1430.0 + 0.5) / 4096.0;
-        let v = sample_height(&tiles, 12, norm_x, norm_y).unwrap();
+        let (v, z) = sample_height(&tiles, 12, 12, norm_x, norm_y).unwrap();
+        assert_eq!(z, 11, "read from the parent");
         assert!((v - 250.0).abs() < 0.51, "got {v}");
+    }
+
+    #[test]
+    fn test_sample_height_reads_pixel_centres_across_a_tile_seam() {
+        let mut tiles: FnvHashMap<TileKey, TileImage> = FnvHashMap::default();
+        tiles.insert(
+            TileKey {
+                z: 12,
+                x: 2138,
+                y: 1430,
+            },
+            flat_tile(100.0),
+        );
+        tiles.insert(
+            TileKey {
+                z: 12,
+                x: 2139,
+                y: 1430,
+            },
+            flat_tile(300.0),
+        );
+        let norm_y = (1430.0 + 0.5) / 4096.0;
+        let at = |px_in_east: f64, smooth: u8| {
+            let norm_x = (2139.0 + px_in_east / TILE_PX as f64) / 4096.0;
+            sample_height(&tiles, 12, smooth, norm_x, norm_y).unwrap().0
+        };
+        // The seam lies halfway between the last west and the first east pixel centre.
+        assert!((at(0.0, 12) - 200.0).abs() < 1e-6, "got {}", at(0.0, 12));
+        assert!((at(0.5, 12) - 300.0).abs() < 1e-6, "got {}", at(0.5, 12));
+        assert!((at(-0.5, 12) - 100.0).abs() < 1e-6, "got {}", at(-0.5, 12));
+        // The spline is symmetric about the seam too, and settles within two pixels.
+        assert!((at(0.0, 13) - 200.0).abs() < 1e-6, "got {}", at(0.0, 13));
+        assert!((at(2.5, 13) - 300.0).abs() < 1e-6, "got {}", at(2.5, 13));
+        // Between the two pixel centres the height runs straight across the seam.
+        for k in -5..=5 {
+            let off = 0.1 * k as f64;
+            let want = 200.0 + 200.0 * off;
+            assert!(
+                (at(off, 12) - want).abs() < 1e-6,
+                "at {off}: {}",
+                at(off, 12)
+            );
+        }
+    }
+
+    #[test]
+    fn test_coverage_edge_meets_the_parent_without_a_step() {
+        // A slope at 0.5 m per z13 pixel; the east z13 tile is missing, so its side comes
+        // from the z12 parent, which carries the same slope at its own pixel centres.
+        let base = 4276.0 * TILE_PX as f64;
+        let slope = |x13: f64| 500.0 + 0.5 * (x13 - base);
+        let encode = |h: f64| {
+            let raw = h + TERRARIUM_OFFSET;
+            let whole = raw.floor();
+            image::Rgb([
+                (whole / 256.0) as u8,
+                (whole % 256.0) as u8,
+                ((raw - whole) * 256.0) as u8,
+            ])
+        };
+        let mut tiles: FnvHashMap<TileKey, TileImage> = FnvHashMap::default();
+        tiles.insert(
+            TileKey {
+                z: 13,
+                x: 4276,
+                y: 2860,
+            },
+            TileImage::from_fn(TILE_PX, TILE_PX, |i, _| {
+                encode(slope(base + i as f64 + 0.5))
+            }),
+        );
+        tiles.insert(
+            TileKey {
+                z: 12,
+                x: 2138,
+                y: 1430,
+            },
+            TileImage::from_fn(TILE_PX, TILE_PX, |i, _| {
+                encode(slope(2.0 * (2138.0 * TILE_PX as f64 + i as f64 + 0.5)))
+            }),
+        );
+        let norm_y = (2860.0 + 0.5) / 8192.0;
+        let world_px = 8192.0 * TILE_PX as f64;
+        // Up to a pixel short of the edge on the fine side, then well into the parent's side.
+        for x13 in (0..1000).map(|i| base + 0.5 + i as f64) {
+            if (base + 511.0..base + 513.0).contains(&x13) {
+                continue;
+            }
+            let (v, _) = sample_height(&tiles, 13, 13, x13 / world_px, norm_y).unwrap();
+            assert!(
+                (v - slope(x13)).abs() < 0.02,
+                "at {}: {v} vs {}",
+                x13 - base,
+                slope(x13)
+            );
+        }
+    }
+
+    #[test]
+    fn test_smooth_below_spares_fine_data() {
+        let berlin = LLBBox::new(52.50, 13.40, 52.51, 13.41).unwrap();
+        let (w, h) = bbox_dimensions_m(&berlin);
+        let (w, h) = (w as usize + 1, h as usize + 1);
+        let zoom = choose_zoom(&berlin, w, h);
+        let below = smooth_below(&berlin, zoom, w, h);
+        // The chosen zoom and its first parent stay bilinear; 30 m data is smoothed.
+        assert!(
+            below < zoom && below >= zoom - 1,
+            "z{zoom}, smooth below z{below}"
+        );
+        assert!(below > 12);
+        // A grid capped coarser than its tiles' pixels smooths the chosen zoom too.
+        assert_eq!(smooth_below(&berlin, 10, w, h), 11);
+    }
+
+    #[test]
+    fn test_tap_tile_range_takes_a_neighbour_only_when_taps_reach_it() {
+        let z = 12;
+        let edge = 2138.0 / 4096.0;
+        let px = 1.0 / (4096.0 * TILE_PX as f64);
+        assert_eq!(
+            tap_tile_range(z, edge + 100.0 * px, edge + 400.0 * px),
+            (2138, 2138)
+        );
+        assert_eq!(
+            tap_tile_range(z, edge + 1.0 * px, edge + 400.0 * px),
+            (2137, 2138)
+        );
+        assert_eq!(
+            tap_tile_range(z, edge + 100.0 * px, edge + 510.0 * px),
+            (2138, 2139)
+        );
+        assert_eq!(tap_tile_range(0, 0.0, 1.0), (0, 0));
     }
 
     #[test]
     fn test_sample_height_ocean_returns_none() {
         let tiles: FnvHashMap<TileKey, TileImage> = FnvHashMap::default();
-        assert!(sample_height(&tiles, 12, 0.4, 0.6).is_none());
+        assert!(sample_height(&tiles, 12, 12, 0.4, 0.6).is_none());
     }
 
     #[test]
@@ -935,7 +1114,7 @@ mod tests {
         };
 
         // 2500 rows forces three sampling chunks.
-        let grid = sample_grid(&bbox, 8, &outcome, tmp.path(), 64, 2500);
+        let (grid, _) = sample_grid(&bbox, 8, &outcome, tmp.path(), 64, 2500);
         assert_eq!(grid.len(), 2500);
         for row in &grid {
             for &v in row {
@@ -963,7 +1142,7 @@ mod tests {
             failed_downloads: 0,
         };
 
-        let grid = sample_grid(&bbox, 6, &outcome, tmp.path(), 32, 2500);
+        let (grid, _) = sample_grid(&bbox, 6, &outcome, tmp.path(), 32, 2500);
         assert!(
             (grid[0][0] - 300.0).abs() < 0.51,
             "north row got {}",
@@ -994,7 +1173,7 @@ mod tests {
             confirmed_missing,
             failed_downloads: 0,
         };
-        let grid = sample_grid(&bbox, 8, &ocean, tmp.path(), 8, 8);
+        let (grid, _) = sample_grid(&bbox, 8, &ocean, tmp.path(), 8, 8);
         assert!(grid.iter().flatten().all(|v| *v == 0.0));
 
         let failed = FetchOutcome {
@@ -1002,8 +1181,61 @@ mod tests {
             confirmed_missing: FnvHashSet::default(),
             failed_downloads: 3,
         };
-        let grid = sample_grid(&bbox, 8, &failed, tmp.path(), 8, 8);
+        let (grid, _) = sample_grid(&bbox, 8, &failed, tmp.path(), 8, 8);
         assert!(grid.iter().flatten().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn test_source_pixel_m_counts_a_glo30_fallback_at_30_m() {
+        let bbox = LLBBox::new(46.5, 7.9, 46.52, 7.92).unwrap();
+        // Read at the zoom asked for: that level's own pixels, LiDAR or not.
+        for z in [12, 16] {
+            assert!((source_pixel_m(&bbox, z, z) - pixel_m(&bbox, z, TILE_PX)).abs() < 1e-9);
+        }
+        // Fallen back to the GLO-30 levels: GLO-30, never finer than its own 30 m.
+        assert_eq!(source_pixel_m(&bbox, 12, 16), GLO30_M);
+        assert!(source_pixel_m(&bbox, 8, 16) > GLO30_M);
+        // A LiDAR level answering for a finer one keeps its pixels.
+        assert!(source_pixel_m(&bbox, 14, 16) < 5.0);
+    }
+
+    #[test]
+    fn test_sample_grid_reports_the_source_behind_each_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bbox = LLBBox::new(46.5, 7.9, 46.501, 7.901).unwrap();
+        let lidar = tile_key_at(13, (7.9005 + 180.0) / 360.0, norm_y_for_lat(46.5005));
+        let glo30 = lidar.parent().unwrap();
+        flat_tile(500.0).save(lidar.cache_path(tmp.path())).unwrap();
+        flat_tile(500.0).save(glo30.cache_path(tmp.path())).unwrap();
+        let outcome = |keys: &[TileKey]| FetchOutcome {
+            available: keys.iter().copied().collect(),
+            confirmed_missing: FnvHashSet::default(),
+            failed_downloads: 0,
+        };
+
+        let only = |px: &SourcePixels, want: f32| {
+            px.height() == 40 && (0..40).all(|gz| px.row(gz).runs() == [(0, want)])
+        };
+        let (_, px) = sample_grid(&bbox, 13, &outcome(&[lidar, glo30]), tmp.path(), 40, 40);
+        assert!(only(&px, pixel_m(&bbox, 13, TILE_PX) as f32));
+
+        let (_, px) = sample_grid(&bbox, 13, &outcome(&[glo30]), tmp.path(), 40, 40);
+        assert!(only(&px, GLO30_M as f32));
+
+        // Ocean has no source: its blocks stay unknown.
+        let ocean = FetchOutcome {
+            available: FnvHashSet::default(),
+            confirmed_missing: [tile_key_at(
+                6,
+                (7.9005 + 180.0) / 360.0,
+                norm_y_for_lat(46.5005),
+            )]
+            .into_iter()
+            .collect(),
+            failed_downloads: 0,
+        };
+        let (_, px) = sample_grid(&bbox, 13, &ocean, tmp.path(), 40, 40);
+        assert!(only(&px, f32::INFINITY));
     }
 
     #[test]

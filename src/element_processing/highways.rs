@@ -1,4 +1,4 @@
-use crate::args::Args;
+use crate::args::{Args, GenerationMode};
 use crate::block_definitions::*;
 use crate::bresenham::bresenham_line;
 use crate::coordinate_system::cartesian::{XZBBox, XZPoint};
@@ -8,176 +8,197 @@ use crate::element_processing::bridge_styles::{
 };
 use crate::element_processing::bridges::{is_bridge_way, BridgeStructureMap, BridgeSurfaceMap};
 use crate::element_processing::connected_blocks::{
-    connected_iron_bars, place_connected, stair_steps,
+    connected_iron_bars, four_connected_line, place_connected, stair_steps,
 };
 use crate::element_processing::get_nearest_non_road_block;
 use crate::element_processing::road_markings::{self, CrossMark, CrossingPaint, RoadMarkingIndex};
 use crate::element_processing::surfaces::{
     cycleway_palette, get_blocks_for_surface, get_blocks_for_surface_way, semirandom_surface,
 };
+use crate::element_processing::traffic_lights::is_signal;
 use crate::floodfill::flood_fill_area;
 use crate::floodfill_cache::{CoordinateBitmap, FloodFillCache, RoadMaskBitmap};
 use crate::osm_parser::{ProcessedElement, ProcessedNode, ProcessedWay};
 use crate::world_editor::WorldEditor;
 use std::collections::{HashMap, HashSet};
 
-/// Upper bound on `block_range` used by wide-road width flattening. The
-/// stamp is `2 * block_range + 1`; with `MAX_BLOCK_RANGE = 8` we can sort
-/// up to 17 samples on the stack. Keep this generous — a `debug_assert`
-/// below catches it if a caller ever exceeds it.
+/// Widest road half-width in blocks.
 const MAX_BLOCK_RANGE: usize = 8;
 
 /// Centerline cells between pillars under a raised non-bridge road.
 const OVERPASS_PILLAR_INTERVAL: usize = 8;
 
-/// Median of the ground levels along the road's width-perpendicular
-/// strip at one along-length coordinate. Pure primitive — no along-length
-/// smoothing. Callers should use `perpendicular_median_ground_y` unless
-/// they specifically need the unsmoothed value.
-#[inline]
-fn perpendicular_median_raw(
-    editor: &WorldEditor,
-    set_x: i32,
-    set_z: i32,
-    centerline_x: i32,
-    centerline_z: i32,
-    block_range: i32,
-    dir_horizontal: bool,
-) -> i32 {
-    debug_assert!(block_range as usize <= MAX_BLOCK_RANGE);
-    let len = 2 * block_range as usize + 1;
-    // Stack buffer keeps this allocation-free on a hot path that runs
-    // millions of times for a city-scale bbox.
-    let mut ys = [0i32; 2 * MAX_BLOCK_RANGE + 1];
-    if dir_horizontal {
-        for (i, t) in (-block_range..=block_range).enumerate() {
-            ys[i] = editor.get_ground_level(set_x, centerline_z + t);
-        }
-    } else {
-        for (i, t) in (-block_range..=block_range).enumerate() {
-            ys[i] = editor.get_ground_level(centerline_x + t, set_z);
-        }
-    }
-    ys[..len].sort_unstable();
-    ys[len / 2]
+/// What one level change costs a road profile, in squared blocks of deviation from the
+/// ground. Dips shorter than about ten cells cost more than they save and are levelled.
+const ROAD_STEP_COST: f64 = 5.0;
+/// Levels either side of the smoothed ground a road profile may take.
+const ROAD_PROFILE_REACH: i32 = 2;
+const ROAD_PROFILE_LEVELS: usize = (2 * ROAD_PROFILE_REACH + 2) as usize;
+/// Centerline cells either side a road's heading is read over.
+const ROAD_HEADING_CELLS: usize = 4;
+/// Gaussian, sigma 2 cells, so a diagonal centerline stepping across a side slope
+/// doesn't read as bumps.
+const ROAD_SMOOTHING: [f64; 13] = [
+    0.0022, 0.0088, 0.0270, 0.0648, 0.1210, 0.1760, 0.1995, 0.1760, 0.1210, 0.0648, 0.0270, 0.0088,
+    0.0022,
+];
+/// Half the side of the square a junction's level is averaged over.
+const JUNCTION_RADIUS: i32 = 3;
+
+/// Height over the ground from which a ramp spans a way below it rather than walling it in.
+const RAMP_SPAN_CLEARANCE: i32 = 4;
+
+/// Unrounded ground at a column, ignoring any surface a road has set.
+fn terrain_exact(editor: &WorldEditor, x: i32, z: i32) -> f64 {
+    editor
+        .terrain_level_exact(x, z)
+        .filter(|h| h.is_finite())
+        .unwrap_or_else(|| f64::from(editor.get_ground_level(x, z)))
 }
 
-/// Precompute one perpendicular-median Y per axial position in a
-/// centerline's stamp. Hot-loop optimization: inside a single centerline
-/// point's `(2b+1) × (2b+1)` stamp, every cell that shares a given axial
-/// offset (dx for horizontal travel, dz for vertical travel) produces
-/// the same target Y — `perpendicular_median_ground_y` ignores the
-/// cross-axis position entirely. Computing it once per axial value and
-/// reading from this table in the inner loop cuts `get_ground_level`
-/// call count by a factor of `2b+1` on the main road-stamp path.
-///
-/// The table layout maps axial offset `a ∈ [-block_range, block_range]`
-/// to index `(a + block_range) as usize`. `out.len()` must be at least
-/// `2 * block_range + 1`.
-#[inline]
-fn precompute_row_medians(
-    editor: &WorldEditor,
-    centerline_x: i32,
-    centerline_z: i32,
-    block_range: i32,
-    dir_horizontal: bool,
-    out: &mut [i32],
-) {
-    debug_assert!(block_range as usize <= MAX_BLOCK_RANGE);
-    let len = 2 * block_range as usize + 1;
-    debug_assert!(out.len() >= len);
-    for (i, slot) in out[..len].iter_mut().enumerate() {
-        let axial = -block_range + i as i32;
-        let (sx, sz) = if dir_horizontal {
-            (centerline_x + axial, centerline_z)
-        } else {
-            (centerline_x, centerline_z + axial)
-        };
-        *slot = perpendicular_median_ground_y(
-            editor,
-            sx,
-            sz,
-            centerline_x,
-            centerline_z,
-            block_range,
-            dir_horizontal,
-        );
+/// The level every way through a junction is held to, from the ground around it alone,
+/// so each way reaches the same level whatever order or tile it is drawn in.
+pub(crate) fn junction_level(editor: &WorldEditor, x: i32, z: i32) -> i32 {
+    let mut sum = 0.0;
+    for dz in -JUNCTION_RADIUS..=JUNCTION_RADIUS {
+        for dx in -JUNCTION_RADIUS..=JUNCTION_RADIUS {
+            sum += terrain_exact(editor, x + dx, z + dz);
+        }
     }
+    let side = f64::from(2 * JUNCTION_RADIUS + 1);
+    (sum / (side * side)).round() as i32
 }
 
-/// Median of the ground levels along the road's width-perpendicular strip
-/// **at this specific cell's along-length coordinate**. Does NOT sample
-/// anything in the travel direction, so the target Y varies naturally
-/// along the length of the road (terrain-following) while staying
-/// identical across the width at any given length position — meaning
-/// every block in one lateral cross-section sits flat (not pitched
-/// sideways down a slope).
-///
-/// A 3-tap median along the road's length axis is layered on top, purely
-/// to kill 1-cell terrain noise that would otherwise leave single-block
-/// potholes in the road surface (e.g. `…1 1 0 1 1…` → `…1 1 1 1 1…`).
-/// A monotone ramp is unaffected because the 3-tap median of any
-/// monotonic triple is the middle value.
-///
-/// - `set_x, set_z` — the cell whose Y we're computing.
-/// - `centerline_x, centerline_z` — the current centerline bresenham point.
-///   Only the axis perpendicular to travel is used (e.g. `centerline_z`
-///   for a horizontal-dominant segment); the cell's own along-length
-///   coordinate drives the other axis, which is what makes the sampling
-///   cell-specific instead of centerline-specific.
-/// - `dir_horizontal` — true when `|dx_segment| >= |dz_segment|`, telling
-///   us travel is x-dominant (so perpendicular sampling runs along z).
-#[inline]
-fn perpendicular_median_ground_y(
+/// Surface Y of an at-grade road for each cell of its centerline path, in the order the
+/// renderer walks it. The ground across the road is averaged, smoothed along it, then
+/// levelled so the road steps only where the ground does. Nodes `pin_at` gives a level are
+/// held to it, as are the cells across a One World area's edge.
+pub(crate) fn road_profile(
     editor: &WorldEditor,
-    set_x: i32,
-    set_z: i32,
-    centerline_x: i32,
-    centerline_z: i32,
+    way: &ProcessedWay,
     block_range: i32,
-    dir_horizontal: bool,
-) -> i32 {
-    let (prev_x, prev_z, next_x, next_z) = if dir_horizontal {
-        (set_x - 1, set_z, set_x + 1, set_z)
-    } else {
-        (set_x, set_z - 1, set_x, set_z + 1)
+    connectivity: &HighwayConnectivityMap,
+    pin_at: impl Fn(i32, i32) -> Option<i32>,
+) -> Vec<i32> {
+    let Some(first) = way.nodes.first() else {
+        return Vec::new();
     };
-    let t_prev = perpendicular_median_raw(
-        editor,
-        prev_x,
-        prev_z,
-        centerline_x,
-        centerline_z,
-        block_range,
-        dir_horizontal,
-    );
-    let t_curr = perpendicular_median_raw(
-        editor,
-        set_x,
-        set_z,
-        centerline_x,
-        centerline_z,
-        block_range,
-        dir_horizontal,
-    );
-    let t_next = perpendicular_median_raw(
-        editor,
-        next_x,
-        next_z,
-        centerline_x,
-        centerline_z,
-        block_range,
-        dir_horizontal,
-    );
-    let mut arr = [t_prev, t_curr, t_next];
-    arr.sort_unstable();
-    arr[1]
+    let mut cells: Vec<(i32, i32)> = vec![(first.x, first.z)];
+    let mut node_cells: Vec<usize> = vec![0];
+    for pair in way.nodes.windows(2) {
+        let path = bresenham_line(pair[0].x, 0, pair[0].z, pair[1].x, 0, pair[1].z);
+        cells.extend(path.iter().skip(1).map(|&(x, _, z)| (x, z)));
+        node_cells.push(cells.len() - 1);
+    }
+    let n = cells.len();
+    let width = f64::from(2 * block_range + 1);
+    let across: Vec<f64> = (0..n)
+        .map(|i| {
+            let (ax, az) = cells[i.saturating_sub(ROAD_HEADING_CELLS)];
+            let (bx, bz) = cells[(i + ROAD_HEADING_CELLS).min(n - 1)];
+            let (tx, tz) = (f64::from(bx - ax), f64::from(bz - az));
+            let len = tx.hypot(tz);
+            let (px, pz) = if len > 0.0 {
+                (-tz / len, tx / len)
+            } else {
+                (0.0, 0.0)
+            };
+            let (cx, cz) = (f64::from(cells[i].0), f64::from(cells[i].1));
+            let sum: f64 = (-block_range..=block_range)
+                .map(|k| {
+                    let k = f64::from(k);
+                    terrain_exact(
+                        editor,
+                        (cx + px * k).round() as i32,
+                        (cz + pz * k).round() as i32,
+                    )
+                })
+                .sum();
+            sum / width
+        })
+        .collect();
+    let half = ROAD_SMOOTHING.len() / 2;
+    let smooth: Vec<f64> = (0..n)
+        .map(|i| {
+            ROAD_SMOOTHING
+                .iter()
+                .enumerate()
+                .map(|(k, w)| w * across[(i + k).saturating_sub(half).min(n - 1)])
+                .sum()
+        })
+        .collect();
+
+    let mut pins: Vec<Option<i32>> = vec![None; n];
+    for (node, &cell) in way.nodes.iter().zip(&node_cells) {
+        if let Some(level) = pin_at(node.x, node.z) {
+            pins[cell] = Some(level);
+        }
+    }
+    // Each area clips the way at its own padding, so both take the edge's level from one cell.
+    if let Some(area) = &connectivity.area {
+        let inside = |i: usize| area.contains(&XZPoint::new(cells[i].0, cells[i].1));
+        for i in (1..n).filter(|&i| inside(i - 1) != inside(i)) {
+            let lower = if cells[i - 1] < cells[i] { i - 1 } else { i };
+            let y = smooth[lower].round() as i32;
+            pins[i - 1].get_or_insert(y);
+            pins[i].get_or_insert(y);
+        }
+    }
+    level_profile(&smooth, &pins)
+}
+
+/// Whole-block heights for a smoothed profile: the sequence paying least in squared
+/// deviation plus `ROAD_STEP_COST` per level changed, held to `pins` where given.
+fn level_profile(smooth: &[f64], pins: &[Option<i32>]) -> Vec<i32> {
+    const W: usize = ROAD_PROFILE_LEVELS;
+    let n = smooth.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // The levels a cell may take: W from `low`, or only its pin.
+    let low = |i: usize| pins[i].unwrap_or(smooth[i].floor() as i32 - ROAD_PROFILE_REACH);
+    let span = |i: usize| if pins[i].is_some() { 1 } else { W };
+    let own = |i: usize, y: i32| (f64::from(y) - smooth[i]).powi(2);
+    let mut cost = [f64::INFINITY; W];
+    for (k, c) in cost.iter_mut().enumerate().take(span(0)) {
+        *c = own(0, low(0) + k as i32);
+    }
+    let mut back = vec![0u8; n * W];
+    for i in 1..n {
+        let (prev_low, lo) = (low(i - 1), low(i));
+        let mut next = [f64::INFINITY; W];
+        for (k, slot) in next.iter_mut().enumerate().take(span(i)) {
+            let y = lo + k as i32;
+            let mut best = (f64::INFINITY, 0u8);
+            for (j, &c) in cost.iter().enumerate().take(span(i - 1)) {
+                let c = c + ROAD_STEP_COST * f64::from((y - prev_low - j as i32).abs());
+                if c < best.0 {
+                    best = (c, j as u8);
+                }
+            }
+            *slot = best.0 + own(i, y);
+            back[i * W + k] = best.1;
+        }
+        cost = next;
+    }
+    let mut k = (0..span(n - 1))
+        .min_by(|&a, &b| cost[a].total_cmp(&cost[b]))
+        .unwrap_or(0);
+    let mut out = vec![0; n];
+    for i in (0..n).rev() {
+        out[i] = low(i) + k as i32;
+        k = usize::from(back[i * W + k]);
+    }
+    out
 }
 
 /// Default block-mix used for road surfaces when no `surface=*` tag is
 /// present. Kept as a constant so the `semirandom_surface` call sites read
 /// consistently across the file.
 const DEFAULT_ROAD_MIX: &[Block] = &[GRAY_CONCRETE_POWDER, CYAN_TERRACOTTA];
+
+/// Bare earth for a road under construction, whatever its final surface.
+const CONSTRUCTION_BED: &[Block] = &[COARSE_DIRT, GRAVEL, DIRT];
 
 /// Blocks that a road write must NOT overwrite. Intentionally narrow:
 /// - `GRAY_CONCRETE_POWDER`, `CYAN_TERRACOTTA`: the default asphalt mix,
@@ -240,6 +261,9 @@ pub(crate) fn surface_palette(
     highway_type: &str,
     tags: &HashMap<String, String>,
 ) -> &'static [Block] {
+    if highway_type == "construction" {
+        return CONSTRUCTION_BED;
+    }
     if highway_type == "cycleway" {
         if let Some(red) = cycleway_palette(tags) {
             return red;
@@ -276,10 +300,43 @@ fn is_pedestrian_way_tags(tags: &HashMap<String, String>) -> bool {
     matches!(tags.get("footway").map(|s| s.as_str()), Some(v) if v != "no")
 }
 
-/// Type alias for highway connectivity map
-pub type HighwayConnectivityMap = HashMap<(i32, i32), Vec<i32>>;
+/// Where highways meet: the layers of the ways ending at each point, and every point
+/// two or more highways pass through.
+#[derive(Default)]
+pub struct HighwayConnectivityMap {
+    ends: HashMap<(i32, i32), Vec<i32>>,
+    /// Packed with `pack_xz`, sorted.
+    shared: Vec<u64>,
+    /// In One World, the area being built, whose roads the next area's meet at the edge.
+    area: Option<XZBBox>,
+}
 
-// Absolute base Y for a node feature; deck Y on a bridge, else terrain + layer_boost.
+impl HighwayConnectivityMap {
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Meets the roads of the areas built next to `area` at its edge.
+    pub fn meet_at_edge_of(&mut self, area: XZBBox) {
+        self.area = Some(area);
+    }
+
+    pub(crate) fn is_shared(&self, x: i32, z: i32) -> bool {
+        self.shared.binary_search(&pack_xz(x, z)).is_ok()
+    }
+}
+
+fn pack_xz(x: i32, z: i32) -> u64 {
+    (u64::from(x as u32) << 32) | u64::from(z as u32)
+}
+
+/// How far off a deck a lamp tagged with a `layer` moves onto it, as one mapped on a sidewalk
+/// the deck leaves out.
+const LAYERED_LAMP_DECK_REACH: i32 = 3;
+
+// Absolute base Y for a node feature; deck Y on a bridge, else terrain. A `layer` alone lifts
+// nothing: it marks a plaza over an underpass as often as a bridge.
 // `bridge_radius`: 0 = exact (lamps, bus stops, on-road signal head), 1 = the deck edge too
 // (a signal pole on the rail cell).
 #[inline]
@@ -288,12 +345,18 @@ fn node_feature_base_y(
     bridge_surface: &BridgeSurfaceMap,
     x: i32,
     z: i32,
-    layer_boost: i32,
+    layered: bool,
     bridge_radius: i32,
 ) -> i32 {
-    bridge_surface
-        .nearby_deck_y(x, z, bridge_radius)
-        .unwrap_or_else(|| editor.get_absolute_y(x, layer_boost, z))
+    // A layered one beside the deck stands against its edge, at the nearest deck's level.
+    let deck = if layered {
+        bridge_surface
+            .nearest_deck_cell(x, z, bridge_radius.max(1))
+            .map(|(_, y)| y)
+    } else {
+        bridge_surface.nearby_deck_y(x, z, bridge_radius)
+    };
+    deck.unwrap_or_else(|| editor.get_absolute_y(x, 0, z))
 }
 
 /// Generates highways with elevation support based on layer tags and connectivity analysis
@@ -314,6 +377,9 @@ pub fn generate_highways(
     markings: &RoadMarkingIndex,
 ) {
     if let ProcessedElement::Way(way) = element {
+        if let Some(cars) = editor.car_network() {
+            cars.place_way(editor, way.id);
+        }
         // A way with no room to be bored falls through and renders at grade.
         if renders_as_highway_tunnel(way)
             && generate_highway_tunnel_shell(
@@ -392,6 +458,8 @@ impl TunnelApproach {
 pub struct TunnelPortalMap {
     ways: HashMap<u64, TunnelApproach>,
     nodes: HashMap<(i32, i32), i32>,
+    /// Every open tunnel end, approach or not.
+    open_ends: HashSet<(i32, i32)>,
 }
 
 impl TunnelPortalMap {
@@ -408,6 +476,10 @@ impl TunnelPortalMap {
     fn drop_at(&self, xz: (i32, i32)) -> i32 {
         self.nodes.get(&xz).copied().unwrap_or(0)
     }
+
+    fn is_open_end(&self, xz: (i32, i32)) -> bool {
+        self.open_ends.contains(&xz)
+    }
 }
 
 const TUNNEL_CEIL_OFFSET: i32 = 5; // roof height above the road
@@ -418,6 +490,9 @@ const TUNNEL_RAMP_STEP: i32 = 1; // max descent per cell
 const TUNNEL_RAMP_RUN: i32 = 3; // portal ramp run per 1 block drop
 const TUNNEL_LAYER_DROP: i32 = 7; // extra depth per layer below -1
 const TUNNEL_LIGHT_INTERVAL: usize = 8;
+// The terrain fit leaves `BORE_ROOM` between the deepest bed and the lowest a bed can lie,
+// a block under the lowest a road can lie, `TUNNEL_COVER_DROP` under it.
+const _: () = assert!(TUNNEL_COVER_DROP < crate::water_depth::BORE_ROOM);
 /// `layer` is untrusted; deeper than this is noise and overflows `i32`.
 const TUNNEL_MAX_LAYERS_BELOW: i32 = 8;
 
@@ -646,7 +721,11 @@ pub fn collect_tunnel_portals(
         let tunnel_is_pedestrian = is_pedestrian_way_tags(&w.tags);
         for node in [&w.nodes[0], &w.nodes[w.nodes.len() - 1]] {
             let xz = (node.x, node.z);
-            if internal.contains(&xz) || portals.nodes.contains_key(&xz) {
+            if internal.contains(&xz) {
+                continue;
+            }
+            portals.open_ends.insert(xz);
+            if portals.nodes.contains_key(&xz) {
                 continue;
             }
             // Never below the bedrock plane at the portal itself.
@@ -806,6 +885,18 @@ pub fn generate_highway_tunnel_shell(
     // Raw DEM keeps road_y identical when a way is reprocessed across tiles.
     // `cover_ys` is the lowest ground the footprint touches; it decides the roof.
     let (terrain_ys, cover_ys) = tunnel_cover_profile(editor, &pts, wall_off);
+    // Under water the terrain is the water's surface, and the carve digs the bed out below
+    // it. The bore aims under the deepest bed across its footprint, or the bed is laid on
+    // its roof and the shell stands up in the water. The water still counts as cover.
+    let aim_ys: Vec<i32> = pts
+        .iter()
+        .zip(&cover_ys)
+        .map(|(&(x, z), &c)| {
+            editor
+                .lowest_carved_bed(x, z, wall_off)
+                .map_or(c, |b| b.min(c))
+        })
+        .collect();
 
     let floor = tunnel_min_road_y();
     // No room anywhere: a road at grade beats a brick pit.
@@ -840,7 +931,7 @@ pub fn generate_highway_tunnel_shell(
         let t = i as f32 / denom;
         let grade = (start_ground as f32 + (end_ground - start_ground) as f32 * t).round() as i32;
         // Deepen the target, not the portal, so the ramp still reaches ground.
-        let desired = grade.min(cover_ys[i] - cover_drop);
+        let desired = grade.min(aim_ys[i] - cover_drop);
         // The road has to be back at the surface by an open portal.
         let ramp_s = if start_internal {
             i32::MIN
@@ -1034,8 +1125,40 @@ fn tunnel_portal_faces(
     ]
 }
 
-// Phase 2: carve the interior, then lay the road last so no carve can eat it.
-pub fn carve_highway_tunnel_interior(editor: &mut WorldEditor, tunnel_cells: &[HighwayTunnelCell]) {
+/// A tunnel light to hang under whatever roof stands over (x, z) between `lo` and `hi`.
+pub struct TunnelLight {
+    pub x: i32,
+    pub z: i32,
+    pub lo: i32,
+    pub hi: i32,
+}
+
+/// Hangs tunnel lights once every bore is carved, since one carved later, such as a road
+/// tunnel across a rail one, can open the roof a light was hung from. A tile hangs only its
+/// own, so no copy from its halo hangs beside or under one.
+pub fn hang_tunnel_lights(editor: &mut WorldEditor, lights: &[TunnelLight]) {
+    for light in lights {
+        if !editor.owns(light.x, light.z) {
+            continue;
+        }
+        let roof =
+            (light.lo..=light.hi).find(|&y| editor.block_exists_absolute(light.x, y, light.z));
+        // A repeat finds the light already hung, not the roof.
+        let lit = |y: i32| {
+            editor.check_for_block_absolute(light.x, y, light.z, Some(&[SEA_LANTERN]), None)
+        };
+        if let Some(y) = roof.filter(|&y| !lit(y)) {
+            editor.set_block_absolute(SEA_LANTERN, light.x, y - 1, light.z, None, None);
+        }
+    }
+}
+
+// Phase 2: carve the interior, then lay the road last so no carve can eat it. Returns the
+// lights to hang once every tunnel is carved.
+pub fn carve_highway_tunnel_interior(
+    editor: &mut WorldEditor,
+    tunnel_cells: &[HighwayTunnelCell],
+) -> Vec<TunnelLight> {
     // What the bore may swallow: its placeholder, ground fill, approach paving, cut surfaces.
     const CARVE_WL: &[Block] = &[
         STONE_BRICKS,
@@ -1087,7 +1210,6 @@ pub fn carve_highway_tunnel_interior(editor: &mut WorldEditor, tunnel_cells: &[H
     ];
 
     for cell in tunnel_cells {
-        let ceil_y = cell.road_y + TUNNEL_CEIL_OFFSET;
         let hw = cell.half_width;
         // Stop at the portal; past it carving leaves a gap the bore cannot repave.
         for dx in -hw..=hw {
@@ -1108,9 +1230,6 @@ pub fn carve_highway_tunnel_interior(editor: &mut WorldEditor, tunnel_cells: &[H
                 }
             }
         }
-        if cell.light {
-            editor.set_block_absolute(SEA_LANTERN, cell.x, ceil_y - 1, cell.z, None, None);
-        }
     }
 
     for cell in tunnel_cells {
@@ -1126,6 +1245,17 @@ pub fn carve_highway_tunnel_interior(editor: &mut WorldEditor, tunnel_cells: &[H
             }
         }
     }
+
+    tunnel_cells
+        .iter()
+        .filter(|c| c.light)
+        .map(|c| TunnelLight {
+            x: c.x,
+            z: c.z,
+            lo: c.road_y + 3,
+            hi: c.road_y + TUNNEL_CEIL_OFFSET + 2,
+        })
+        .collect()
 }
 
 // Tunnel-bore footprint, to keep the water depth-carve and vegetation off it.
@@ -1176,6 +1306,7 @@ pub fn collect_tunnel_footprint(
 }
 
 fn place_street_lamp(editor: &mut WorldEditor, x: i32, z: i32, base: i32) {
+    editor.register_lamp(x, z);
     editor.set_block_absolute(SMOOTH_STONE, x, base + 1, z, None, None);
     for dy in 2..=4 {
         editor.set_block_absolute(STONE_BRICK_WALL, x, base + dy, z, None, None);
@@ -1189,6 +1320,34 @@ fn place_street_lamp(editor: &mut WorldEditor, x: i32, z: i32, base: i32) {
         None,
     );
     editor.set_block_absolute(IRON_TRAPDOOR, x, base + 6, z, None, None);
+}
+
+/// Takes down lamps the water fill reached, as on a quay edge a river polygon overclaims.
+/// Lamps go up before the water, so only afterwards does it show. Halo lamps go too, or
+/// the merge would put a neighbour's copy back where the owner took its own down.
+pub fn drop_lamps_in_water(editor: &mut WorldEditor) {
+    const PARTS: &[Block] = &[SMOOTH_STONE, STONE_BRICK_WALL, REDSTONE_LAMP, IRON_TRAPDOOR];
+    for (x, z) in editor.take_lamps() {
+        let is = |ed: &WorldEditor, y: i32, blocks: &[Block]| {
+            ed.check_for_block_absolute(x, y, z, Some(blocks), None)
+        };
+        let ground = editor.get_ground_level(x, z);
+        let Some(head) = (ground + 2..=ground + 12)
+            .find(|&y| is(editor, y, &[REDSTONE_LAMP]) && is(editor, y - 1, &[STONE_BRICK_WALL]))
+        else {
+            continue;
+        };
+        // A still surface over the ground swallows the plinth, so walk down the post.
+        let mut foot = head - 1;
+        while foot > head - 4 && is(editor, foot - 1, &[STONE_BRICK_WALL, SMOOTH_STONE]) {
+            foot -= 1;
+        }
+        if is(editor, foot - 1, &[WATER]) {
+            for y in foot..=head + 1 {
+                editor.set_block_absolute(AIR, x, y, z, Some(PARTS), None);
+            }
+        }
+    }
 }
 
 const WAY_LAMP_INTERVAL: usize = 25;
@@ -1233,7 +1392,9 @@ fn place_way_lamps(
 
 /// Build a connectivity map for highway endpoints to determine where slopes are needed.
 pub fn build_highway_connectivity_map(elements: &[ProcessedElement]) -> HighwayConnectivityMap {
-    let mut connectivity_map: HashMap<(i32, i32), Vec<i32>> = HashMap::new();
+    let mut ends: HashMap<(i32, i32), Vec<i32>> = HashMap::new();
+    let mut points: Vec<u64> = Vec::new();
+    let mut own: Vec<u64> = Vec::new();
 
     for element in elements {
         if let ProcessedElement::Way(way) = element {
@@ -1248,27 +1409,38 @@ pub fn build_highway_connectivity_map(elements: &[ProcessedElement]) -> HighwayC
                 let layer_value = if layer_value < 0 { 0 } else { layer_value };
 
                 // Add connectivity for start and end nodes
-                if !way.nodes.is_empty() {
-                    let start_node = &way.nodes[0];
-                    let end_node = &way.nodes[way.nodes.len() - 1];
-
-                    let start_coord = (start_node.x, start_node.z);
-                    let end_coord = (end_node.x, end_node.z);
-
-                    connectivity_map
-                        .entry(start_coord)
+                if let (Some(start_node), Some(end_node)) = (way.nodes.first(), way.nodes.last()) {
+                    ends.entry((start_node.x, start_node.z))
                         .or_default()
                         .push(layer_value);
-                    connectivity_map
-                        .entry(end_coord)
+                    ends.entry((end_node.x, end_node.z))
                         .or_default()
                         .push(layer_value);
                 }
+
+                // Each way counts once per point, so a loop's closing node isn't shared.
+                own.clear();
+                own.extend(way.nodes.iter().map(|n| pack_xz(n.x, n.z)));
+                own.sort_unstable();
+                own.dedup();
+                points.extend_from_slice(&own);
             }
         }
     }
 
-    connectivity_map
+    points.sort_unstable();
+    let mut shared: Vec<u64> = points
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0])
+        .collect();
+    shared.dedup();
+    shared.shrink_to_fit();
+    HighwayConnectivityMap {
+        ends,
+        shared,
+        area: None,
+    }
 }
 
 /// Internal function that generates highways with connectivity context for elevation handling
@@ -1277,7 +1449,7 @@ fn generate_highways_internal(
     editor: &mut WorldEditor,
     element: &ProcessedElement,
     args: &Args,
-    highway_connectivity: &HashMap<(i32, i32), Vec<i32>>, // Maps node coordinates to list of layers that connect to this node
+    highway_connectivity: &HighwayConnectivityMap,
     flood_fill_cache: &FloodFillCache,
     road_mask: &RoadMaskBitmap,
     bridge_structures: &BridgeStructureMap,
@@ -1289,7 +1461,7 @@ fn generate_highways_internal(
     // Shared `indoor=yes` / layer parsing for the whole function. Indoor
     // highways must never produce elevated geometry (they sit inside
     // buildings), and features like street lamps on an explicit
-    // `layer=*` should ride up with the bridge/overpass they belong to.
+    // `layer=*` stand on the bridge deck they belong to.
     let is_indoor = element.tags().get("indoor").is_some_and(|v| v == "yes");
     let layer_value_raw = element
         .tags()
@@ -1305,25 +1477,43 @@ fn generate_highways_internal(
     };
     const LAYER_HEIGHT_STEP: i32 = 6;
     let layer_boost = layer_value_effective * LAYER_HEIGHT_STEP;
+    let layered = layer_value_effective > 0;
+    let signal_base = |ed: &WorldEditor, x: i32, z: i32, radius: i32| {
+        node_feature_base_y(ed, bridge_surface, x, z, layered, radius)
+    };
 
     if let Some(highway_type) = element.tags().get("highway") {
         if highway_type == "street_lamp" {
             if let ProcessedElement::Node(first_node) = element {
-                let x: i32 = first_node.x;
-                let z: i32 = first_node.z;
-                let base = node_feature_base_y(editor, bridge_surface, x, z, layer_boost, 0);
+                let mut x: i32 = first_node.x;
+                let mut z: i32 = first_node.z;
+                if layered {
+                    if let Some((cell, _)) =
+                        bridge_surface.nearest_deck_cell(x, z, LAYERED_LAMP_DECK_REACH)
+                    {
+                        (x, z) = cell;
+                    }
+                }
+                let base = node_feature_base_y(editor, bridge_surface, x, z, layered, 0);
                 place_street_lamp(editor, x, z, base);
             }
         } else if highway_type == "crossing" || highway_type == "traffic_signals" {
             // Signal heads for signalised crossings and standalone traffic_signals nodes.
             let signalised = highway_type == "traffic_signals"
                 || element.tags().get("crossing").map(String::as_str) == Some("traffic_signals");
-            if signalised {
+            // With the extras' lights on, a signal they have no road for gets no head: a
+            // banner one would never change.
+            let cycling = editor.traffic_signals();
+            if let (true, ProcessedElement::Node(node), Some(signals)) =
+                (signalised, element, &cycling)
+            {
+                signals.place(editor, node, &signal_base);
+            }
+            if signalised && cycling.is_none() {
                 if let ProcessedElement::Node(node) = element {
                     let x = node.x;
                     let z = node.z;
-                    let head_base =
-                        node_feature_base_y(editor, bridge_surface, x, z, layer_boost, 0);
+                    let head_base = node_feature_base_y(editor, bridge_surface, x, z, layered, 0);
 
                     // Try to build a hanging signal if it's on a road
                     let anchor = road_mask
@@ -1336,7 +1526,7 @@ fn generate_highways_internal(
                             // The deck edge (rail cell) still holds the pole; further out it
                             // stands on the terrain.
                             let pole_base =
-                                node_feature_base_y(editor, bridge_surface, ax, az, layer_boost, 1);
+                                node_feature_base_y(editor, bridge_surface, ax, az, layered, 1);
                             editor.set_block_absolute(
                                 COBBLESTONE_WALL,
                                 ax,
@@ -1353,10 +1543,12 @@ fn generate_highways_internal(
 
                             // One level for the whole arm, so its bars are true neighbours and
                             // can be joined; a per-cell terrain height would step them apart.
-                            let arm: Vec<(i32, i32)> = bresenham_line(x, 0, z, ax, 0, az)
-                                .into_iter()
-                                .map(|(lx, _, lz)| (lx, lz))
-                                .collect();
+                            let arm: Vec<(i32, i32)> = four_connected_line(
+                                &bresenham_line(x, 0, z, ax, 0, az)
+                                    .into_iter()
+                                    .map(|(lx, _, lz)| (lx, lz))
+                                    .collect::<Vec<_>>(),
+                            );
                             let arm_cells: HashSet<(i32, i32)> = arm.iter().copied().collect();
                             for &(lx, lz) in &arm {
                                 let joins =
@@ -1425,14 +1617,14 @@ fn generate_highways_internal(
             if let ProcessedElement::Node(node) = element {
                 let x = node.x;
                 let z = node.z;
-                let base = node_feature_base_y(editor, bridge_surface, x, z, layer_boost, 0);
+                let base = node_feature_base_y(editor, bridge_surface, x, z, layered, 0);
                 for dy in 1..=3 {
                     editor.set_block_absolute(COBBLESTONE_WALL, x, base + dy, z, None, None);
                 }
 
                 editor.set_block_absolute(WHITE_WOOL, x, base + 4, z, None, None);
                 let neighbor_base =
-                    node_feature_base_y(editor, bridge_surface, x + 1, z, layer_boost, 1);
+                    node_feature_base_y(editor, bridge_surface, x + 1, z, layered, 1);
                 editor.set_block_absolute(WHITE_WOOL, x + 1, neighbor_base + 4, z, None, None);
 
                 // Bus sign on both broad faces of the overhanging wool, stop name on the pole block.
@@ -1515,13 +1707,15 @@ fn generate_highways_internal(
             // Canonical width (shared with prescan/bridge consumers).
             let block_range = highway_block_range(highway_type, &way.tags, scale_factor);
 
-            // At-grade lit ways get periodic street lamps alongside.
+            // At-grade lit ways get periodic street lamps alongside, but a blueprint has no furniture.
             if way.tags.get("lit").map(String::as_str) == Some("yes")
+                && args.mode != GenerationMode::Blueprint
                 && !is_bridge_member
                 && !is_bridge_ramp
                 && !is_indoor
                 && layer_value_effective == 0
                 && highway_type != "steps"
+                && highway_type != "construction"
             {
                 place_way_lamps(editor, way, block_range, road_mask);
             }
@@ -1581,27 +1775,6 @@ fn generate_highways_internal(
                 tunnel_portals.approach(way.id)
             };
 
-            // Raw DEM up front: the perpendicular median reads back this road's own
-            // overrides, so folding a descent into it would compound cell after cell.
-            let tunnel_approach_terrain: Vec<i32> = if tunnel_approach.is_none() {
-                Vec::new()
-            } else {
-                let mut ys = vec![0i32; total_bresenham_length];
-                let mut cum = 0usize;
-                for pair in way.nodes.windows(2) {
-                    let pts = bresenham_line(pair[0].x, 0, pair[0].z, pair[1].x, 0, pair[1].z);
-                    for (i, (px, _, pz)) in pts.iter().enumerate() {
-                        if let Some(slot) = ys.get_mut(cum + i) {
-                            *slot = editor
-                                .terrain_level(*px, *pz)
-                                .unwrap_or_else(|| editor.get_ground_level(*px, *pz));
-                        }
-                    }
-                    cum += pts.len().saturating_sub(1);
-                }
-                ys
-            };
-
             // Plain beam bridges get a swept segment-schematic deck instead.
             let bridge_module = bridge_member
                 .and_then(|m| m.module_idx)
@@ -1610,6 +1783,13 @@ fn generate_highways_internal(
             // Cable carriers hang from pylons; other members stand on piers.
             let bridge_pylons = bridge_member.and_then(|m| m.cable_pylons.as_deref());
             let bridge_cables_carry_deck = bridge_pylons.is_some();
+            // Under mapped towers only the suspended stretch hangs, and it is painted.
+            let bridge_cable_span = bridge_member.and_then(|m| m.cable_span.as_deref());
+            let hangs_at = |x: i32, z: i32| match bridge_cable_span {
+                Some(span) => span.suspends(x, z),
+                None => bridge_cables_carry_deck,
+            };
+            let bridge_paint = bridge_cable_span.map(|s| s.paint);
 
             let is_short_isolated_elevated = !is_bridge_member
                 && !is_bridge_ramp
@@ -1628,7 +1808,7 @@ fn generate_highways_internal(
             let slope_length = (total_way_length as f32 * 0.35).clamp(15.0, 50.0) as usize;
 
             // Painted pedestrian crossing, kept to the carriageways it runs over.
-            let crossing_paint = markings.crossing_way_paint(element.tags());
+            let crossing_paint = markings.crossing_way_paint(way);
             let crossing_clips = crossing_paint.and(markings.crossing_clips(way.id));
             // Surface of the carriageway under a crossing cell; None off the road, and
             // everywhere for a crossing that shares no node with a road.
@@ -1639,9 +1819,31 @@ fn generate_highways_internal(
                     .map(|c| c.palette())
             };
 
+            // One surface level per centerline cell; bridges and ramps carry their own.
+            let own_profile: Vec<i32> = if is_bridge_member || is_bridge_ramp {
+                Vec::new()
+            } else {
+                // A tunnel portal keeps the ground at its mouth, which the bore starts from.
+                road_profile(editor, way, block_range, highway_connectivity, |x, z| {
+                    highway_connectivity.is_shared(x, z).then(|| {
+                        if tunnel_portals.is_open_end((x, z)) {
+                            editor
+                                .terrain_level(x, z)
+                                .unwrap_or_else(|| editor.get_ground_level(x, z))
+                        } else {
+                            junction_level(editor, x, z)
+                        }
+                    })
+                })
+            };
+            let road_ys: &[i32] = bridge_ramp.map_or(&own_profile, |ramp| ramp.ys());
+            let road_y_at = |tds: usize, along: i32| {
+                let at = (tds as i32 + along).clamp(0, road_ys.len() as i32 - 1);
+                road_ys[at as usize]
+            };
+
             // Iterate over nodes to create the highway
             let mut segment_index = 0;
-            let total_segments = way.nodes.len() - 1;
             // Cumulative bresenham distance across all segments; drives bridge ramp interp.
             let mut cumulative_distance_from_start: usize = 0;
             // Previous bridge cell Y for steep-step gap fill.
@@ -1668,19 +1870,11 @@ fn generate_highways_internal(
                     // Calculate elevation for this segment
                     let segment_length = bresenham_points.len();
 
-                    // Travel direction for this segment. The perpendicular
-                    // median sampling runs along the *other* axis, so that
-                    // lateral cross-sections end up level while the road's
-                    // Y still varies along length as the terrain climbs /
-                    // descends.
+                    // Dominant axis of this segment, which stripes and crossing lines run across.
                     let dir_horizontal = (x2 - x1).abs() >= (z2 - z1).abs();
 
-                    // Whether wide-road Y-flattening applies to this
-                    // segment. Bridges and 1-cell paths keep their legacy
-                    // per-call behaviour; everything else gets the
-                    // perpendicular median via
-                    // `perpendicular_median_ground_y`.
-                    let flatten_width = !is_bridge_member && !is_bridge_ramp && block_range >= 1;
+                    // At-grade roads take their surface from the way's profile.
+                    let flatten_width = !road_ys.is_empty();
                     // Whether the road cross-section also registers an
                     // effective-ground override is decided per bresenham
                     // point below — `offset` varies inside a segment (slope
@@ -1722,10 +1916,25 @@ fn generate_highways_internal(
                             ((dx as f32 * ex + dz as f32 * ez) * inv).round() as i32
                         }
                     };
+                    // Profile height of a column, placed from the segment's start so every
+                    // stamp along it reads the same cell.
+                    let segment_tds = cumulative_distance_from_start;
+                    let profile_y =
+                        |cx: i32, cz: i32| road_y_at(segment_tds, along_offset(cx - x1, cz - z1));
+                    // A column another road already surfaced keeps its level, so the two never
+                    // stack. A ramp only takes one within a block of its own, not the street below.
+                    let flat_y = |editor: &WorldEditor, cx: i32, cz: i32, offset: i32| {
+                        let own = profile_y(cx, cz) + offset;
+                        match editor.surface_override(cx, cz) {
+                            Some(y) if offset == 0 && (!is_bridge_ramp || (y - own).abs() <= 1) => {
+                                y
+                            }
+                            _ => own,
+                        }
+                    };
 
                     // Bridges/ramps drive their Y from cumulative tds, so skip the duplicate
-                    // shared endpoint on later segments. Non-bridge slope offsets keep the
-                    // legacy calculate_point_elevation indexing, which expects every point.
+                    // shared endpoint on later segments.
                     let skip_first = if (is_bridge_member || is_bridge_ramp) && segment_index > 0 {
                         1
                     } else {
@@ -1735,19 +1944,17 @@ fn generate_highways_internal(
                         bresenham_points.iter().enumerate().skip(skip_first)
                     {
                         let tds = cumulative_distance_from_start + point_index;
-                        let bridge_y_here =
-                            bridge_member.map(|info| info.y_at(tds)).or_else(|| {
-                                bridge_ramp.map(|info| info.y_at(tds, total_bresenham_length))
-                            });
+                        let bridge_y_here = bridge_member.map(|info| info.y_at(tds));
+                        // Railings run along decks and ramps alike.
+                        let rail_y_here =
+                            bridge_y_here.or_else(|| bridge_ramp.map(|info| info.y_at(tds)));
 
                         let offset = if is_bridge_member || is_bridge_ramp {
                             0
                         } else {
                             calculate_point_elevation(
-                                segment_index,
-                                point_index,
-                                segment_length,
-                                total_segments,
+                                tds,
+                                total_bresenham_length - 1,
                                 effective_elevation,
                                 effective_start_slope,
                                 effective_end_slope,
@@ -1756,16 +1963,12 @@ fn generate_highways_internal(
                         };
 
                         // Absolute Y of an approach cell; one Y per stamp would slab the ramp.
-                        let approach_terrain_last =
-                            tunnel_approach_terrain.len().saturating_sub(1) as i32;
                         let approach_at = |dx: i32, dz: i32| -> Option<i32> {
                             let a = tunnel_approach?;
-                            let t =
-                                (tds as i32 + along_offset(dx, dz)).clamp(0, approach_terrain_last);
+                            let t = (tds as i32 + along_offset(dx, dz))
+                                .clamp(0, road_ys.len() as i32 - 1);
                             match tunnel_approach_offset(a, t) {
-                                drop if drop < 0 => {
-                                    tunnel_approach_terrain.get(t as usize).map(|&ty| ty + drop)
-                                }
+                                drop if drop < 0 => road_ys.get(t as usize).map(|&y| y + drop),
                                 _ => None,
                             }
                         };
@@ -1773,25 +1976,6 @@ fn generate_highways_internal(
                         let register_ground_override = flatten_width && offset == 0;
 
                         let use_absolute_y = is_bridge_member || is_bridge_ramp || flatten_width;
-
-                        // Precompute per-axial-offset perpendicular medians
-                        // once for this centerline. Every cell in the stamp
-                        // that shares an axial offset picks up the same
-                        // value — without this cache, we'd recompute the
-                        // full 3-tap median (which itself touches ~15
-                        // ground samples) for every `(dx, dz)` cell, making
-                        // wide-road rendering O(width²) per centerline.
-                        let mut row_medians = [0i32; 2 * MAX_BLOCK_RANGE + 1];
-                        if flatten_width {
-                            precompute_row_medians(
-                                editor,
-                                *x,
-                                *z,
-                                block_range,
-                                dir_horizontal,
-                                &mut row_medians,
-                            );
-                        }
 
                         // Only Arch actually reads this; other styles re-sample inside place_pillar.
                         let centerline_ground_y =
@@ -1855,13 +2039,45 @@ fn generate_highways_internal(
                                 } else if let Some(ay) = approach_y {
                                     ay
                                 } else if flatten_width {
-                                    let axial = if dir_horizontal { dx } else { dz };
-                                    row_medians[(axial + block_range) as usize] + offset
+                                    flat_y(editor, set_x, set_z, offset)
                                 } else {
                                     offset
                                 };
+                                // Where a ramp stands clear of the ground it is built up in
+                                // stone, so its sides read as walls, and spans what runs below.
+                                let raised_ground = if is_bridge_ramp {
+                                    editor
+                                        .terrain_level(set_x, set_z)
+                                        .filter(|&g| g + 1 < cell_y)
+                                } else {
+                                    None
+                                };
+                                if let Some(ground) = raised_ground {
+                                    if bridge_surface.over_grade_way(set_x, set_z)
+                                        && cell_y - ground >= RAMP_SPAN_CLEARANCE
+                                    {
+                                        editor.set_block_absolute(
+                                            STONE_BRICKS,
+                                            set_x,
+                                            cell_y - 1,
+                                            set_z,
+                                            None,
+                                            None,
+                                        );
+                                    } else {
+                                        editor.fill_column_absolute(
+                                            STONE_BRICKS,
+                                            set_x,
+                                            set_z,
+                                            ground + 1,
+                                            cell_y - 1,
+                                            true,
+                                        );
+                                    }
+                                }
                                 // The tunnel owns columns in its footprint; depth here bares the roof.
                                 if register_ground_override
+                                    && raised_ground.is_none()
                                     && !(approach_y.is_some()
                                         && tunnel_footprint.contains(set_x, set_z))
                                 {
@@ -1870,8 +2086,8 @@ fn generate_highways_internal(
 
                                 // A crossing on the road is painted on the road's own
                                 // surface, not the footway's grey.
-                                let crossing_here = crossing_paint
-                                    .and_then(|p| carriageway_at(set_x, set_z).map(|r| (p, r)));
+                                let crossing_here =
+                                    crossing_paint.zip(carriageway_at(set_x, set_z));
                                 if let Some((paint, road)) = crossing_here {
                                     let along = if dir_horizontal { set_x } else { set_z };
                                     let on_stripe =
@@ -1948,13 +2164,12 @@ fn generate_highways_internal(
                                 // from the registered ground-surface override instead.)
                                 let is_elevated_deck = (is_bridge_member
                                     && !bridge_structure_moduled)
-                                    || is_bridge_ramp
                                     || effective_elevation > 0;
                                 // Absolute decks can sit below Y=0.
                                 if is_elevated_deck && (use_absolute_y || cell_y > 0) {
                                     // Foundation: stone bricks for everything except wooden boardwalks.
                                     let foundation = if is_bridge_member {
-                                        bridge_foundation_block
+                                        bridge_paint.unwrap_or(bridge_foundation_block)
                                     } else {
                                         STONE_BRICKS
                                     };
@@ -2005,7 +2220,7 @@ fn generate_highways_internal(
                                         }
                                         if is_center
                                             && use_absolute_y
-                                            && !bridge_cables_carry_deck
+                                            && !hangs_at(set_x, set_z)
                                             && on_pier_step(bridge_style.pier_interval(block_range))
                                         {
                                             if let Some(perp) = bridge_rail_perp {
@@ -2045,8 +2260,7 @@ fn generate_highways_internal(
                         }
 
                         // Side railings; stair_steps keeps the rail 4-connected on diagonals.
-                        if let (Some(by), Some((perp_x, perp_z))) =
-                            (bridge_y_here, bridge_rail_perp)
+                        if let (Some(by), Some((perp_x, perp_z))) = (rail_y_here, bridge_rail_perp)
                         {
                             // L1-projected stamp extent + 1, so the rail never lands on the deck.
                             let rail_dist =
@@ -2078,12 +2292,14 @@ fn generate_highways_internal(
                                             continue;
                                         }
                                         // No parapet where an approach ramp is back on the ground.
-                                        if is_bridge_ramp && by <= editor.get_ground_level(rx, rz) {
+                                        if is_bridge_ramp
+                                            && by <= editor.get_ground_level(rx, rz) + 1
+                                        {
                                             *prev_parapet = None;
                                             continue;
                                         }
                                         let rail_block = if is_bridge_member {
-                                            bridge_rail_block_choice
+                                            bridge_paint.unwrap_or(bridge_rail_block_choice)
                                         } else {
                                             LIGHT_GRAY_CONCRETE
                                         };
@@ -2096,7 +2312,9 @@ fn generate_highways_internal(
                                             Some(ROAD_PROTECTED_SURFACES),
                                         );
                                         let rail_foundation = if is_bridge_member {
-                                            bridge_style.rail_foundation_block()
+                                            bridge_paint.unwrap_or_else(|| {
+                                                bridge_style.rail_foundation_block()
+                                            })
                                         } else {
                                             STONE_BRICKS
                                         };
@@ -2108,6 +2326,23 @@ fn generate_highways_internal(
                                             None,
                                             None,
                                         );
+                                        // A ramp's side is a retaining wall down to the ground,
+                                        // unless another way runs below it.
+                                        if is_bridge_ramp {
+                                            let ground = editor.get_ground_level(rx, rz);
+                                            let spans = road_mask.contains(rx, rz)
+                                                && by - ground >= RAMP_SPAN_CLEARANCE;
+                                            if ground < by - 2 && !spans {
+                                                editor.fill_column_absolute(
+                                                    STONE_BRICKS,
+                                                    rx,
+                                                    rz,
+                                                    ground + 1,
+                                                    by - 2,
+                                                    true,
+                                                );
+                                            }
+                                        }
                                         let parapet = if is_bridge_member {
                                             bridge_style.parapet_block()
                                         } else {
@@ -2146,9 +2381,7 @@ fn generate_highways_internal(
                             } else if let Some(ay) = approach_at(sx - *x, sz - *z) {
                                 ay
                             } else if flatten_width {
-                                let axial = if dir_horizontal { sx - *x } else { sz - *z };
-                                let idx = (axial + block_range).clamp(0, 2 * block_range);
-                                row_medians[idx as usize] + offset
+                                flat_y(editor, sx, sz, offset)
                             } else {
                                 offset
                             };
@@ -2270,9 +2503,17 @@ fn generate_highways_internal(
                         bridge_start_is_boundary,
                         bridge_end_is_boundary,
                         bridge_pylons,
+                        bridge_cable_span,
                     );
                 }
             }
+        }
+    } else if let (ProcessedElement::Node(node), Some(signals)) =
+        (element, editor.traffic_signals())
+    {
+        // Tram crossings carry the signal tags but no highway tag.
+        if is_signal(&node.tags) {
+            signals.place(editor, node, &signal_base);
         }
     }
 }
@@ -2281,17 +2522,17 @@ fn generate_highways_internal(
 fn should_add_slope_at_node(
     node: &crate::osm_parser::ProcessedNode,
     current_layer: i32,
-    highway_connectivity: &HashMap<(i32, i32), Vec<i32>>,
+    highway_connectivity: &HighwayConnectivityMap,
 ) -> bool {
     let node_coord = (node.x, node.z);
 
     // If we don't have connectivity information, always add slopes for non-zero layers
-    if highway_connectivity.is_empty() {
+    if highway_connectivity.ends.is_empty() {
         return current_layer != 0;
     }
 
     // Check if there are other highways at different layers connected to this node
-    if let Some(connected_layers) = highway_connectivity.get(&node_coord) {
+    if let Some(connected_layers) = highway_connectivity.ends.get(&node_coord) {
         // Count how many ways are at the same layer as current way
         let same_layer_count = connected_layers
             .iter()
@@ -2329,51 +2570,25 @@ fn calculate_way_length(way: &ProcessedWay) -> usize {
     total_length
 }
 
-/// Calculate the Y elevation for a specific point along the highway
-#[allow(clippy::too_many_arguments)]
+/// Height above the ground of path cell `tds` (of `last + 1`) on a way raised by
+/// `base_elevation`, ramping linearly over `slope_length` cells at the ends that need it.
 fn calculate_point_elevation(
-    segment_index: usize,
-    point_index: usize,
-    segment_length: usize,
-    total_segments: usize,
+    tds: usize,
+    last: usize,
     base_elevation: i32,
     needs_start_slope: bool,
     needs_end_slope: bool,
     slope_length: usize,
 ) -> i32 {
-    // If no slopes needed, return base elevation
-    if !needs_start_slope && !needs_end_slope {
-        return base_elevation;
+    let ramp = |d: usize| (d as f32 / slope_length.max(1) as f32).min(1.0);
+    let mut share = 1.0f32;
+    if needs_start_slope {
+        share = share.min(ramp(tds));
     }
-
-    // Calculate total distance from start
-    let total_distance_from_start = segment_index * segment_length + point_index;
-    let total_way_length = total_segments * segment_length;
-
-    // Ensure we have reasonable values
-    if total_way_length == 0 || slope_length == 0 {
-        return base_elevation;
+    if needs_end_slope {
+        share = share.min(ramp(last.saturating_sub(tds)));
     }
-
-    // Start slope calculation - gradual rise from ground level
-    if needs_start_slope && total_distance_from_start <= slope_length {
-        let slope_progress = total_distance_from_start as f32 / slope_length as f32;
-        let elevation_offset = (base_elevation as f32 * slope_progress) as i32;
-        return elevation_offset;
-    }
-
-    // End slope calculation - gradual descent to ground level
-    if needs_end_slope
-        && total_distance_from_start >= (total_way_length.saturating_sub(slope_length))
-    {
-        let distance_from_end = total_way_length - total_distance_from_start;
-        let slope_progress = distance_from_end as f32 / slope_length as f32;
-        let elevation_offset = (base_elevation as f32 * slope_progress) as i32;
-        return elevation_offset;
-    }
-
-    // Middle section at full elevation
-    base_elevation
+    (base_elevation as f32 * share).round() as i32
 }
 
 /// Support pillar for an elevated highway whose Y is an offset from the ground.
@@ -2463,14 +2678,67 @@ fn runway_centerline_dash_on(s: f32, scale: f64) -> bool {
 
 /// Parses an OSM `width=*` value in metres (tolerates a trailing "m").
 // Parse an OSM width=* tag in metres, tolerating a trailing "m"/" m".
-fn parse_width_tag_m(tags: &HashMap<String, String>) -> Option<f64> {
+pub(crate) fn parse_width_tag_m(tags: &HashMap<String, String>) -> Option<f64> {
     let raw = tags.get("width")?;
     let s = raw.trim().trim_end_matches('m').trim();
     s.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
 }
 
-/// Renders an aeroway as a concrete strip with markings: runways get asphalt-gray with a dashed
-/// white centerline + white edge stripes, taxiways a lighter surface with a yellow centerline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AerowayArea {
+    /// Runway, stopway or blast pad.
+    Runway,
+    /// Taxiway, apron or stand.
+    Apron,
+}
+
+/// Aprons, `area:aeroway` ways, and runways or taxiways with `area=yes`.
+pub(crate) fn aeroway_area(way: &ProcessedWay) -> Option<AerowayArea> {
+    let closed = way.nodes.len() >= 4
+        && way.nodes.first().map(|n| (n.x, n.z)) == way.nodes.last().map(|n| (n.x, n.z));
+    if !closed {
+        return None;
+    }
+    let area = way.tags.get("area").map(String::as_str) == Some("yes");
+    let kind = match way.tags.get("area:aeroway").map(String::as_str) {
+        Some(kind) => kind,
+        None => match way.tags.get("aeroway").map(String::as_str) {
+            Some("apron") => "apron",
+            Some(kind @ ("runway" | "taxiway")) if area => kind,
+            _ => return None,
+        },
+    };
+    match kind {
+        "runway" | "stopway" | "blastpad" | "blast_pad" => Some(AerowayArea::Runway),
+        "taxiway" | "apron" | "parking_position" => Some(AerowayArea::Apron),
+        _ => None,
+    }
+}
+
+/// Ground block for an aeroway with an unpaved surface, like a grass strip.
+fn unpaved_aeroway_block(tags: &HashMap<String, String>) -> Option<Block> {
+    let surface = tags.get("surface")?.as_str();
+    match surface {
+        "grass" | "dirt" | "ground" | "earth" | "soil" | "unpaved" | "gravel" | "fine_gravel"
+        | "compacted" | "sand" | "clay" | "mud" => {
+            get_blocks_for_surface(surface).and_then(|blocks| blocks.first().copied())
+        }
+        _ => None,
+    }
+}
+
+/// Concrete for a paved aeroway area: gray for runways, light gray for the rest.
+pub(crate) fn aeroway_area_block(way: &ProcessedWay) -> Option<Block> {
+    if unpaved_aeroway_block(&way.tags).is_some() {
+        return None;
+    }
+    aeroway_area(way).map(|area| match area {
+        AerowayArea::Runway => GRAY_CONCRETE,
+        AerowayArea::Apron => LIGHT_GRAY_CONCRETE,
+    })
+}
+
+/// Fills aeroway areas and draws runways, taxiways and stand lines as marked strips.
 /// No threshold "piano keys" — OSM splits runways into segments, so a per-way renderer can't tell
 /// a real end from an internal split.
 pub fn generate_aeroway(
@@ -2478,23 +2746,49 @@ pub fn generate_aeroway(
     way: &ProcessedWay,
     args: &Args,
     building_footprints: &CoordinateBitmap,
+    flood_fill_cache: &FloodFillCache,
 ) {
     let aeroway = way.tags.get("aeroway").map(String::as_str);
-    let is_runway = aeroway == Some("runway");
-    let is_taxiway = aeroway == Some("taxiway");
-    // A parking position is the painted lead-in to one stand, not a 24 m slab of pavement.
-    let is_stand_line = aeroway == Some("parking_position");
 
     if aeroway == Some("helipad") {
         generate_helipad_way(editor, way, args, building_footprints);
         return;
     }
 
-    let base_block = if is_runway {
+    let unpaved = unpaved_aeroway_block(&way.tags);
+
+    // Grass mapped inside an area keeps its cells, as in a parking lot.
+    if aeroway_area(way).is_some() {
+        let Some(block) = aeroway_area_block(way).or(unpaved) else {
+            return;
+        };
+        let runway_overwrites = [LIGHT_GRAY_CONCRETE, YELLOW_CONCRETE];
+        let over: Option<&[Block]> = (block == GRAY_CONCRETE).then_some(&runway_overwrites[..]);
+        let filled = flood_fill_cache.get_or_compute(way, args.timeout.as_ref());
+        for &(x, z) in filled.iter() {
+            if !editor.nested_area_owns(x, z) {
+                editor.set_block(block, x, 0, z, over, None);
+            }
+        }
+        return;
+    }
+
+    let is_runway = aeroway == Some("runway");
+    let is_taxiway = aeroway == Some("taxiway");
+    // A parking position or taxilane is a painted lead-in, not a 24 m slab.
+    let is_stand_line = matches!(aeroway, Some("parking_position" | "taxilane"));
+    // Runway pavement without markings.
+    let is_stopway = aeroway == Some("stopway");
+    // Aerodrome boundaries, hangars and holding positions have no pavement.
+    if !(is_runway || is_taxiway || is_stand_line || is_stopway) {
+        return;
+    }
+
+    let base_block = unpaved.unwrap_or(if is_runway || is_stopway {
         GRAY_CONCRETE
     } else {
         LIGHT_GRAY_CONCRETE
-    };
+    });
 
     // Half-width from the OSM `width=*` tag (metres, clamped to sane sizes); default when absent.
     let half_m = if is_stand_line {
@@ -2538,13 +2832,17 @@ pub fn generate_aeroway(
     // wins crossings regardless of element order; a taxiway's base only fills empty cells (`None`),
     // so it never paints over a runway.
     let runway_overwrites = [LIGHT_GRAY_CONCRETE, YELLOW_CONCRETE];
-    let base_over: Option<&[Block]> = is_runway.then_some(&runway_overwrites[..]);
+    let base_over: Option<&[Block]> =
+        (is_runway && unpaved.is_none()).then_some(&runway_overwrites[..]);
     for cp in &points {
         for dx in -half_width..=half_width {
             for dz in -half_width..=half_width {
                 editor.set_block(base_block, cp.x + dx, 0, cp.z + dz, base_over, None);
             }
         }
+    }
+    if unpaved.is_some() {
+        return;
     }
 
     // Pass 2: markings. `set_block` only overwrites a whitelisted block, so markings must list
@@ -2683,9 +2981,9 @@ fn ring_contains(ring: &[(i32, i32)], x: f64, z: f64) -> bool {
 }
 
 /// Removes the buildings that would stand on pavement aircraft use. Nothing is ever built on
-/// a runway, so any building whose middle lies on one goes. Taxiways and aprons only lose the
-/// buildings Overture traced from imagery, which there are mostly parked aircraft read as
-/// roofs; a mapped hangar a taxiway line runs into stays. Returns how many were dropped.
+/// a runway or stopway, so any building whose middle lies on one goes. Taxiways and aprons only
+/// lose the buildings Overture traced from imagery, which there are mostly parked aircraft read
+/// as roofs; a mapped hangar a taxiway line runs into stays. Returns how many were dropped.
 ///
 /// Costs a scan of the elements plus, for the few buildings inside the airport's bounds, one
 /// test per strip segment; nothing is allocated per block.
@@ -2703,22 +3001,15 @@ pub fn drop_buildings_on_aircraft_pavement(
         let ProcessedElement::Way(way) = element else {
             continue;
         };
-        let closed = way.nodes.len() >= 4
-            && way.nodes.first().map(|n| (n.x, n.z)) == way.nodes.last().map(|n| (n.x, n.z));
         let ring = || way.nodes.iter().map(|n| (n.x, n.z)).collect::<Vec<_>>();
-        let area_kind = way.tags.get("area:aeroway").map(String::as_str);
-        match (way.tags.get("aeroway").map(String::as_str), area_kind) {
-            (_, Some("runway")) if closed => runway_areas.push(ring()),
-            (_, Some("taxiway")) if closed => aprons.push(ring()),
-            (Some("runway"), _)
-                if closed && way.tags.get("area").map(String::as_str) == Some("yes") =>
-            {
-                runway_areas.push(ring())
-            }
-            (Some("runway"), _) => push_strip_segments(&mut runways, way, scale),
-            (Some("taxiway"), _) => push_strip_segments(&mut taxiways, way, scale),
-            (Some("apron"), _) if closed => aprons.push(ring()),
-            _ => {}
+        match aeroway_area(way) {
+            Some(AerowayArea::Runway) => runway_areas.push(ring()),
+            Some(AerowayArea::Apron) => aprons.push(ring()),
+            None => match way.tags.get("aeroway").map(String::as_str) {
+                Some("runway" | "stopway") => push_strip_segments(&mut runways, way, scale),
+                Some("taxiway") => push_strip_segments(&mut taxiways, way, scale),
+                _ => {}
+            },
         }
     }
     if runways.is_empty() && taxiways.is_empty() && runway_areas.is_empty() && aprons.is_empty() {
@@ -2852,6 +3143,10 @@ pub(crate) fn highway_default_lanes(highway_type: &str) -> i32 {
 
 /// Lanes the paint divides a way into; 1 means no lane lines.
 pub(crate) fn lane_marking_count(highway_type: &str, tags: &HashMap<String, String>) -> i32 {
+    // Nothing is painted on a road that is still being built.
+    if highway_type == "construction" {
+        return 1;
+    }
     let painted = tags.get("lane_markings").map(String::as_str);
     if painted == Some("no") {
         return 1;
@@ -3013,6 +3308,13 @@ pub(crate) fn highway_block_range(
     tags: &HashMap<String, String>,
     scale: f64,
 ) -> i32 {
+    // A road under construction is as wide as the finished road.
+    let highway_type = if highway_type == "construction" {
+        tags.get("construction")
+            .map_or(highway_type, String::as_str)
+    } else {
+        highway_type
+    };
     let (mut block_range, scales_with_lanes): (i32, bool) = match highway_type {
         "footway" | "pedestrian" => (1, false),
         // Bicycle paths are 2-4 m across; at the road default they swallowed the verge
@@ -3083,21 +3385,69 @@ pub fn collect_carriageway_coords(
     xzbbox: &XZBBox,
     scale: f64,
 ) -> CoordinateBitmap {
-    collect_highway_surface_coords(elements, None, xzbbox, scale, |highway| {
-        !matches!(
-            highway,
-            "footway"
-                | "path"
-                | "steps"
-                | "pedestrian"
-                | "cycleway"
-                | "bridleway"
-                | "corridor"
-                | "track"
-                | "elevator"
-                | "platform"
-        )
-    })
+    collect_highway_surface_coords(elements, None, xzbbox, scale, is_carriageway)
+}
+
+/// True for highway types that carry vehicles rather than people on foot, bike or horse.
+pub(crate) fn is_carriageway(highway_type: &str) -> bool {
+    !matches!(
+        highway_type,
+        "footway"
+            | "path"
+            | "steps"
+            | "pedestrian"
+            | "cycleway"
+            | "bridleway"
+            | "corridor"
+            | "track"
+            | "elevator"
+            | "platform"
+    )
+}
+
+/// The type of a highway way the renderer stamps as a surface; tunnels still need
+/// `tunnel_renders_at_surface`.
+pub(crate) fn surface_highway_type(way: &ProcessedWay) -> Option<&str> {
+    let highway_type = way.tags.get("highway")?.as_str();
+    // Node-only types have no surface.
+    if matches!(highway_type, "street_lamp" | "crossing" | "bus_stop") {
+        return None;
+    }
+    // Area highways (pedestrian plazas etc.) are flood-filled separately.
+    if way.tags.get("area").is_some_and(|v| v == "yes") {
+        return None;
+    }
+    // Same indoor guard as generate_highways_internal.
+    if way.tags.get("indoor").is_some_and(|v| v == "yes") {
+        return None;
+    }
+    // Jet bridges render as a schematic, so the apron under them is not road.
+    if way.tags.get("aeroway").is_some_and(|v| v == "jet_bridge") {
+        return None;
+    }
+    // A pier path is drawn as the deck, and the water under it is not road.
+    if way.tags.get("man_made").is_some_and(|v| v == "pier") {
+        return None;
+    }
+    // Negative levels are indoor mapping.
+    if way
+        .tags
+        .get("level")
+        .and_then(|l| l.parse::<i32>().ok())
+        .is_some_and(|l| l < 0)
+    {
+        return None;
+    }
+    Some(highway_type)
+}
+
+/// Tunnels render underground, unless there is no room to bore one.
+pub(crate) fn tunnel_renders_at_surface(
+    way: &ProcessedWay,
+    editor: Option<&WorldEditor>,
+    scale: f64,
+) -> bool {
+    !renders_as_highway_tunnel(way) || editor.is_some_and(|e| !tunnel_bore_fits(e, way, scale))
 }
 
 /// Shared stamping loop for the road-surface bitmaps; `include` filters by highway type.
@@ -3115,47 +3465,10 @@ fn collect_highway_surface_coords(
             continue;
         };
 
-        let Some(highway_type) = way.tags.get("highway") else {
+        let Some(highway_type) = surface_highway_type(way) else {
             continue;
         };
-
-        // Exclude non-surface node-only highway types
-        match highway_type.as_str() {
-            "street_lamp" | "crossing" | "bus_stop" => continue,
-            _ => {}
-        }
-        if !include(highway_type) {
-            continue;
-        }
-
-        // Exclude area highways (pedestrian plazas etc.) — flood-filled separately
-        if way.tags.get("area").is_some_and(|v| v == "yes") {
-            continue;
-        }
-
-        // Exclude indoor ways (same guard as generate_highways_internal)
-        if way.tags.get("indoor").is_some_and(|v| v == "yes") {
-            continue;
-        }
-
-        // Jet bridges render as a schematic, so the apron under them is not road.
-        if way.tags.get("aeroway").is_some_and(|v| v == "jet_bridge") {
-            continue;
-        }
-
-        // Exclude negative-level ways (indoor mapping)
-        if way
-            .tags
-            .get("level")
-            .and_then(|l| l.parse::<i32>().ok())
-            .is_some_and(|l| l < 0)
-        {
-            continue;
-        }
-
-        // Tunnels render underground, unless there is no room to bore one.
-        if renders_as_highway_tunnel(way) && editor.is_none_or(|e| tunnel_bore_fits(e, way, scale))
-        {
+        if !include(highway_type) || !tunnel_renders_at_surface(way, editor, scale) {
             continue;
         }
 
@@ -3295,6 +3608,22 @@ mod tests {
         assert_eq!(highway_block_range("residential", &tags(&[]), 0.4), 1);
     }
 
+    /// The water carve finds a bore's roof by what it is built of, so it has to know
+    /// every block of the shell.
+    #[test]
+    fn the_water_carve_knows_every_road_shell_block() {
+        use crate::water_depth::BORE_SHELL;
+        for x in -30..30 {
+            for y in -10..10 {
+                for z in -30..30 {
+                    assert!(BORE_SHELL.contains(&tunnel_shell_block(x, y, z)));
+                }
+            }
+        }
+        // The foundation, road row and interior placeholder.
+        assert!(BORE_SHELL.contains(&STONE_BRICKS));
+    }
+
     #[test]
     fn runway_dash_alternates_on_and_off() {
         // At scale 1: 10 blocks on, 6 off, repeating every 16.
@@ -3358,6 +3687,136 @@ mod tests {
         }
     }
 
+    fn ring_aeroway(tags: &[(&str, &str)]) -> ProcessedWay {
+        let corners = [(100, 20), (200, 20), (200, 80), (100, 80), (100, 20)];
+        ProcessedWay {
+            id: 7,
+            nodes: corners
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, z))| ProcessedNode {
+                    id: 70 + i as u64,
+                    tags: StdMap::new(),
+                    x,
+                    z,
+                })
+                .collect(),
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn draw_aeroway(way: &ProcessedWay) -> WorldEditor<'static> {
+        let args = Args::parse_from(["arnis", "--bbox", "1,2,3,4"].iter());
+        let xzbbox = Box::leak(Box::new(
+            XZBBox::rect_from_xz_lengths(400.0, 100.0).unwrap(),
+        ));
+        let mut editor = test_editor(xzbbox);
+        generate_aeroway(
+            &mut editor,
+            way,
+            &args,
+            &CoordinateBitmap::new_empty(),
+            &FloodFillCache::new(),
+        );
+        editor
+    }
+
+    #[test]
+    fn an_apron_is_filled_not_outlined() {
+        let editor = draw_aeroway(&ring_aeroway(&[("aeroway", "apron")]));
+        assert!(
+            editor.check_for_block(150, 0, 50, Some(&[LIGHT_GRAY_CONCRETE])),
+            "the middle of the apron is paved"
+        );
+        assert!(
+            !editor.check_for_block(150, 0, 90, Some(&[LIGHT_GRAY_CONCRETE])),
+            "nothing past its edge"
+        );
+    }
+
+    #[test]
+    fn a_runway_area_is_filled_gray() {
+        let editor = draw_aeroway(&ring_aeroway(&[("area:aeroway", "runway")]));
+        assert!(editor.check_for_block(150, 0, 50, Some(&[GRAY_CONCRETE])));
+        assert!(editor.check_for_block(101, 0, 50, Some(&[GRAY_CONCRETE])));
+    }
+
+    #[test]
+    fn an_unpaved_aeroway_is_its_own_ground_without_paint() {
+        let paved = [
+            GRAY_CONCRETE,
+            LIGHT_GRAY_CONCRETE,
+            WHITE_CONCRETE,
+            YELLOW_CONCRETE,
+        ];
+        let apron = draw_aeroway(&ring_aeroway(&[("aeroway", "apron"), ("surface", "grass")]));
+        assert!(apron.check_for_block(150, 0, 50, Some(&[GRASS_BLOCK])));
+        let mut strip = straight_aeroway("runway");
+        strip.tags.insert("surface".into(), "gravel".into());
+        let runway = draw_aeroway(&strip);
+        assert!(runway.check_for_block(100, 0, 50, Some(&[GRAVEL])));
+        for (editor, x, z) in [(&apron, 150, 50), (&runway, 100, 50), (&runway, 100, 39)] {
+            assert!(
+                !editor.check_for_block(x, 0, z, Some(&paved)),
+                "paint at {x},{z}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_aerodrome_boundary_draws_nothing() {
+        let editor = draw_aeroway(&ring_aeroway(&[("aeroway", "aerodrome")]));
+        for (x, z) in [(100, 20), (150, 20), (150, 50), (150, 30)] {
+            assert!(
+                !editor.check_for_block(x, 0, z, Some(&[GRAY_CONCRETE, LIGHT_GRAY_CONCRETE])),
+                "pavement at {x},{z}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_taxilane_is_a_narrow_lead_in_line() {
+        let editor = draw_aeroway(&straight_aeroway("taxilane"));
+        assert!(
+            editor.check_for_block(100, 0, 50, Some(&[YELLOW_CONCRETE])),
+            "yellow centre line"
+        );
+        assert!(
+            !editor.check_for_block(100, 0, 58, Some(&[LIGHT_GRAY_CONCRETE])),
+            "no 24 m slab"
+        );
+    }
+
+    #[test]
+    fn a_stopway_is_runway_pavement_without_markings() {
+        let editor = draw_aeroway(&straight_aeroway("stopway"));
+        assert!(
+            editor.check_for_block(10, 0, 50, Some(&[GRAY_CONCRETE])),
+            "no centre dash"
+        );
+        assert!(
+            editor.check_for_block(10, 0, 39, Some(&[GRAY_CONCRETE])),
+            "no edge stripe"
+        );
+    }
+
+    #[test]
+    fn a_road_under_construction_is_a_bare_bed_as_wide_as_the_road_it_becomes() {
+        let tags: HashMap<String, String> = [("construction", "primary"), ("surface", "asphalt")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(surface_palette("construction", &tags), CONSTRUCTION_BED);
+        assert_eq!(
+            highway_block_range("construction", &tags, 1.0),
+            highway_block_range("primary", &tags, 1.0)
+        );
+        assert_eq!(lane_marking_count("construction", &tags), 1);
+    }
+
     #[test]
     fn runway_paints_white_centerline_and_edges_over_gray() {
         let args = Args::parse_from(["arnis", "--bbox", "1,2,3,4"].iter());
@@ -3369,6 +3828,7 @@ mod tests {
             &straight_aeroway("runway"),
             &args,
             &CoordinateBitmap::new_empty(),
+            &FloodFillCache::new(),
         );
 
         // Centerline at the way start (s=0, dash on) is white; a dash-gap cell stays gray.
@@ -3407,6 +3867,7 @@ mod tests {
             &straight_aeroway("taxiway"),
             &args,
             &CoordinateBitmap::new_empty(),
+            &FloodFillCache::new(),
         );
 
         assert!(
@@ -3432,7 +3893,13 @@ mod tests {
 
         let mut way = straight_aeroway("runway");
         way.tags.insert("width".to_string(), "60".to_string());
-        generate_aeroway(&mut editor, &way, &args, &CoordinateBitmap::new_empty());
+        generate_aeroway(
+            &mut editor,
+            &way,
+            &args,
+            &CoordinateBitmap::new_empty(),
+            &FloodFillCache::new(),
+        );
 
         // 60 m wide ⇒ half-width 30: asphalt reaches z=70 and the edge stripe sits at z=50+29.
         assert!(
@@ -3472,12 +3939,19 @@ mod tests {
             ],
             tags,
         };
-        generate_aeroway(&mut editor, &taxiway, &args, &CoordinateBitmap::new_empty());
+        generate_aeroway(
+            &mut editor,
+            &taxiway,
+            &args,
+            &CoordinateBitmap::new_empty(),
+            &FloodFillCache::new(),
+        );
         generate_aeroway(
             &mut editor,
             &straight_aeroway("runway"),
             &args,
             &CoordinateBitmap::new_empty(),
+            &FloodFillCache::new(),
         );
 
         // The crossing cell belongs to the runway, not the taxiway.
@@ -3521,7 +3995,8 @@ mod tests {
     fn build_ways(editor: &mut WorldEditor, ways: &[ProcessedWay]) {
         let args = Args::parse_from(["arnis", "--bbox", "1,2,3,4"].iter());
         let outlines = crate::element_processing::bridge_styles::BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
         let empty = CoordinateBitmap::new_empty();
         let mut cells = Vec::new();
@@ -3542,6 +4017,160 @@ mod tests {
                 &RoadMarkingIndex::default(),
             );
         }
+    }
+
+    /// Street lamp nodes at (id, x, z), tagged with `layer`.
+    fn place_lamps(
+        editor: &mut WorldEditor,
+        surface: &BridgeSurfaceMap,
+        lamps: &[(u64, i32, i32)],
+        layer: &str,
+    ) {
+        let args = Args::parse_from(["arnis", "--bbox", "1,2,3,4"].iter());
+        let outlines = crate::element_processing::bridge_styles::BridgeOutlineIndex::build(&[]);
+        let structures =
+            BridgeStructureMap::build(&[], editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
+        let empty = CoordinateBitmap::new_empty();
+        for &(id, x, z) in lamps {
+            let element = ProcessedElement::Node(ProcessedNode {
+                id,
+                tags: [("highway", "street_lamp"), ("layer", layer)]
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                x,
+                z,
+            });
+            generate_highways(
+                editor,
+                &element,
+                &args,
+                &HighwayConnectivityMap::new(),
+                &FloodFillCache::new(),
+                &empty,
+                &structures,
+                surface,
+                &TunnelInternalEndpoints::default(),
+                &TunnelPortalMap::default(),
+                &empty,
+                &mut Vec::new(),
+                &RoadMarkingIndex::default(),
+            );
+        }
+    }
+
+    /// Land cover calls a quay sidewalk water as often as the river; only the fill decides.
+    #[test]
+    fn a_lamp_on_land_cover_water_left_dry_stands() {
+        use crate::land_cover::{LandCoverData, LC_GRASSLAND, LC_WATER};
+        let side = 60usize;
+        let grid: Vec<Vec<u8>> = (0..side)
+            .map(|_| {
+                (0..side)
+                    .map(|x| if x < 20 { LC_WATER } else { LC_GRASSLAND })
+                    .collect()
+            })
+            .collect();
+        let lc = LandCoverData {
+            grid,
+            water_distance: vec![vec![0u8; side]; side],
+            water_blend_cache: once_cell::sync::OnceCell::new(),
+            beach_tiles: once_cell::sync::OnceCell::new(),
+            inland_water: Default::default(),
+            width: side,
+            height: side,
+            cells_per_meter: 1.0,
+        };
+        let xzbbox = XZBBox::rect_from_min_max(0, 0, side as i32 - 1, side as i32 - 1).unwrap();
+        let mut editor = test_editor(&xzbbox);
+        editor.set_ground(std::sync::Arc::new(
+            crate::ground::test_support::ground_with_land_cover_and_elevation(lc, side, side),
+        ));
+        place_lamps(
+            &mut editor,
+            &BridgeSurfaceMap::empty(),
+            &[(1, 10, 30), (2, 40, 30)],
+            "0",
+        );
+        drop_lamps_in_water(&mut editor);
+        for x in [10, 40] {
+            let ground = editor.get_absolute_y(x, 0, 30);
+            assert!(editor.check_for_block_absolute(
+                x,
+                ground + 1,
+                30,
+                Some(&[SMOOTH_STONE]),
+                None
+            ));
+        }
+    }
+
+    /// A river polygon reaching over a quay edge fills under a lamp mapped there only after
+    /// the lamp went up, so it comes down; one on a deck over the water stays.
+    #[test]
+    fn lamps_the_water_fill_reached_are_taken_down() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(60.0, 60.0).unwrap();
+        let mut editor = test_editor(&xzbbox);
+        let mut surface = BridgeSurfaceMap::empty();
+        for x in 30..40 {
+            for z in 10..20 {
+                surface.insert_deck(x, z, 4);
+                editor.set_block_absolute(STONE_BRICKS, x, 4, z, None, None);
+            }
+        }
+        place_lamps(&mut editor, &surface, &[(1, 10, 40), (2, 20, 40)], "0");
+        place_lamps(&mut editor, &surface, &[(3, 35, 15)], "1");
+        // A pier paved in the plinth's own stone, over the water.
+        editor.set_block_absolute(SMOOTH_STONE, 45, 0, 40, None, None);
+        editor.set_block_absolute(WATER, 45, -1, 40, None, None);
+        place_lamps(&mut editor, &surface, &[(4, 45, 40)], "0");
+        for x in 0..60 {
+            for z in 0..60 {
+                if x < 15 || (30..40).contains(&x) {
+                    editor.set_block_absolute(WATER, x, 0, z, None, Some(&[]));
+                }
+            }
+        }
+        // Water up a block over its ground drowns the plinth, and the post still goes.
+        editor.set_block_absolute(WATER, 20, 1, 40, None, Some(&[]));
+        editor.set_block_absolute(WATER, 20, 0, 40, None, Some(&[]));
+        // The first lamp is in the halo, a copy the merge would put back if left.
+        editor.set_strict_bounds(15, 0, 59, 59);
+        drop_lamps_in_water(&mut editor);
+
+        assert!(editor.highest_block_between(10, 40, 1, 20).is_none());
+        assert!(editor.highest_block_between(20, 40, 2, 20).is_none());
+        assert!(editor.check_for_block_absolute(35, 9, 15, Some(&[REDSTONE_LAMP]), None));
+        assert!(editor.check_for_block_absolute(45, 5, 40, Some(&[REDSTONE_LAMP]), None));
+        assert!(editor.check_for_block_absolute(45, 0, 40, Some(&[SMOOTH_STONE]), None));
+    }
+
+    /// A `layer` on a lamp marks a plaza over an underpass as often as a bridge: away from
+    /// a deck it stands on the ground, a couple of blocks off one it moves onto the deck.
+    #[test]
+    fn layered_lamps_stand_on_a_deck_or_on_the_ground() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(60.0, 60.0).unwrap();
+        let mut editor = test_editor(&xzbbox);
+        let mut surface = BridgeSurfaceMap::empty();
+        for x in 30..40 {
+            for z in 10..20 {
+                surface.insert_deck(x, z, 20);
+            }
+        }
+        place_lamps(&mut editor, &surface, &[(1, 10, 40), (2, 41, 15)], "1");
+        let ground = editor.get_absolute_y(10, 0, 40);
+        assert!(
+            editor.check_for_block_absolute(10, ground + 1, 40, Some(&[SMOOTH_STONE]), None),
+            "the plaza lamp stands on the ground"
+        );
+        assert!(
+            editor.check_for_block_absolute(39, 21, 15, Some(&[SMOOTH_STONE]), None),
+            "the parapet lamp stands on the deck edge"
+        );
+        assert!(
+            editor.highest_block_between(41, 15, -64, 40).is_none(),
+            "nothing is left where it was mapped, off the deck"
+        );
     }
 
     #[test]
@@ -3604,7 +4233,8 @@ mod tests {
         let markings =
             RoadMarkingIndex::build(&elements, 1.0, crate::decals::region::SignRegion::Europe);
         let outlines = crate::element_processing::bridge_styles::BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
         let empty = CoordinateBitmap::new_empty();
         let mut cells = Vec::new();
@@ -4012,7 +4642,8 @@ mod tests {
         endpoints: &TunnelInternalEndpoints,
     ) -> TunnelPortalMap {
         let outlines = crate::element_processing::bridge_styles::BridgeOutlineIndex::build(&[]);
-        let bridges = BridgeStructureMap::build(&[], editor, &outlines, 1.0);
+        let bridges =
+            BridgeStructureMap::build(&[], editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         collect_tunnel_portals(elems, editor, &bridges, endpoints, 1.0)
     }
 
@@ -4035,7 +4666,8 @@ mod tests {
         let endpoints = collect_tunnel_internal_endpoints(&elems, &xzbbox);
         let portals = test_portals(&editor, &elems, &endpoints);
         let outlines = crate::element_processing::bridge_styles::BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], &editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], &editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
         let empty = CoordinateBitmap::new_empty();
         let mut cells = Vec::new();
@@ -4263,6 +4895,90 @@ mod tests {
         );
     }
 
+    /// A neighbour a block up the ramp carves through this cell's ceiling row, so the
+    /// light goes under the roof that is left rather than into the air below it.
+    #[test]
+    fn tunnel_lights_hang_from_the_roof_left_after_carving() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(40.0, 40.0).unwrap();
+        let mut editor = test_editor(&xzbbox);
+        let cell = |x: i32, road_y: i32, light: bool| HighwayTunnelCell {
+            x,
+            z: 20,
+            road_y,
+            half_width: 2,
+            covered: true,
+            carve_top: road_y + TUNNEL_CEIL_OFFSET - 1,
+            palette: &[GRAY_CONCRETE],
+            light,
+            faces: [None, None],
+        };
+        let cells = vec![cell(20, 0, true), cell(21, 1, false)];
+        for c in &cells {
+            for dx in -3..=3 {
+                for dz in -3..=3 {
+                    for y in -1..=c.road_y + TUNNEL_CEIL_OFFSET {
+                        editor.set_block_absolute(STONE_BRICKS, c.x + dx, y, c.z + dz, None, None);
+                    }
+                }
+            }
+        }
+        let lights = carve_highway_tunnel_interior(&mut editor, &cells);
+        hang_tunnel_lights(&mut editor, &lights);
+
+        let light = (1..=8)
+            .find(|&y| editor.check_for_block_absolute(20, y, 20, Some(&[SEA_LANTERN]), None))
+            .expect("the bore keeps its light");
+        assert!(
+            editor.block_exists_absolute(20, light + 1, 20),
+            "the light at y={light} hangs in the air"
+        );
+    }
+
+    /// A road bore crossing a rail tunnel opens the rail roof, so no lantern hangs before both are carved.
+    #[test]
+    fn a_road_bore_crossing_a_rail_tunnel_leaves_no_light_in_the_air() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(40.0, 40.0).unwrap();
+        let mut editor = test_editor(&xzbbox);
+        for x in 5..35 {
+            for z in 5..35 {
+                for y in -10..0 {
+                    editor.set_block_absolute(STONE, x, y, z, None, None);
+                }
+            }
+        }
+        let rail: Vec<_> = (10..=30).map(|x| (x, 20, -8, x == 20)).collect();
+        let road: Vec<_> = (10..=30)
+            .map(|z| HighwayTunnelCell {
+                x: 20,
+                z,
+                road_y: -5,
+                half_width: 2,
+                covered: true,
+                carve_top: -5 + TUNNEL_CEIL_OFFSET - 1,
+                palette: &[GRAY_CONCRETE],
+                light: false,
+                faces: [None, None],
+            })
+            .collect();
+        let mut lights =
+            crate::element_processing::railways::carve_rail_tunnel_interior(&mut editor, &rail);
+        lights.extend(carve_highway_tunnel_interior(&mut editor, &road));
+        hang_tunnel_lights(&mut editor, &lights);
+
+        for x in 5..35 {
+            for z in 5..35 {
+                for y in -10..4 {
+                    if editor.check_for_block_absolute(x, y, z, Some(&[SEA_LANTERN]), None) {
+                        assert!(
+                            editor.block_exists_absolute(x, y + 1, z),
+                            "the light at ({x}, {y}, {z}) hangs in the air"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The shell stamps a square per cell, which used to seal a roofed portal.
     #[test]
     fn tunnel_mouth_is_not_walled_off() {
@@ -4388,6 +5104,135 @@ mod tests {
         );
     }
 
+    /// The reported pale stripes, for a road tunnel: its roof sat two under the water's
+    /// surface, and the bed over it stayed there while the river around it was carved.
+    #[test]
+    fn a_road_tunnel_under_a_river_runs_below_the_carved_bed() {
+        let _g = crate::world_editor::FLOOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let cells = road_tunnel_under_river(0);
+        let mid = cells.iter().find(|c| c.x == 100).unwrap();
+        assert!(
+            mid.road_y <= -14,
+            "road at {} under a bed at -7",
+            mid.road_y
+        );
+    }
+
+    /// The base the terrain fit lifts an area to when a bore runs under its water is
+    /// exactly enough to keep the bore under the deepest bed.
+    #[test]
+    fn a_road_tunnel_fits_under_a_river_on_the_lifted_base() {
+        let _g = crate::world_editor::FLOOR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // The carve floor for the deepest tier, and the room for a bore on top.
+        road_tunnel_under_river(
+            crate::world_editor::min_y() + 6 + 2 + crate::water_depth::BORE_ROOM,
+        );
+    }
+
+    /// A road tunnel under a river 100 blocks wide at `level`, opening on dry land either
+    /// side, built in the generator's order and checked for a river bed over it.
+    fn road_tunnel_under_river(level: i32) -> Vec<HighwayTunnelCell> {
+        let xzbbox = XZBBox::rect_from_xz_lengths(200.0, 120.0).unwrap();
+        let ground =
+            crate::ground::test_support::ground_with_water(200, 120, level as f32, |x, _| {
+                (50..150).contains(&x)
+            });
+        let field = std::sync::Arc::new(crate::water_depth::compute_big_water_field(
+            &ground, &xzbbox,
+        ));
+        let mut editor = tunnel_editor(&xzbbox, ground.clone());
+        editor.set_water_field(std::sync::Arc::clone(&field));
+        let args = Args::parse_from(["arnis", "--bbox", "1,2,3,4"].iter());
+        let way = tunnel_span(1, 10, 190, &[("highway", "residential"), ("tunnel", "yes")]);
+        let elems = vec![ProcessedElement::Way(way.clone())];
+        let endpoints = collect_tunnel_internal_endpoints(&elems, &xzbbox);
+        let portals = test_portals(&editor, &elems, &endpoints);
+        let footprint = collect_tunnel_footprint(&elems, &editor, &endpoints, &xzbbox, 1.0);
+
+        // In the generator's order: the shell, the river carved over it, then the bore.
+        let mut cells = Vec::new();
+        assert!(generate_highway_tunnel_shell(
+            &mut editor,
+            &way,
+            &args,
+            &endpoints,
+            &portals,
+            &mut cells
+        ));
+        crate::water_depth::carve_lc_water_region(
+            &mut editor,
+            &ground,
+            &xzbbox,
+            &field,
+            &CoordinateBitmap::new_empty(),
+            &footprint,
+            &BridgeSurfaceMap::empty(),
+            xzbbox.min_x(),
+            xzbbox.max_x(),
+            xzbbox.min_z(),
+            xzbbox.max_z(),
+        );
+        carve_highway_tunnel_interior(&mut editor, &cells);
+
+        let wall = cells[0].half_width + 1;
+        for x in 50..150 {
+            for z in 50 - wall..=50 + wall {
+                let bed = editor.carved_bed(x, z).expect("river");
+                // The bed the rest of the river has, not one left on the roof.
+                assert!(
+                    editor.block_exists_absolute(x, bed, z)
+                        && !editor.check_for_block_absolute(x, bed, z, Some(&[WATER]), None),
+                    "no bed at ({x}, {bed}, {z})"
+                );
+                for y in bed - 1..=level {
+                    assert!(
+                        !editor.check_for_block_absolute(x, y, z, Some(TUNNEL_BRICK), None),
+                        "shell in the river at ({x}, {y}, {z}), bed {bed}"
+                    );
+                }
+            }
+        }
+        // Roofed, paved and dry the whole way under the river. On a ramp a neighbour's
+        // stamp sits in the bore and carves the roof a row up, so it is hollow on the flat.
+        let asphalt = &[GRAY_CONCRETE_POWDER, CYAN_TERRACOTTA];
+        for cell in cells.iter().filter(|c| (50..150).contains(&c.x)) {
+            assert!(cell.covered, "open cut at x={}", cell.x);
+            let (x, z, road) = (cell.x, cell.z, cell.road_y);
+            assert!(editor.check_for_block_absolute(x, road, z, Some(asphalt), None));
+            let bed = editor.carved_bed(x, z).unwrap();
+            for y in road..bed {
+                assert!(
+                    !editor.check_for_block_absolute(x, y, z, Some(&[WATER]), None),
+                    "water in the bore at ({x}, {y}, {z})"
+                );
+            }
+            let roof = road + TUNNEL_CEIL_OFFSET;
+            assert!(
+                (roof..=roof + 2).any(|y| editor.check_for_block_absolute(
+                    x,
+                    y,
+                    z,
+                    Some(TUNNEL_BRICK),
+                    None
+                )),
+                "no roof at x={x}"
+            );
+            if (90..110).contains(&x) {
+                for y in road + 1..roof {
+                    assert!(
+                        !editor.block_exists_absolute(x, y, z),
+                        "bore filled at ({x}, {y}, {z})"
+                    );
+                }
+            }
+        }
+        cells
+    }
+
     /// With no vertical room the bore used to emit a few stone-brick pads.
     #[test]
     fn tunnel_declines_when_the_world_floor_leaves_no_room() {
@@ -4482,7 +5327,8 @@ mod tests {
         let portals = test_portals(editor, &elems, &endpoints);
         let footprint = collect_tunnel_footprint(&elems, editor, &endpoints, xzbbox, 1.0);
         let outlines = crate::element_processing::bridge_styles::BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
         let empty = CoordinateBitmap::new_empty();
         let mut cells = Vec::new();
@@ -4672,6 +5518,23 @@ mod tests {
         assert!(!mask.contains(50, 50), "tunnel is not a surface road");
     }
 
+    #[test]
+    fn pier_paths_leave_the_water_under_them_alone() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(60.0, 60.0).unwrap();
+        let editor = test_editor(&xzbbox);
+        let elems = vec![
+            line_way(
+                1,
+                &[(10, 20), (50, 20)],
+                &[("highway", "footway"), ("man_made", "pier")],
+            ),
+            line_way(2, &[(10, 40), (50, 40)], &[("highway", "footway")]),
+        ];
+        let mask = collect_road_surface_coords(&elems, &editor, &xzbbox, 1.0);
+        assert!(!mask.contains(30, 20), "a pier is a deck, not a road");
+        assert!(mask.contains(30, 40));
+    }
+
     fn line_way(id: u64, points: &[(i32, i32)], tags: &[(&str, &str)]) -> ProcessedElement {
         ProcessedElement::Way(ProcessedWay {
             id,
@@ -4766,9 +5629,502 @@ mod tests {
     }
 
     #[test]
+    fn a_taxiway_area_drops_what_is_traced_on_it_not_beside_it() {
+        let mut elements = vec![
+            line_way(
+                5,
+                &[(0, 0), (300, 0), (300, 100), (0, 100), (0, 0)],
+                &[("aeroway", "taxiway"), ("area", "yes")],
+            ),
+            // A parked aircraft in the middle, far from the outline.
+            building(50, 140, 40, 160, 60, true),
+            // A traced roof just outside the edge.
+            building(51, 140, 104, 160, 110, true),
+        ];
+        assert_eq!(drop_buildings_on_aircraft_pavement(&mut elements, 1.0), 1);
+        assert_eq!(kept_ids(&elements), vec![5, 51]);
+    }
+
+    #[test]
     fn no_airport_leaves_every_building_alone() {
         let mut elements = vec![building(30, 0, 0, 10, 10, true)];
         assert_eq!(drop_buildings_on_aircraft_pavement(&mut elements, 1.0), 0);
         assert_eq!(elements.len(), 1);
+    }
+
+    fn sloped_ground(w: usize, h: usize, at: impl Fn(i32, i32) -> f32) -> crate::ground::Ground {
+        let heights = (0..h)
+            .map(|z| (0..w).map(|x| at(x as i32, z as i32)).collect())
+            .collect();
+        crate::ground::Ground::new_elevation_test(heights, w, h)
+    }
+
+    /// Highways alone, in the given order, with the connectivity a real run builds.
+    fn render_roads(editor: &mut WorldEditor, xzbbox: &XZBBox, elems: &[ProcessedElement]) {
+        let args = Args::parse_from(["arnis", "--bbox", "1,2,3,4"].iter());
+        let connectivity = build_highway_connectivity_map(elems);
+        let endpoints = collect_tunnel_internal_endpoints(elems, xzbbox);
+        let portals = test_portals(editor, elems, &endpoints);
+        let outlines = crate::element_processing::bridge_styles::BridgeOutlineIndex::build(elems);
+        let structures = BridgeStructureMap::build(elems, editor, &connectivity, &outlines, 1.0);
+        let surface = BridgeSurfaceMap::build(elems, &structures, 1.0);
+        let empty = CoordinateBitmap::new_empty();
+        let road_mask = collect_road_surface_coords(elems, editor, xzbbox, 1.0);
+        let mut cells = Vec::new();
+        for elem in elems {
+            generate_highways(
+                editor,
+                elem,
+                &args,
+                &connectivity,
+                &FloodFillCache::new(),
+                &road_mask,
+                &structures,
+                &surface,
+                &endpoints,
+                &portals,
+                &empty,
+                &mut cells,
+                &RoadMarkingIndex::default(),
+            );
+        }
+    }
+
+    /// Every road column tops out at its registered surface, so nothing stacks above it.
+    fn assert_no_stacked_surface(editor: &WorldEditor, x0: i32, x1: i32, z0: i32, z1: i32) {
+        for x in x0..=x1 {
+            for z in z0..=z1 {
+                if let Some(y) = editor.surface_override(x, z) {
+                    assert_eq!(
+                        editor.highest_block_between(x, z, y - 3, y + 3),
+                        Some(y),
+                        "road block above the surface at ({x}, {z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_layered_way_climbs_by_its_distance_along_the_path() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(99.0, 99.0).unwrap();
+        let mut editor = tunnel_editor(&xzbbox, sloped_ground(100, 100, |_, _| 0.0));
+        // A short first segment: the old ramp measured every segment as long as the current one.
+        let way = line_way(
+            1,
+            &[(10, 50), (14, 50), (80, 50)],
+            &[("highway", "residential"), ("layer", "1")],
+        );
+        render_roads(&mut editor, &xzbbox, &[way]);
+        let top: Vec<i32> = (10..=80)
+            .map(|x| editor.highest_block_between(x, 50, -5, 20).unwrap())
+            .collect();
+        assert!(top.iter().any(|&y| y >= 5), "the way is raised: {top:?}");
+        for (i, w) in top.windows(2).enumerate() {
+            assert!((w[1] - w[0]).abs() <= 1, "step at x={}: {top:?}", 10 + i);
+        }
+    }
+
+    /// A bridge from x=40 to 80 along z=50, an embankment ramp down to x=10 and a road on.
+    fn ramp_scene(extra: &[ProcessedElement]) -> Vec<ProcessedElement> {
+        let mut elems = vec![
+            line_way(1, &[(0, 50), (10, 50)], &[("highway", "residential")]),
+            line_way(
+                2,
+                &[(10, 50), (40, 50)],
+                &[("highway", "residential"), ("embankment", "yes")],
+            ),
+            line_way(
+                3,
+                &[(40, 50), (80, 50)],
+                &[
+                    ("highway", "residential"),
+                    ("bridge", "yes"),
+                    ("layer", "1"),
+                ],
+            ),
+        ];
+        elems.extend_from_slice(extra);
+        elems
+    }
+
+    #[test]
+    fn an_approach_ramp_stands_on_its_own_fill_between_walls() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(99.0, 99.0).unwrap();
+        let mut editor = tunnel_editor(&xzbbox, sloped_ground(100, 100, |_, _| 0.0));
+        render_roads(&mut editor, &xzbbox, &ramp_scene(&[]));
+        let ramp: Vec<i32> = (12..=38)
+            .map(|x| editor.highest_block_between(x, 50, -5, 20).unwrap())
+            .collect();
+        assert!(ramp[ramp.len() - 1] >= 5, "the ramp climbs: {ramp:?}");
+        assert!(
+            ramp.windows(2).all(|w| (0..=1).contains(&(w[1] - w[0]))),
+            "{ramp:?}"
+        );
+        assert_eq!(
+            editor.surface_override(12, 50),
+            Some(ramp[0]),
+            "its foot is a road on the ground"
+        );
+        let edge = 50 + highway_block_range("residential", &HashMap::new(), 1.0) + 1;
+        let y = editor.highest_block_between(30, 50, -5, 20).unwrap();
+        assert!(y >= 3, "{ramp:?}");
+        assert_eq!(
+            editor.get_block_absolute(30, y - 2, edge),
+            Some(STONE_BRICKS),
+            "a wall stands along the ramp"
+        );
+        assert_eq!(
+            editor.get_block_absolute(30, 1, 50),
+            Some(STONE_BRICKS),
+            "the ramp is solid down to the ground"
+        );
+    }
+
+    #[test]
+    fn a_ramp_leaves_room_for_a_road_under_the_bridge_end() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(99.0, 99.0).unwrap();
+        let mut editor = tunnel_editor(&xzbbox, sloped_ground(100, 100, |_, _| 0.0));
+        let under = line_way(4, &[(41, 10), (41, 90)], &[("highway", "residential")]);
+        render_roads(&mut editor, &xzbbox, &ramp_scene(&[under]));
+        for x in 39..=42 {
+            assert_eq!(
+                editor.get_block_absolute(x, 2, 50),
+                None,
+                "blocked at x={x}"
+            );
+        }
+        assert_eq!(
+            editor.get_block_absolute(36, 2, 50),
+            Some(STONE_BRICKS),
+            "the ramp is solid clear of the road"
+        );
+    }
+
+    #[test]
+    fn a_short_ramp_is_solid_where_the_road_at_its_foot_reaches() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(99.0, 99.0).unwrap();
+        let mut editor = tunnel_editor(&xzbbox, sloped_ground(100, 100, |_, _| 0.0));
+        let road = [("highway", "residential")];
+        let elems = [
+            line_way(1, &[(0, 50), (34, 50)], &road),
+            line_way(
+                2,
+                &[(34, 50), (40, 50)],
+                &[("highway", "residential"), ("embankment", "yes")],
+            ),
+            line_way(
+                3,
+                &[(40, 50), (80, 50)],
+                &[
+                    ("highway", "residential"),
+                    ("bridge", "yes"),
+                    ("layer", "1"),
+                ],
+            ),
+        ];
+        render_roads(&mut editor, &xzbbox, &elems);
+        // Three cells up a steep ramp, still within reach of the road it leaves.
+        let y = editor.highest_block_between(37, 50, -5, 20).unwrap();
+        assert!(y >= 3, "the ramp is up at x=37: {y}");
+        for fill in 1..y {
+            assert!(
+                editor.get_block_absolute(37, fill, 50).is_some(),
+                "air under the ramp at y={fill}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ramp_spans_a_street_along_its_edge() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(99.0, 99.0).unwrap();
+        let mut editor = tunnel_editor(&xzbbox, sloped_ground(100, 100, |_, _| 0.0));
+        let beside = line_way(4, &[(15, 55), (45, 55)], &[("highway", "residential")]);
+        render_roads(&mut editor, &xzbbox, &ramp_scene(&[beside]));
+        let y = editor.highest_block_between(30, 50, -5, 20).unwrap();
+        assert!(y >= 3, "the ramp is raised at x=30");
+        for z in [52, 53] {
+            assert_eq!(
+                editor.get_block_absolute(30, 2, z),
+                None,
+                "the street is walled in at z={z}"
+            );
+        }
+        assert_eq!(
+            editor.get_block_absolute(30, y - 2, 47),
+            Some(STONE_BRICKS),
+            "the far side keeps its wall"
+        );
+    }
+
+    #[test]
+    fn a_portal_at_the_foot_of_a_face_keeps_the_ground_in_front() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(199.0, 99.0).unwrap();
+        let ground = sloped_ground(200, 100, |x, _| if x > 80 { 30.0 } else { 10.0 });
+        let mut editor = tunnel_editor(&xzbbox, ground);
+        let elems = [
+            line_way(1, &[(10, 50), (80, 50)], &[("highway", "residential")]),
+            line_way(
+                2,
+                &[(80, 50), (150, 50)],
+                &[("highway", "residential"), ("tunnel", "yes")],
+            ),
+        ];
+        render_roads(&mut editor, &xzbbox, &elems);
+        let ys: Vec<i32> = (50..=79)
+            .map(|x| editor.highest_block_between(x, 50, -20, 40).unwrap())
+            .collect();
+        assert!(
+            ys.windows(2).all(|w| w[1] <= w[0]),
+            "climbs to the mouth: {ys:?}"
+        );
+        assert!(ys[ys.len() - 1] < 10, "{ys:?}");
+        assert!(
+            editor.highest_block_between(80, 50, -20, 40).unwrap() < 10,
+            "nothing at the mouth stands above the ground in front"
+        );
+    }
+
+    #[test]
+    fn a_tunnel_approach_descends_without_flicker() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(199.0, 99.0).unwrap();
+        // A short rise of a tenth of a block, which the raw cells round up a whole one.
+        let ground = sloped_ground(
+            200,
+            100,
+            |x, _| {
+                if (64..72).contains(&x) {
+                    20.55
+                } else {
+                    20.45
+                }
+            },
+        );
+        let mut editor = tunnel_editor(&xzbbox, ground);
+        let road = [("highway", "residential")];
+        let elems = [
+            line_way(1, &[(10, 50), (80, 50)], &road),
+            line_way(
+                2,
+                &[(80, 50), (120, 50)],
+                &[("highway", "residential"), ("tunnel", "yes")],
+            ),
+        ];
+        render_roads(&mut editor, &xzbbox, &elems);
+        let ys: Vec<i32> = (50..=78)
+            .map(|x| editor.highest_block_between(x, 50, 0, 30).unwrap())
+            .collect();
+        assert!(ys.last() < ys.first(), "the approach descends: {ys:?}");
+        assert!(ys.windows(2).all(|w| w[1] <= w[0]), "{ys:?}");
+    }
+
+    #[test]
+    fn level_profile_holds_a_level_hovering_at_a_half_block() {
+        let smooth: Vec<f64> = (0..60)
+            .map(|i| if i % 3 == 0 { 4.56 } else { 4.44 })
+            .collect();
+        let ys = level_profile(&smooth, &vec![None; smooth.len()]);
+        assert!(ys.windows(2).all(|w| w[0] == w[1]), "{ys:?}");
+    }
+
+    #[test]
+    fn level_profile_climbs_a_ramp_one_block_at_a_time() {
+        let smooth: Vec<f64> = (0..80).map(|i| 0.13 * f64::from(i)).collect();
+        let ys = level_profile(&smooth, &vec![None; smooth.len()]);
+        for (i, w) in ys.windows(2).enumerate() {
+            assert!((0..=1).contains(&(w[1] - w[0])), "step at {i}: {ys:?}");
+        }
+        for (y, s) in ys.iter().zip(&smooth) {
+            assert!((f64::from(*y) - s).abs() <= 1.0, "{y} strays from {s}");
+        }
+    }
+
+    #[test]
+    fn level_profile_levels_a_short_dip_and_keeps_a_long_one() {
+        let dip = |len: usize| {
+            let smooth: Vec<f64> = (0..100)
+                .map(|i| {
+                    if (40..40 + len).contains(&i) {
+                        9.0
+                    } else {
+                        10.0
+                    }
+                })
+                .collect();
+            level_profile(&smooth, &vec![None; smooth.len()])
+        };
+        assert!(dip(3).iter().all(|&y| y == 10), "{:?}", dip(3));
+        let long = dip(30);
+        assert!(
+            long[55] == 9 && long[10] == 10 && long[90] == 10,
+            "{long:?}"
+        );
+    }
+
+    #[test]
+    fn level_profile_meets_its_pins() {
+        let smooth = vec![3.4; 40];
+        let mut pins = vec![None; 40];
+        pins[0] = Some(5);
+        pins[39] = Some(1);
+        let ys = level_profile(&smooth, &pins);
+        assert_eq!((ys[0], ys[39]), (5, 1));
+        assert!(ys[10..30].iter().all(|&y| y == 3), "{ys:?}");
+    }
+
+    #[test]
+    fn one_world_areas_either_side_of_an_edge_level_a_road_alike() {
+        // Hovering at a half block from x = 40 to 260, so each clip alone keeps its own end's level.
+        let ground = sloped_ground(300, 100, |x, _| {
+            if x < 40 {
+                4.0
+            } else if x < 260 {
+                4.5
+            } else {
+                5.0
+            }
+        });
+        let xzbbox = XZBBox::rect_from_xz_lengths(299.0, 99.0).unwrap();
+        let editor = tunnel_editor(&xzbbox, ground);
+        let edge: Vec<_> = [(0, 149), (150, 299)]
+            .into_iter()
+            .map(|(x0, x1)| {
+                let mut connectivity = HighwayConnectivityMap::new();
+                connectivity.meet_at_edge_of(XZBBox::rect_from_min_max(x0, 0, x1, 99).unwrap());
+                // Each clipped 64 blocks past its own area.
+                let (from, to) = ((x0 - 64).max(10), (x1 + 64).min(290));
+                let ProcessedElement::Way(road) =
+                    line_way(1, &[(from, 50), (to, 50)], &[("highway", "residential")])
+                else {
+                    unreachable!()
+                };
+                let ys = road_profile(&editor, &road, 2, &connectivity, |_, _| None);
+                [ys[(149 - from) as usize], ys[(150 - from) as usize]]
+            })
+            .collect();
+        assert_eq!(edge[0], edge[1]);
+    }
+
+    #[test]
+    fn shared_points_are_where_two_highways_pass() {
+        let road = [("highway", "residential")];
+        let elems = vec![
+            line_way(1, &[(0, 0), (10, 0), (20, 0)], &road),
+            line_way(2, &[(10, 0), (10, 10)], &road),
+            line_way(3, &[(50, 50), (60, 50), (60, 60), (50, 50)], &road),
+            line_way(4, &[(20, 0), (30, 0)], &[("building", "yes")]),
+        ];
+        let map = build_highway_connectivity_map(&elems);
+        assert!(map.is_shared(10, 0));
+        assert!(!map.is_shared(0, 0) && !map.is_shared(20, 0) && !map.is_shared(10, 10));
+        assert!(!map.is_shared(50, 50), "a loop's closing node is its own");
+        assert_eq!(map.ends.get(&(10, 0)), Some(&vec![0]));
+    }
+
+    #[test]
+    fn a_short_dip_in_the_ground_leaves_the_road_level() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(199.0, 99.0).unwrap();
+        let ground = sloped_ground(
+            200,
+            100,
+            |x, _| if (70..=71).contains(&x) { -1.0 } else { 0.0 },
+        );
+        let mut editor = tunnel_editor(&xzbbox, ground);
+        let road = line_way(1, &[(10, 50), (150, 50)], &[("highway", "residential")]);
+        render_roads(&mut editor, &xzbbox, &[road]);
+        for x in 12..=148 {
+            assert_eq!(editor.surface_override(x, 50), Some(0), "dip at x={x}");
+        }
+    }
+
+    #[test]
+    fn a_diagonal_road_is_level_across_its_width() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(199.0, 199.0).unwrap();
+        let ground = sloped_ground(200, 200, |x, _| 0.5 * x as f32);
+        let mut editor = tunnel_editor(&xzbbox, ground);
+        let road = line_way(1, &[(20, 20), (120, 120)], &[("highway", "residential")]);
+        render_roads(&mut editor, &xzbbox, &[road]);
+        // Across a (1, 1) way is (1, -1).
+        for t in 30..=110 {
+            let centre = editor.surface_override(t, t);
+            assert!(centre.is_some(), "no road at ({t}, {t})");
+            for k in [-1, 1] {
+                assert_eq!(
+                    editor.surface_override(t + k, t - k),
+                    centre,
+                    "tilted across the road at ({t}, {t})"
+                );
+            }
+        }
+        assert_no_stacked_surface(&editor, 20, 120, 20, 120);
+    }
+
+    #[test]
+    fn roads_meet_at_a_junction_at_one_level_in_either_order() {
+        let ground = || sloped_ground(200, 200, |x, z| 0.3 * x as f32 + 0.1 * z as f32);
+        let road = [("highway", "residential")];
+        let main = line_way(1, &[(10, 100), (100, 100), (190, 100)], &road);
+        let side = line_way(2, &[(100, 100), (100, 190)], &road);
+        let xzbbox = XZBBox::rect_from_xz_lengths(199.0, 199.0).unwrap();
+        let mut levels = Vec::new();
+        for order in [[&main, &side], [&side, &main]] {
+            let mut editor = tunnel_editor(&xzbbox, ground());
+            let elems: Vec<ProcessedElement> = order.iter().map(|e| (*e).clone()).collect();
+            render_roads(&mut editor, &xzbbox, &elems);
+            assert_eq!(
+                editor.surface_override(100, 100),
+                Some(junction_level(&editor, 100, 100))
+            );
+            assert_no_stacked_surface(&editor, 5, 195, 95, 195);
+            levels.push(editor.surface_override(100, 100));
+        }
+        assert_eq!(levels[0], levels[1]);
+    }
+
+    #[test]
+    fn a_street_split_into_two_ways_has_no_seam() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(199.0, 199.0).unwrap();
+        // Rising gently, so independent levelling could step either side of the split.
+        let ground = sloped_ground(200, 200, |x, _| 0.45 + 0.012 * x as f32);
+        let mut editor = tunnel_editor(&xzbbox, ground);
+        let road = [("highway", "residential")];
+        render_roads(
+            &mut editor,
+            &xzbbox,
+            &[
+                line_way(1, &[(10, 100), (97, 100)], &road),
+                line_way(2, &[(97, 100), (190, 100)], &road),
+            ],
+        );
+        let ys: Vec<i32> = (12..=188)
+            .map(|x| editor.surface_override(x, 100).unwrap())
+            .collect();
+        assert!(
+            ys.windows(2).all(|w| (0..=1).contains(&(w[1] - w[0]))),
+            "{ys:?}"
+        );
+    }
+
+    #[test]
+    fn a_loop_closes_without_a_step() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(199.0, 199.0).unwrap();
+        let ground = sloped_ground(200, 200, |x, z| 0.08 * x as f32 + 0.05 * z as f32);
+        let mut editor = tunnel_editor(&xzbbox, ground);
+        let ring = [(60, 60), (140, 60), (140, 140), (60, 140), (60, 60)];
+        render_roads(
+            &mut editor,
+            &xzbbox,
+            &[line_way(1, &ring, &[("highway", "residential")])],
+        );
+        let mut path = Vec::new();
+        for pair in ring.windows(2) {
+            for (x, _, z) in bresenham_line(pair[0].0, 0, pair[0].1, pair[1].0, 0, pair[1].1) {
+                path.push(editor.surface_override(x, z).unwrap());
+            }
+        }
+        assert!(
+            path.windows(2).all(|w| (w[1] - w[0]).abs() <= 1),
+            "{path:?}"
+        );
     }
 }

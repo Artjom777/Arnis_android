@@ -117,6 +117,10 @@ const OVERTURE_SKIP_IDS: &[&str] = &[
     // Königsplatz, Munich: a 17 x 25 m stage/tent footprint on the square in
     // front of the Propyläen (Microsoft ML Buildings, imagery of 2019-07).
     "f8c0757e-c059-49e4-9757-7e278751926f",
+    // Corcovado, Rio: two 7 x 4 m boxes on the terrace by the summit station
+    // (Google Open Buildings), where OSM already maps every building.
+    "300e8ad6-8834-4704-9f3c-f0f082439da5",
+    "e1286a9a-92bb-4d99-9f66-61d383c399f4",
 ];
 
 /// Whether a footprint is a known false positive. Both transports ask this,
@@ -297,32 +301,60 @@ impl OvertureHints {
                 ProcessedElement::Relation(relation) => &mut relation.tags,
                 ProcessedElement::Node(_) => continue,
             };
-
-            // Only buildings; Overture's building theme has no other feature type.
-            if !tags.contains_key("building") && !tags.contains_key("building:part") {
-                continue;
+            if fill_tags(hint, tags) {
+                enriched += 1;
             }
-            // Any existing vertical tag means OSM already knows better.
-            if tags.contains_key("height") || tags.contains_key("building:levels") {
-                continue;
-            }
-
-            // Every stored hint holds at least one validated value (see `insert`).
-            if let Some(floors) = hint.num_floors {
-                tags.insert("building:levels".to_string(), floors.to_string());
-            }
-            if let Some(h) = hint.height_m {
-                tags.insert("height".to_string(), format!("{h:.1}"));
-            }
-            // Marks the provenance for debugging and for the licence notice.
-            tags.insert(
-                "arnis:height_source".to_string(),
-                "overture_maps".to_string(),
-            );
-            enriched += 1;
         }
         enriched
     }
+
+    /// What `apply` will write onto a raw OSM `kind` ("way" or "relation") building with
+    /// these `tags`, or None when it leaves it alone.
+    pub(crate) fn hint_for(
+        &self,
+        kind: &'static str,
+        id: u64,
+        tags: &HashMap<String, String>,
+    ) -> Option<crate::element_processing::buildings::HeightHint> {
+        if !takes_hint(tags) {
+            return None;
+        }
+        let hint = self.hints.get(&OsmRef { kind, id })?;
+        Some(crate::element_processing::buildings::HeightHint {
+            height_m: hint.height_m,
+            levels: hint.num_floors.map(f64::from),
+        })
+    }
+}
+
+/// A building without a vertical tag of its own.
+fn takes_hint(tags: &HashMap<String, String>) -> bool {
+    // Only buildings; Overture's building theme has no other feature type.
+    // Any existing vertical tag means OSM already knows better.
+    (tags.contains_key("building") || tags.contains_key("building:part"))
+        && !tags.contains_key("height")
+        && !tags.contains_key("building:levels")
+}
+
+/// Writes `hint` onto a building's tags unless OSM already has a vertical tag.
+fn fill_tags(hint: &OsmAttributeHint, tags: &mut HashMap<String, String>) -> bool {
+    if !takes_hint(tags) {
+        return false;
+    }
+
+    // Every stored hint holds at least one validated value (see `insert`).
+    if let Some(floors) = hint.num_floors {
+        tags.insert("building:levels".to_string(), floors.to_string());
+    }
+    if let Some(h) = hint.height_m {
+        tags.insert("height".to_string(), format!("{h:.1}"));
+    }
+    // Marks the provenance for debugging and for the licence notice.
+    tags.insert(
+        "arnis:height_source".to_string(),
+        "overture_maps".to_string(),
+    );
+    true
 }
 
 /// Pull the OSM back-reference out of an Overture `sources` value.
@@ -372,6 +404,48 @@ fn parse_osm_ref(field: &parquet::record::Field) -> Option<OsmRef> {
     let mut out = None;
     walk(field, &mut out);
     out
+}
+
+/// Whether OSM supplied a row's geometry, going by the `sources` entry with an
+/// empty `property`. The other entries only name the source of one attribute,
+/// and the licence of other datasets can mention OpenStreetMap too, as Esri's
+/// does. `None` when the value holds no entry with a dataset.
+fn geometry_is_osm(field: &parquet::record::Field) -> Option<bool> {
+    fn collect<'a>(field: &'a parquet::record::Field, out: &mut Vec<(bool, &'a str)>) {
+        match field {
+            parquet::record::Field::ListInternal(list) => {
+                for element in list.elements() {
+                    collect(element, out);
+                }
+            }
+            parquet::record::Field::Group(row) => {
+                let mut dataset = None;
+                let mut covers_geometry = true;
+                for (name, sub) in row.get_column_iter() {
+                    match (name.as_str(), sub) {
+                        ("dataset", parquet::record::Field::Str(v)) => dataset = Some(v.as_str()),
+                        ("property", parquet::record::Field::Str(v)) => {
+                            covers_geometry = v.is_empty()
+                        }
+                        ("dataset" | "property", _) => {}
+                        _ => collect(sub, out),
+                    }
+                }
+                if let Some(dataset) = dataset {
+                    out.push((covers_geometry, dataset));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut entries = Vec::new();
+    collect(field, &mut entries);
+    let (_, dataset) = entries
+        .iter()
+        .find(|(covers_geometry, _)| *covers_geometry)
+        .or(entries.first())?;
+    Some(dataset.eq_ignore_ascii_case("OpenStreetMap"))
 }
 
 /// `"w519166507@9"` -> way 519166507. Also accepts `r`/`n` prefixes and a
@@ -513,6 +587,9 @@ pub struct OvertureData {
     pub elements: Vec<ProcessedElement>,
     /// Attributes for OSM buildings that OSM itself leaves untagged.
     pub hints: OvertureHints,
+    /// Every vertex of the footprints above whose height may reach past the vanilla build
+    /// height, for the terrain fit to check.
+    pub tall_structures: Vec<crate::elevation::TallModel>,
 }
 
 /// Fetch Overture Maps building data for the given bbox.
@@ -959,6 +1036,7 @@ fn fetch_overture_buildings_inner(
     let (coord_transformer, xzbbox) = projection.transformer(bbox)?;
     let clip_bbox = projection.clip_bbox(&xzbbox);
 
+    let mut tall_structures = Vec::new();
     let elements: Vec<ProcessedElement> = all_buildings
         .into_iter()
         .take(budget)
@@ -997,11 +1075,33 @@ fn fetch_overture_buildings_inner(
                 }
             }
             way.nodes = clipped;
+            let (w_m, l_m) = crate::elevation::peaks::extent_m(
+                building.exterior_ring.iter().map(|&(lon, lat)| (lat, lon)),
+            );
+            if let Some(height_m) = crate::element_processing::buildings::mapped_top_m(
+                &way.tags,
+                Default::default(),
+                w_m,
+                l_m,
+            )
+            .filter(|&h| crate::elevation::peaks::may_pass_vanilla(h, projection.scale))
+            {
+                tall_structures.extend(
+                    building
+                        .exterior_ring
+                        .iter()
+                        .map(|&(lon, lat)| crate::elevation::TallModel { lat, lon, height_m }),
+                );
+            }
             Some(ProcessedElement::Way(way))
         })
         .collect();
 
-    Ok(OvertureData { elements, hints })
+    Ok(OvertureData {
+        elements,
+        hints,
+        tall_structures,
+    })
 }
 
 /// Sorts `YYYY-MM-DD.N` release names, comparing the revision numerically.
@@ -1630,7 +1730,7 @@ fn parse_overture_row(
 ) -> Option<OvertureBuilding> {
     let mut id: Option<String> = None;
     let mut geometry_bytes: Option<Vec<u8>> = None;
-    let mut sources_str: Option<String> = None;
+    let mut is_osm = false;
     let mut osm_ref: Option<OsmRef> = None;
     let mut height: Option<f64> = None;
     let mut min_height: Option<f64> = None;
@@ -1663,11 +1763,9 @@ fn parse_overture_row(
                 }
             }
             "sources" => {
-                // Sources is a complex nested struct; convert to string for analysis
-                sources_str = Some(format!("{field}"));
-                // Best-effort structured read for the OSM back-reference. The
-                // string test above stays authoritative for dedup so a schema
-                // change cannot resurrect duplicate footprints.
+                // The text test only for a `sources` shape the structured read does not know.
+                is_osm = geometry_is_osm(field)
+                    .unwrap_or_else(|| format!("{field}").contains("OpenStreetMap"));
                 osm_ref = parse_osm_ref(field);
             }
             "height" => {
@@ -1780,12 +1878,6 @@ fn parse_overture_row(
     if exterior_ring.len() < 3 {
         return None;
     }
-
-    // Check if primary source is OSM
-    let is_osm = sources_str
-        .as_deref()
-        .map(|s| s.contains("OpenStreetMap"))
-        .unwrap_or(false);
 
     let id = id?;
 
@@ -2605,6 +2697,35 @@ mod tests {
         );
         let mut elements = vec![hint_way(42, &[("building", "yes")])];
         assert_eq!(one_floor.apply(&mut elements), 0);
+    }
+
+    #[test]
+    fn hinted_heights_count_for_the_build_height_check() {
+        let mut hints = OvertureHints::default();
+        for id in [10, 11] {
+            hints.insert(
+                OsmRef { kind: "way", id },
+                OsmAttributeHint {
+                    height_m: Some(420.0),
+                    num_floors: None,
+                },
+            );
+        }
+        let data: crate::osm_parser::OsmData = serde_json::from_str(
+            r#"{"elements": [
+                {"type": "node", "id": 1, "lat": 40.0, "lon": -74.0},
+                {"type": "way", "id": 10, "nodes": [1], "tags": {"building": "yes"}},
+                {"type": "way", "id": 11, "nodes": [1], "tags": {"building": "yes", "height": "10"}}
+            ]}"#,
+        )
+        .unwrap();
+        // The untagged building takes Overture's height, the tagged one keeps its own 10 m.
+        let found = crate::elevation::peaks::tall_structures_in(&data, 1.0, Some(&hints));
+        assert_eq!(
+            found.iter().map(|m| m.height_m).collect::<Vec<_>>(),
+            vec![420.0]
+        );
+        assert!(crate::elevation::peaks::tall_structures_in(&data, 1.0, None).is_empty());
     }
 
     #[test]

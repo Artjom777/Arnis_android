@@ -16,13 +16,16 @@ use crate::world_editor::WorldEditor;
 
 /// A parsed schematic: dimensions plus the non-air log/leaf voxels. The origin is the
 /// schematic's min corner (`x` in `0..width`, `y` in `0..height`, `z` in `0..length`).
+/// Coordinates are kept as i16, which halves a loaded pack's memory.
 pub struct Schematic {
     pub width: i32,
     pub height: i32,
     pub length: i32,
-    pub voxels: Vec<(i32, i32, i32, Block)>,
+    pub voxels: Vec<(i16, i16, i16, Block)>,
     /// Lowest log voxel y (the trunk floor); precomputed for the root pass.
     pub min_log_vy: i32,
+    /// Columns with a leaf in them, what the crown covers seen from above.
+    pub leaf_columns: u32,
 }
 
 /// Map a Minecraft block-state string to one of our blocks, or `None` for anything we
@@ -141,6 +144,12 @@ pub fn load_schem(gz_bytes: &[u8]) -> Result<Schematic, String> {
     if width <= 0 || height <= 0 || length <= 0 {
         return Err("schem: non-positive dimensions".into());
     }
+    if [width, height, length]
+        .iter()
+        .any(|&d| d > i32::from(i16::MAX))
+    {
+        return Err("schem: dimensions past the supported range".into());
+    }
 
     // v3: Blocks { Palette, Data }; v2: root-level Palette + BlockData.
     let (palette_v, data_v) = match scm.get("Blocks").and_then(as_compound) {
@@ -181,16 +190,18 @@ pub fn load_schem(gz_bytes: &[u8]) -> Result<Schematic, String> {
     }
 
     let wl = width * length;
-    let mut voxels = Vec::new();
+    let mut voxels: Vec<(i16, i16, i16, Block)> = Vec::new();
     for (i, &idx) in indices.iter().enumerate() {
         let i = i as i32;
         if let Some(block) = idx_to_block.get(&idx).cloned() {
             let x = i % width;
             let z = (i / width) % length;
             let y = i / wl;
-            voxels.push((x, y, z, block));
+            // Each fits: the dimensions were checked against i16 above.
+            voxels.push((x as i16, y as i16, z as i16, block));
         }
     }
+    drop_stray_leaves(&mut voxels, width, height, length);
 
     // Normalise so the lowest log/leaf sits at y=0 (schems pad air below the trunk).
     if let Some(min_y) = voxels.iter().map(|v| v.1).min() {
@@ -205,9 +216,22 @@ pub fn load_schem(gz_bytes: &[u8]) -> Result<Schematic, String> {
     let min_log_vy = voxels
         .iter()
         .filter(|&&(_, _, _, b)| is_log(b))
-        .map(|&(_, vy, _, _)| vy)
+        .map(|&(_, vy, _, _)| i32::from(vy))
         .min()
         .unwrap_or(0);
+    // Most models pad air rows on top, which would put them a size tier too high.
+    let height = voxels
+        .iter()
+        .map(|v| i32::from(v.1) + 1)
+        .max()
+        .unwrap_or(height);
+    let mut crown: Vec<(i16, i16)> = voxels
+        .iter()
+        .filter(|v| is_leaf(v.3))
+        .map(|v| (v.0, v.2))
+        .collect();
+    crown.sort_unstable();
+    crown.dedup();
 
     Ok(Schematic {
         width,
@@ -215,7 +239,58 @@ pub fn load_schem(gz_bytes: &[u8]) -> Result<Schematic, String> {
         length,
         voxels,
         min_log_vy,
+        leaf_columns: crown.len() as u32,
     })
+}
+
+/// Furthest apart, per axis, two voxels of one tree may be: one air block between still
+/// reads as the crown.
+const CROWN_REACH: i32 = 2;
+
+/// Drops leaves no chain of voxels within `CROWN_REACH` of each other links to the wood,
+/// so a stray bit left in a model doesn't float beside the tree.
+fn drop_stray_leaves(
+    voxels: &mut Vec<(i16, i16, i16, Block)>,
+    width: i32,
+    height: i32,
+    length: i32,
+) {
+    let mut todo: Vec<usize> = (0..voxels.len()).filter(|&k| is_log(voxels[k].3)).collect();
+    if todo.is_empty() {
+        return;
+    }
+    let cell = |x: i32, y: i32, z: i32| ((y * length + z) * width + x) as usize;
+    let mut grid = vec![u32::MAX; (width * height * length) as usize];
+    for (k, v) in voxels.iter().enumerate() {
+        grid[cell(v.0.into(), v.1.into(), v.2.into())] = k as u32;
+    }
+    let mut linked = vec![false; voxels.len()];
+    for &k in &todo {
+        linked[k] = true;
+    }
+    while let Some(k) = todo.pop() {
+        let (x, y, z) = (
+            i32::from(voxels[k].0),
+            i32::from(voxels[k].1),
+            i32::from(voxels[k].2),
+        );
+        for ny in (y - CROWN_REACH).max(0)..=(y + CROWN_REACH).min(height - 1) {
+            for nz in (z - CROWN_REACH).max(0)..=(z + CROWN_REACH).min(length - 1) {
+                for nx in (x - CROWN_REACH).max(0)..=(x + CROWN_REACH).min(width - 1) {
+                    let j = grid[cell(nx, ny, nz)];
+                    if j != u32::MAX && !linked[j as usize] {
+                        linked[j as usize] = true;
+                        todo.push(j as usize);
+                    }
+                }
+            }
+        }
+    }
+    let mut k = 0;
+    voxels.retain(|_| {
+        k += 1;
+        linked[k - 1]
+    });
 }
 
 /// Rotate a schematic cell offset `(x, z)` by `k` quarter-turns clockwise (k in 0..=3).
@@ -323,6 +398,7 @@ pub fn place_schematic_tree(
     // Lowest log at or above the base, per column: below it lie only roots.
     let mut base_logs: HashMap<(i32, i32), (i32, Block)> = HashMap::new();
     for &(vx, vy, vz, block) in &schem.voxels {
+        let (vx, vy, vz) = (i32::from(vx), i32::from(vy), i32::from(vz));
         let (rx, rz) = rotate_xz(vx, vz, schem.width, schem.length, rot);
         let wx = anchor_x + rx - cx;
         let wz = anchor_z + rz - cz;
@@ -461,6 +537,7 @@ mod tests {
                 (2, 2, 0, OAK_LOG),
             ],
             min_log_vy: -3,
+            leaf_columns: 0,
         };
         editor.set_block_absolute(GRASS, 10, 1, 10, None, None);
         editor.set_block_absolute(RED_FLOWER, 12, 4, 10, None, None);
@@ -482,6 +559,70 @@ mod tests {
             !editor.block_exists_absolute(12, 4, 10),
             "undergrowth right under the branch is cleared"
         );
+    }
+
+    /// A gzipped Sponge v2 schematic of `w` x `h` x `l` from palette ids.
+    fn schem_bytes(w: i16, h: i16, l: i16, palette: &[&str], ids: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut pal = HashMap::new();
+        for (i, name) in palette.iter().enumerate() {
+            pal.insert(name.to_string(), Value::Int(i as i32));
+        }
+        let mut root = HashMap::new();
+        root.insert("Version".to_string(), Value::Int(2));
+        root.insert("Width".to_string(), Value::Short(w));
+        root.insert("Height".to_string(), Value::Short(h));
+        root.insert("Length".to_string(), Value::Short(l));
+        root.insert("Palette".to_string(), Value::Compound(pal));
+        root.insert(
+            "BlockData".to_string(),
+            Value::ByteArray(fastnbt::ByteArray::new(
+                ids.iter().map(|&b| b as i8).collect(),
+            )),
+        );
+        let raw = fastnbt::to_bytes(&Value::Compound(root)).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(&raw).unwrap();
+        gz.finish().unwrap()
+    }
+
+    // Model files pad empty rows on top. The height is what the tree fills, so a
+    // 3-block tree in a 6-row file sits in the small tier, not the medium one.
+    #[test]
+    fn height_is_the_tree_not_the_file() {
+        // 1 x 6 x 1: log, log, leaves, then three rows of air.
+        let bytes = schem_bytes(
+            1,
+            6,
+            1,
+            &["minecraft:air", "minecraft:oak_log", "minecraft:oak_leaves"],
+            &[1, 1, 2, 0, 0, 0],
+        );
+        let schem = load_schem(&bytes).unwrap();
+        assert_eq!(schem.height, 3);
+        assert_eq!(schem.leaf_columns, 1);
+        assert_eq!(
+            crate::trees::tree_library::size_for_height(schem.height),
+            crate::trees::tree_library::TreeSize::Small
+        );
+    }
+
+    // A leaf one air block off the crown is crown; a bit left floating further off
+    // in the model file is not part of the tree.
+    #[test]
+    fn stray_leaves_far_from_the_tree_are_dropped() {
+        // 1 x 8 x 1: log, log, leaves, air, leaves, air, air, leaves.
+        let bytes = schem_bytes(
+            1,
+            8,
+            1,
+            &["minecraft:air", "minecraft:oak_log", "minecraft:oak_leaves"],
+            &[1, 1, 2, 0, 2, 0, 0, 2],
+        );
+        let schem = load_schem(&bytes).unwrap();
+        let ys: Vec<i16> = schem.voxels.iter().map(|v| v.1).collect();
+        assert_eq!(ys, vec![0, 1, 2, 4]);
+        assert_eq!(schem.height, 5);
     }
 
     #[test]
@@ -529,6 +670,7 @@ mod tests {
             length: 1,
             voxels: vec![(0, 0, 0, JUNGLE_LOG), (0, 1, 0, JUNGLE_LOG)],
             min_log_vy: 0,
+            leaf_columns: 0,
         };
         assert!(!cactus.has_leaves());
         let tree = Schematic {
@@ -537,6 +679,7 @@ mod tests {
             length: 1,
             voxels: vec![(0, 0, 0, OAK_LOG), (0, 1, 0, OAK_LEAVES)],
             min_log_vy: 0,
+            leaf_columns: 0,
         };
         assert!(tree.has_leaves());
     }

@@ -1,4 +1,4 @@
-use crate::args::Args;
+use crate::args::{Args, GenerationMode};
 use crate::canopy::{self, CanopyData};
 use crate::celestial::CelestialBody;
 use crate::coordinate_system::{
@@ -7,7 +7,7 @@ use crate::coordinate_system::{
 };
 use crate::ecoregion::{EcoMap, Ecoregion};
 use crate::elevation::{
-    compute_grid_dims, compute_grid_dims_for_world, AffinePolicy, ElevationAffine,
+    compute_grid_dims, compute_grid_dims_for_world, AffinePolicy, ElevationAffine, RaisedFor,
 };
 use crate::elevation_data::{fetch_elevation_data, ElevationData};
 use crate::land_cover::{self, LandCoverData};
@@ -60,6 +60,11 @@ pub struct Ground {
     /// Earth unless this is a Moon/Mars world, which take their own surface palette.
     body: CelestialBody,
     ecoregions: Option<Arc<EcoMap>>,
+    /// A winter run: every biome becomes its snowy counterpart.
+    winter: bool,
+    /// Absolute block of the grids' first cell, so passes that draw patterns line up
+    /// across One World seams. (0, 0) in a local run.
+    origin: (i32, i32),
 }
 
 /// Layout of a run's ground grids. A projected run takes its size from the
@@ -71,8 +76,6 @@ pub struct GroundFrame {
     pub mercator: Option<WebMercatorProjection>,
     pub pad_blocks: usize,
     pub affine: AffinePolicy,
-    /// Where climate is read; `None` is the bbox centre.
-    pub climate_anchor: Option<(f64, f64)>,
 }
 
 impl GroundFrame {
@@ -82,7 +85,6 @@ impl GroundFrame {
             mercator: None,
             pad_blocks: 0,
             affine: AffinePolicy::Fit,
-            climate_anchor: None,
         }
     }
 
@@ -108,38 +110,31 @@ impl GroundFrame {
                     Some(affine) => AffinePolicy::Fixed(affine),
                     None => AffinePolicy::FitWithHeadroom,
                 },
-                climate_anchor: Some((run.origin_lat, run.origin_lon)),
             },
             None => Self {
                 world_dims: Some((world_w, world_h)),
                 mercator: Some(projection),
                 pad_blocks: 0,
                 affine: AffinePolicy::Fit,
-                climate_anchor: None,
             },
         }
     }
 
-    fn climate(&self, bbox: &LLBBox) -> crate::climate::Climate {
-        match self.climate_anchor {
-            Some((lat, lon)) => crate::climate::Climate::classify_at(lat, lon),
-            None => crate::climate::Climate::classify(bbox),
-        }
-    }
-
-    fn anchor_lat(&self, bbox: &LLBBox) -> f64 {
-        match self.climate_anchor {
-            Some((lat, _)) => lat,
-            None => (bbox.min().lat() + bbox.max().lat()) / 2.0,
-        }
+    /// Absolute block of the area's north-west corner, where its grids start.
+    fn origin(&self, bbox: &LLBBox) -> (i32, i32) {
+        self.mercator.as_ref().map_or((0, 0), |proj| {
+            (
+                crate::projection::snap_edge(proj.x_for_lon(bbox.min().lng()), false),
+                crate::projection::snap_edge(proj.z_for_lat(bbox.max().lat()), false),
+            )
+        })
     }
 
     /// Ecoregions over the area, at the geography the land cover is laid out on.
     fn ecoregions(&self, bbox: &LLBBox, (world_w, world_h): (usize, usize)) -> Option<Arc<EcoMap>> {
         let map = match &self.mercator {
             Some(proj) => {
-                let x0 = crate::projection::snap_edge(proj.x_for_lon(bbox.min().lng()), false);
-                let z0 = crate::projection::snap_edge(proj.z_for_lat(bbox.max().lat()), false);
+                let (x0, z0) = self.origin(bbox);
                 EcoMap::build(world_w, world_h, (x0, z0), |gx, gz| {
                     (
                         proj.lat_for_z(f64::from(z0) + gz),
@@ -169,6 +164,7 @@ impl GroundFrame {
                 dims: (ww, wh, gw, gh),
                 pad: 0,
                 final_dims: (ww, wh),
+                origin: None,
             };
         };
         let pad = self.pad_blocks;
@@ -178,12 +174,18 @@ impl GroundFrame {
             // Providers sample a bbox edge to edge, so with one cell per block a
             // bbox running from first to last block centre samples every block
             // at its centre.
-            let x0 = crate::projection::snap_edge(proj.x_for_lon(bbox.min().lng()), false) as f64
-                - pad as f64
-                + 0.5;
-            let z0 = crate::projection::snap_edge(proj.z_for_lat(bbox.max().lat()), false) as f64
-                - pad as f64
-                + 0.5;
+            let origin = (
+                i64::from(crate::projection::snap_edge(
+                    proj.x_for_lon(bbox.min().lng()),
+                    false,
+                )) - pad as i64,
+                i64::from(crate::projection::snap_edge(
+                    proj.z_for_lat(bbox.max().lat()),
+                    false,
+                )) - pad as i64,
+            );
+            let x0 = origin.0 as f64 + 0.5;
+            let z0 = origin.1 as f64 + 0.5;
             let (x1, z1) = (x0 + (pw - 1) as f64, z0 + (ph - 1) as f64);
             if let Ok(centres) = LLBBox::new(
                 proj.lat_for_z(z1),
@@ -196,8 +198,15 @@ impl GroundFrame {
                     dims: (pw, ph, gw, gh),
                     pad,
                     final_dims: (world_w, world_h),
+                    origin: Some(origin),
                 };
             }
+        }
+        if pad > 0 {
+            println!(
+                "Note: this area is too wide for the seam margin, so terrain near its edges may \
+                 not match the neighbouring areas exactly."
+            );
         }
         let (_, _, gw, gh) = compute_grid_dims_for_world(world_w, world_h);
         FetchPlan {
@@ -205,6 +214,7 @@ impl GroundFrame {
             dims: (world_w, world_h, gw, gh),
             pad: 0,
             final_dims: (world_w, world_h),
+            origin: None,
         }
     }
 }
@@ -215,6 +225,8 @@ struct FetchPlan {
     dims: (usize, usize, usize, usize),
     pad: usize,
     final_dims: (usize, usize),
+    /// The world block of the grid's cell (0, 0), where the grid has one cell per block.
+    origin: Option<(i64, i64)>,
 }
 
 impl FetchPlan {
@@ -280,6 +292,8 @@ impl Ground {
             climate: crate::climate::Climate::Temperate,
             body: CelestialBody::Earth,
             ecoregions: None,
+            winter: false,
+            origin: (0, 0),
         }
     }
 
@@ -332,9 +346,11 @@ impl Ground {
             world_height: world_h,
             rotation_mask: None,
             snow_threshold_y: i32::MAX,
-            climate: frame.climate(bbox),
+            climate: crate::climate::Climate::classify(bbox),
             body: CelestialBody::Earth,
             ecoregions: frame.ecoregions(bbox, (world_w, world_h)),
+            winter: false,
+            origin: frame.origin(bbox),
         }
     }
 
@@ -358,6 +374,33 @@ impl Ground {
             climate: crate::climate::Climate::Temperate,
             body: CelestialBody::Earth,
             ecoregions: None,
+            winter: false,
+            origin: (0, 0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_flat_canopy_test(
+        canopy: CanopyData,
+        world_width: usize,
+        world_height: usize,
+    ) -> Self {
+        Self {
+            elevation_enabled: false,
+            extended_ceiling: false,
+            ground_level: 0,
+            elevation_data: None,
+            land_cover: None,
+            canopy: Some(canopy),
+            world_width,
+            world_height,
+            rotation_mask: None,
+            snow_threshold_y: i32::MAX,
+            climate: crate::climate::Climate::Temperate,
+            body: CelestialBody::Earth,
+            ecoregions: None,
+            winter: false,
+            origin: (0, 0),
         }
     }
 
@@ -396,6 +439,9 @@ impl Ground {
                 slope_correction: 1.0,
                 ground_level: 0,
                 soft_top: None,
+                extended_ceiling: false,
+                raised_for: None,
+                halo: None,
             }),
             land_cover: None,
             canopy: None,
@@ -406,6 +452,8 @@ impl Ground {
             climate: crate::climate::Climate::Temperate,
             body: CelestialBody::Earth,
             ecoregions: None,
+            winter: false,
+            origin: (0, 0),
         }
     }
 
@@ -415,14 +463,14 @@ impl Ground {
         scale: f64,
         height_multiplier: f64,
         ground_level: i32,
-        min_ground_level: i32,
-        disable_height_limit: bool,
-        extended_max_y: i32,
+        height: WorldHeight,
+        taller: Option<WorldHeight>,
         aws_only_elevation: bool,
         benchmark: bool,
         canopy_height: bool,
         body: CelestialBody,
         frame: &GroundFrame,
+        peaks: &crate::elevation::PeakSource,
     ) -> Self {
         let mut bench = crate::bench::Bench::new(benchmark);
         // Land cover, canopy and the snow line are Earth datasets keyed by
@@ -454,18 +502,25 @@ impl Ground {
             bench.mark("elev_landcover_fetch");
 
             // Raise the floor for the deepest water carve (elevation path only).
-            let carve_floor = match &land_cover {
-                Some(lc) => {
-                    let max_depth =
-                        crate::water_depth::estimate_max_carve_depth(&lc.grid, world_w, world_h);
-                    crate::world_editor::min_y() + max_depth + 2
+            let max_depth = land_cover
+                .as_ref()
+                .map(|lc| crate::water_depth::estimate_max_carve_depth(&lc.grid, world_w, world_h));
+            let band = |h: WorldHeight| {
+                let carve_floor = match max_depth {
+                    Some(depth) => h.min_y + depth + 2,
+                    None => h.min_y,
+                };
+                let water_floor = ground_level.max(carve_floor);
+                // The terrain may sink to reach an extended floor, but never below the carve
+                // floor: water would otherwise be cut straight through the bedrock layer.
+                crate::elevation::HeightBand {
+                    ground_level: water_floor,
+                    min_ground_level: h.min_ground_level.max(carve_floor).min(water_floor),
+                    disable_height_limit: h.extended,
+                    extended_max_y: h.extended_max_y,
+                    floor_y: h.min_y,
                 }
-                None => crate::world_editor::min_y(),
             };
-            let water_floor = ground_level.max(carve_floor);
-            // The terrain may sink to reach an extended floor, but never below the carve floor:
-            // water would otherwise be cut straight through the bedrock layer.
-            let sink_floor = min_ground_level.max(carve_floor).min(water_floor);
 
             let source_mode = if !body.is_earth() {
                 crate::elevation::SourceMode::Planetary(body)
@@ -478,18 +533,21 @@ impl Ground {
                 bbox,
                 scale,
                 height_multiplier,
-                water_floor,
-                sink_floor,
-                disable_height_limit,
-                extended_max_y,
+                band(height),
+                taller.map(band),
                 land_cover.as_mut(),
                 source_mode,
                 benchmark,
                 (world_w, world_h, grid_w, grid_h),
                 frame.affine,
+                peaks,
+                (frame.pad_blocks > 0).then_some(crate::elevation::Seam {
+                    pad: plan.pad,
+                    origin: plan.origin,
+                }),
             ) {
                 Ok(mut elevation_data) => {
-                    let lat = frame.anchor_lat(&requested_bbox);
+                    let lat = (requested_bbox.min().lat() + requested_bbox.max().lat()) / 2.0;
                     // Must use the base the scaler actually settled on: snow_threshold_for
                     // inverts that exact affine, so a mismatched base misplaces every snow cap.
                     let base = elevation_data.ground_level;
@@ -522,8 +580,7 @@ impl Ground {
                     }
                     Self {
                         elevation_enabled: true,
-                        extended_ceiling: disable_height_limit
-                            && extended_max_y > crate::world_editor::DEFAULT_MAX_Y,
+                        extended_ceiling: elevation_data.extended_ceiling,
                         ground_level: base,
                         elevation_data: Some(elevation_data),
                         land_cover,
@@ -532,12 +589,14 @@ impl Ground {
                         world_height: final_h,
                         rotation_mask: None,
                         snow_threshold_y,
-                        climate: frame.climate(&requested_bbox),
+                        climate: crate::climate::Climate::classify(&requested_bbox),
                         body,
                         ecoregions: body
                             .is_earth()
                             .then(|| frame.ecoregions(&requested_bbox, (final_w, final_h)))
                             .flatten(),
+                        winter: false,
+                        origin: frame.origin(&requested_bbox),
                     }
                 }
                 Err(e) => {
@@ -566,12 +625,14 @@ impl Ground {
                         world_height: 0,
                         rotation_mask: None,
                         snow_threshold_y: i32::MAX,
-                        climate: frame.climate(&requested_bbox),
+                        climate: crate::climate::Climate::classify(&requested_bbox),
                         body,
                         ecoregions: body
                             .is_earth()
                             .then(|| frame.ecoregions(&requested_bbox, plan.final_dims))
                             .flatten(),
+                        winter: false,
+                        origin: frame.origin(&requested_bbox),
                     }
                 }
             }
@@ -612,6 +673,16 @@ impl Ground {
         self.ecoregions = Some(Arc::new(map));
     }
 
+    /// Whether this is a winter run, whose biomes are all snowy.
+    #[inline(always)]
+    pub fn winter(&self) -> bool {
+        self.winter
+    }
+
+    pub fn set_winter(&mut self, winter: bool) {
+        self.winter = winter;
+    }
+
     /// Returns whether land cover data is available
     #[inline(always)]
     pub fn has_land_cover(&self) -> bool {
@@ -643,44 +714,69 @@ impl Ground {
     /// Share of a `span` square at `origin` that carries canopy, or `None` where
     /// nothing in it was measured. Unmeasured columns stay out of the average,
     /// so a cell with none at all hands the decision back to the land cover.
+    #[cfg(test)]
     pub fn canopy_fraction(&self, origin: XZPoint, span: i32) -> Option<f64> {
+        self.canopy_cell(origin, span).map(|(fraction, _)| fraction)
+    }
+
+    /// Whether `canopy_cell` would answer, stopping at the first measured column.
+    pub fn canopy_measured(&self, origin: XZPoint, span: i32) -> bool {
+        (0..span).any(|dz| {
+            (0..span).any(|dx| {
+                self.canopy_height_m(XZPoint::new(origin.x + dx, origin.z + dz))
+                    .is_some()
+            })
+        })
+    }
+
+    /// The canopy share of a `span` square at `origin` and its tallest crown in
+    /// metres, or `None` where nothing in it was measured.
+    pub fn canopy_cell(&self, origin: XZPoint, span: i32) -> Option<(f64, u8)> {
         self.canopy.as_ref()?;
         if span <= 0 {
             return None;
         }
-        let (mut measured, mut wooded) = (0u32, 0u32);
+        let (mut measured, mut wooded, mut top) = (0u32, 0u32, 0u8);
         for dz in 0..span {
             for dx in 0..span {
                 if let Some(h) = self.canopy_height_m(XZPoint::new(origin.x + dx, origin.z + dz)) {
                     measured += 1;
                     if h >= canopy::CANOPY_MIN_M {
                         wooded += 1;
+                        top = top.max(h);
                     }
                 }
             }
         }
-        (measured > 0).then(|| f64::from(wooded) / f64::from(measured))
+        (measured > 0).then(|| (f64::from(wooded) / f64::from(measured), top))
     }
 
-    /// Force LC_WATER inside OSM water, sinking those cells onto that water's surface.
+    /// Force LC_WATER inside OSM water and sink it onto that water; flat worlds only mark inland.
     pub fn apply_osm_water_override(&mut self, elements: &[ProcessedElement], xzbbox: &XZBBox) {
+        use crate::land_cover::osm_water_override::{apply_osm_water_override, mark_inland_water};
+        let (world_width, world_height) = self.world_dims();
         let Ground {
             land_cover,
             elevation_data,
             ..
         } = self;
-        let (Some(lc), Some(data)) = (land_cover.as_mut(), elevation_data.as_mut()) else {
+        let Some(lc) = land_cover.as_mut() else {
             return;
         };
-        let (world_width, world_height) = (data.world_width, data.world_height);
-        crate::land_cover::osm_water_override::apply_osm_water_override(
-            lc,
-            &mut data.heights,
-            world_width,
-            world_height,
-            elements,
-            xzbbox,
-        );
+        match elevation_data.as_mut() {
+            Some(data) => {
+                let (world_width, world_height) = (data.world_width, data.world_height);
+                apply_osm_water_override(
+                    lc,
+                    &mut data.heights,
+                    world_width,
+                    world_height,
+                    elements,
+                    xzbbox,
+                );
+            }
+            None => mark_inland_water(lc, world_width, world_height, elements, xzbbox),
+        }
     }
 
     /// Trim ESA water back to land where OSM shows roads, buildings or its own shoreline.
@@ -702,6 +798,31 @@ impl Ground {
             xzbbox,
             scale,
         );
+    }
+
+    /// Last land cover pass, once the OSM and bridge repairs have moved the water: returns
+    /// built-up land and fields to nature where the mode asks, then marks the beaches.
+    pub fn finish_land_cover(&mut self, mode: GenerationMode) {
+        if mode.natural_land_cover() {
+            // A blueprint still draws roads and outlines on narrow land by the water.
+            self.naturalize_land_cover(mode.skip_objects());
+        }
+        self.mark_beaches();
+    }
+
+    /// Returns built-up land and fields to natural cover, for terrain-only worlds.
+    fn naturalize_land_cover(&mut self, reclaim: bool) {
+        let (climate, origin) = (self.climate, self.origin);
+        let Ground {
+            land_cover,
+            elevation_data,
+            ..
+        } = self;
+        let Some(lc) = land_cover.as_mut() else {
+            return;
+        };
+        let heights = elevation_data.as_mut().map(|d| d.heights.as_mut_slice());
+        crate::land_cover::naturalize::naturalize(lc, heights, climate, origin, reclaim);
     }
 
     /// Marks bare ground at the water's edge as beach. Run after every pass that moves water.
@@ -781,31 +902,60 @@ impl Ground {
     /// Returns 0 if land cover data is not available.
     #[inline(always)]
     pub fn cover_class(&self, coord: XZPoint) -> u8 {
-        if let Some(ref lc) = self.land_cover {
-            let (world_w, world_h) = self.world_dims();
-            let x_ratio = (coord.x as f64 / (world_w - 1).max(1) as f64).clamp(0.0, 1.0);
-            let z_ratio = (coord.z as f64 / (world_h - 1).max(1) as f64).clamp(0.0, 1.0);
-            let x = ((x_ratio * (lc.width - 1) as f64).round() as usize).min(lc.width - 1);
-            let z = ((z_ratio * (lc.height - 1) as f64).round() as usize).min(lc.height - 1);
-            lc.grid[z][x]
-        } else {
-            0
+        self.lc_cell(coord).map_or(0, |(lc, x, z)| lc.grid[z][x])
+    }
+
+    /// Land-cover cell under a coordinate, clamped to the grid.
+    #[inline(always)]
+    fn lc_cell(&self, coord: XZPoint) -> Option<(&land_cover::LandCoverData, usize, usize)> {
+        let lc = self.land_cover.as_ref()?;
+        let (world_w, world_h) = self.world_dims();
+        let x_ratio = (coord.x as f64 / (world_w - 1).max(1) as f64).clamp(0.0, 1.0);
+        let z_ratio = (coord.z as f64 / (world_h - 1).max(1) as f64).clamp(0.0, 1.0);
+        let x = ((x_ratio * (lc.width - 1) as f64).round() as usize).min(lc.width - 1);
+        let z = ((z_ratio * (lc.height - 1) as f64).round() as usize).min(lc.height - 1);
+        Some((lc, x, z))
+    }
+
+    /// Whether beach land cover lies within `reach` blocks of the given coordinates.
+    pub fn beach_within(&self, coord: XZPoint, reach: f64) -> bool {
+        let Some(ref lc) = self.land_cover else {
+            return false;
+        };
+        if lc.width == 0 || lc.height == 0 {
+            return false;
         }
+        let (world_w, world_h) = self.world_dims();
+        let sx = (lc.width - 1) as f64 / (world_w - 1).max(1) as f64;
+        let sz = (lc.height - 1) as f64 / (world_h - 1).max(1) as f64;
+        let x = ((coord.x as f64 * sx).round().max(0.0) as usize).min(lc.width - 1);
+        let z = ((coord.z as f64 * sz).round().max(0.0) as usize).min(lc.height - 1);
+        lc.beach_within(x, z, (reach * sx.max(sz)).ceil().max(0.0) as usize)
     }
 
     /// Returns the water distance-to-shore value at the given coordinates.
     /// 0 = non-water, 1 = shore, 2+ = progressively deeper water.
     #[inline(always)]
     pub fn water_distance(&self, coord: XZPoint) -> u8 {
-        if let Some(ref lc) = self.land_cover {
-            let (world_w, world_h) = self.world_dims();
-            let x_ratio = (coord.x as f64 / (world_w - 1).max(1) as f64).clamp(0.0, 1.0);
-            let z_ratio = (coord.z as f64 / (world_h - 1).max(1) as f64).clamp(0.0, 1.0);
-            let x = ((x_ratio * (lc.width - 1) as f64).round() as usize).min(lc.width - 1);
-            let z = ((z_ratio * (lc.height - 1) as f64).round() as usize).min(lc.height - 1);
-            lc.water_distance[z][x]
-        } else {
-            0
+        self.lc_cell(coord)
+            .map_or(0, |(lc, x, z)| lc.water_distance[z][x])
+    }
+
+    /// Whether OSM maps this cell as a lake, river or canal rather than open sea.
+    #[inline]
+    pub fn inland_water_mapped(&self, coord: XZPoint) -> bool {
+        self.lc_cell(coord)
+            .is_some_and(|(lc, x, z)| lc.inland_water.get(x, z))
+    }
+
+    /// Highest Y of the sea surface, `None` without terrain; water above it is inland.
+    pub fn sea_surface_max_y(&self) -> Option<i32> {
+        const SEA_SURFACE_MAX_M: f64 = 5.0;
+        match &self.elevation_data {
+            Some(d) if self.elevation_enabled && d.blocks_per_meter > 0.0 => {
+                Some(d.affine().y_for_metres(SEA_SURFACE_MAX_M).floor() as i32)
+            }
+            _ => None,
         }
     }
 
@@ -820,55 +970,18 @@ impl Ground {
         d == 0 || d >= 4
     }
 
-    /// Returns a continuous 0.0–1.0 value indicating how "watery" a block is,
-    /// using bilinear interpolation of the water classification grid.
-    ///
-    /// Nearest-neighbor grid lookups (`cover_class`) create rectangular water
-    /// edges when the grid is coarser than block resolution.  Bilinear
-    /// interpolation produces a smooth gradient across grid cell boundaries,
-    /// allowing noise-based thresholding to create organic shorelines.
+    /// Whether the Gaussian-smoothed water mask, sampled bilinearly, makes this block water.
+    /// Noise-free thresholding of the smooth field traces organic shorelines where
+    /// nearest-neighbour `cover_class` lookups would leave rectangular grid edges.
     #[inline(always)]
-    pub fn water_blend(&self, coord: XZPoint) -> f64 {
-        if let Some(ref lc) = self.land_cover {
-            let (world_w, world_h) = self.world_dims();
-            // Continuous grid coordinates (no rounding — that's the key difference
-            // from cover_class which uses .round())
-            let fx = (coord.x as f64 / (world_w - 1).max(1) as f64).clamp(0.0, 1.0)
-                * (lc.width - 1) as f64;
-            let fz = (coord.z as f64 / (world_h - 1).max(1) as f64).clamp(0.0, 1.0)
-                * (lc.height - 1) as f64;
-
-            let x0 = (fx.floor() as usize).min(lc.width - 1);
-            let x1 = (x0 + 1).min(lc.width - 1);
-            let z0 = (fz.floor() as usize).min(lc.height - 1);
-            let z1 = (z0 + 1).min(lc.height - 1);
-
-            let tx = fx - fx.floor();
-            let tz = fz - fz.floor();
-
-            // Sample pre-smoothed water-ness at the 4 surrounding grid cells.
-            // The grid was Gaussian-blurred from the binary LC_WATER mask so
-            // that even at integer block positions (1-to-1 grid-to-world
-            // mapping, where tx == tz == 0 below) the sampled value is
-            // continuous — the renderer's hard `> 0.5` threshold then traces
-            // a clean curved shoreline contour instead of the raw ESA 10 m
-            // rectangular grid edge.
-            // Widen f32 storage to f64 for the bilinear arithmetic. This
-            // doesn't recover the ~10⁻⁷ precision lost at storage, but it
-            // prevents extra rounding from accumulating in the four
-            // multiply-adds + the threshold comparison downstream.
-            let wb = lc.water_blend_grid();
-            let w00 = wb[z0][x0] as f64;
-            let w10 = wb[z0][x1] as f64;
-            let w01 = wb[z1][x0] as f64;
-            let w11 = wb[z1][x1] as f64;
-
-            // Bilinear interpolation
-            let top = w00 * (1.0 - tx) + w10 * tx;
-            let bottom = w01 * (1.0 - tx) + w11 * tx;
-            top * (1.0 - tz) + bottom * tz
-        } else {
-            0.0
+    pub fn water_blend_is_water(&self, coord: XZPoint) -> bool {
+        match self.land_cover {
+            Some(ref lc) => {
+                let (world_w, world_h) = self.world_dims();
+                lc.water_blend_mask(world_w, world_h)
+                    .contains(coord.x, coord.z)
+            }
+            None => false,
         }
     }
 
@@ -998,6 +1111,9 @@ impl Ground {
         }
 
         let data: &ElevationData = self.elevation_data.as_ref().unwrap();
+        if let Some(h) = data.beyond(coord.x, coord.z) {
+            return f64::from(h).round() as i32;
+        }
         let (x_ratio, z_ratio) = self.get_data_coordinates(coord, data);
         self.interpolate_height(x_ratio, z_ratio, data)
     }
@@ -1007,6 +1123,9 @@ impl Ground {
     pub fn level_exact(&self, coord: XZPoint) -> f64 {
         match &self.elevation_data {
             Some(data) if self.elevation_enabled => {
+                if let Some(h) = data.beyond(coord.x, coord.z) {
+                    return f64::from(h);
+                }
                 let (x_ratio, z_ratio) = self.get_data_coordinates(coord, data);
                 Self::interpolate_height_exact(x_ratio, z_ratio, data)
             }
@@ -1144,6 +1263,7 @@ impl Ground {
             data.height = grid_height;
             data.world_width = world_width;
             data.world_height = world_height;
+            data.halo = None;
         }
     }
 
@@ -1153,12 +1273,14 @@ impl Ground {
         &mut self,
         grid: Vec<Vec<u8>>,
         water_distance: Vec<Vec<u8>>,
+        inland_water: crate::land_cover::InlandWater,
         width: usize,
         height: usize,
     ) {
         if let Some(ref mut lc) = self.land_cover {
             lc.grid = grid;
             lc.water_distance = water_distance;
+            lc.inland_water = inland_water;
             lc.width = width;
             lc.height = height;
             // The water-blend mask was derived from the pre-rotation grid —
@@ -1178,7 +1300,8 @@ impl Ground {
     /// Computes the lazy water-blend mask now; all grid mutations must be done.
     pub fn warm_water_blend(&self) {
         if let Some(ref lc) = self.land_cover {
-            let _ = lc.water_blend_grid();
+            let (world_w, world_h) = self.world_dims();
+            let _ = lc.water_blend_mask(world_w, world_h);
         }
     }
 
@@ -1344,27 +1467,46 @@ impl Ground {
     }
 }
 
-pub fn generate_ground_data(args: &Args, bbox: LLBBox) -> Ground {
+/// `peaks` delivers OSM summits once the parallel OSM fetch has them.
+pub fn generate_ground_data(
+    args: &Args,
+    bbox: LLBBox,
+    peaks: &crate::elevation::PeakSource,
+) -> Ground {
     // Cleared before the scaler publishes its own: in the GUI a previous run's terrain top
     // would misgrade this world's map preview.
     crate::world_editor::common::set_terrain_top_y(args.ground_level);
     let frame = GroundFrame::from_args(args, &bbox);
+    let auto = auto_height(args);
+    let (height, taller) = height_choice(args);
     if args.terrain() {
         println!("{} Fetching elevation...", "[3/7]".bold());
-        let ground = Ground::new_enabled(
+        let mut ground = Ground::new_enabled(
             &bbox,
             args.scale,
             args.height_multiplier,
             args.ground_level,
-            min_ground_level_for(args),
-            args.disable_height_limit,
-            extended_max_y_for(args),
+            height,
+            taller,
             args.aws_only_elevation,
             args.benchmark,
             args.canopy_height,
             args.body,
             &frame,
+            peaks,
         );
+        let mut raised_for = ground.elevation_data.as_ref().and_then(|d| d.raised_for);
+        if auto && !ground.elevation_enabled {
+            raised_for = (!height.extended)
+                .then(|| flat_overflow(args, &bbox, ground.base_level(), peaks))
+                .flatten();
+            ground.extended_ceiling = height.extended || raised_for.is_some();
+        }
+        if auto && ground.extended_ceiling {
+            let raised_for = raised_for.map(|r| r.with_overture(peaks, args.scale));
+            extend_world_bounds(args, ground.base_level(), raised_for);
+        }
+        ground.set_winter(args.winter);
         // The scaler may have sunk the base to reach the extended floor. The bedrock plane and
         // the out-of-bbox filler chunks both key off that base, so pin them to it now.
         let floor = area_floor_for(&ground, args);
@@ -1380,13 +1522,22 @@ pub fn generate_ground_data(args: &Args, bbox: LLBBox) -> Ground {
         return ground;
     }
     println!("{} Fetching land cover...", "[3/7]".bold());
-    let ground = Ground::new_flat_with_land_cover(
+    let mut ground = Ground::new_flat_with_land_cover(
         &bbox,
         args.scale,
         args.ground_level,
         args.canopy_height,
         &frame,
     );
+    let raised_for = (auto && !height.extended)
+        .then(|| flat_overflow(args, &bbox, ground.base_level(), peaks))
+        .flatten();
+    if auto && (height.extended || raised_for.is_some()) {
+        ground.extended_ceiling = true;
+        let raised_for = raised_for.map(|r| r.with_overture(peaks, args.scale));
+        extend_world_bounds(args, ground.base_level(), raised_for);
+    }
+    ground.set_winter(args.winter);
     crate::world_editor::set_base_chunk_y(ground.base_level());
     crate::world_editor::set_terrain_floor_y(ground.base_level());
     crate::world_editor::set_base_chunk_block(filler_block_for(args.body));
@@ -1424,8 +1575,14 @@ pub(crate) fn extended_max_y_for(args: &Args) -> i32 {
     } else if args.luanti {
         crate::world_editor::DEFAULT_MAX_Y
     } else {
-        2031
+        java_tall_range(args).1
     }
+}
+
+/// The Java tall range: the full pack's, or the one the world being written into declares.
+fn java_tall_range(args: &Args) -> (i32, i32) {
+    args.tall_range
+        .unwrap_or(crate::world_utils::TALL_DATAPACK_FULL_RANGE)
 }
 
 /// World floor. The bundled Java datapack already declares the full range the engine allows
@@ -1437,19 +1594,29 @@ pub(crate) fn extended_max_y_for(args: &Args) -> i32 {
 /// 319. Must never sit below the ceiling the scaler aims at (`extended_max_y_for`), or the
 /// block store drops the terrain the scaler just placed. On Java it also pairs with
 /// `extended_min_y_for`: chunk serialization sizes heightmaps from the span between the two.
-pub fn world_top_y_for(args: &Args) -> i32 {
-    if !args.disable_height_limit || args.luanti {
+pub(crate) fn world_top_y_for(args: &Args) -> i32 {
+    world_top_y(args, args.disable_height_limit)
+}
+
+/// `world_top_y_for` with the extended height on or off.
+pub(crate) fn world_top_y(args: &Args, extended: bool) -> i32 {
+    if !extended || args.luanti {
         crate::world_editor::DEFAULT_MAX_Y
     } else if args.bedrock {
         511
     } else {
-        2031
+        java_tall_range(args).1
     }
 }
 
-pub fn extended_min_y_for(args: &Args) -> i32 {
-    if args.disable_height_limit && !args.bedrock && !args.luanti {
-        -2032
+pub(crate) fn extended_min_y_for(args: &Args) -> i32 {
+    world_min_y(args, args.disable_height_limit)
+}
+
+/// `extended_min_y_for` with the extended height on or off.
+pub(crate) fn world_min_y(args: &Args, extended: bool) -> i32 {
+    if extended && !args.bedrock && !args.luanti {
+        java_tall_range(args).0
     } else {
         crate::world_editor::DEFAULT_MIN_Y
     }
@@ -1460,12 +1627,241 @@ pub fn extended_min_y_for(args: &Args) -> i32 {
 /// this returns the requested ground level, which disables the sink entirely — an explicit
 /// --ground-level must not be silently overridden.
 pub(crate) fn min_ground_level_for(args: &Args) -> i32 {
-    let floor = extended_min_y_for(args);
+    min_ground_level(args, args.disable_height_limit)
+}
+
+fn min_ground_level(args: &Args, extended: bool) -> i32 {
+    let floor = world_min_y(args, extended);
     if floor >= crate::world_editor::DEFAULT_MIN_Y {
         args.ground_level
     } else {
         floor + 2
     }
+}
+
+/// Whether the terrain fit picks this run's build height, extending it only where the area
+/// needs more room than vanilla. Not when the user kept the vanilla height or forced the
+/// pack, in a One World (its height is fixed when it is made), on Luanti (no pack) or off
+/// Earth. Asked before the fit only: `settle_build_height` resolves it.
+pub(crate) fn auto_height(args: &Args) -> bool {
+    !args.vanilla_height
+        && !args.disable_height_limit
+        && !args.luanti
+        && args.body.is_earth()
+        && !args.one_world
+        && args.one_world_run.is_none()
+}
+
+/// A build height the terrain can be fitted into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorldHeight {
+    /// Bottom of the dimension.
+    pub min_y: i32,
+    /// Lowest terrain base the scaler may sink to.
+    pub min_ground_level: i32,
+    pub extended: bool,
+    /// Scaler ceiling when `extended`.
+    pub extended_max_y: i32,
+}
+
+impl WorldHeight {
+    fn of(args: &Args, extended: bool) -> Self {
+        Self {
+            min_y: world_min_y(args, extended),
+            min_ground_level: min_ground_level(args, extended),
+            extended,
+            extended_max_y: extended_max_y_for(args),
+        }
+    }
+}
+
+/// Terrain bases a world can stand on: two above its floor, up to its ceiling less the
+/// terrain buffer, or the scaler's clamp would have its min above its max.
+pub(crate) fn ground_level_range(args: &Args, extended: bool) -> std::ops::RangeInclusive<i32> {
+    world_min_y(args, extended) + 2
+        ..=world_top_y(args, extended) - crate::elevation::postprocess::TERRAIN_HEIGHT_BUFFER
+}
+
+/// The build height the fit starts from, and the extended one it may switch to.
+fn height_choice(args: &Args) -> (WorldHeight, Option<WorldHeight>) {
+    let current = WorldHeight::of(args, args.disable_height_limit);
+    if !auto_height(args) {
+        return (current, None);
+    }
+    let extended = WorldHeight::of(args, true);
+    if !ground_level_range(args, false).contains(&args.ground_level) {
+        eprintln!(
+            "Extended build height: ground level {} is outside the vanilla range",
+            args.ground_level
+        );
+        return (extended, None);
+    }
+    (current, Some(extended))
+}
+
+/// Gives the dimension the extended height, once an auto-height run turns out to need it.
+/// On Java only as far as the area reaches, when the fit says how far that is: every extra
+/// section costs each loaded chunk memory and time in the game, filled or not.
+fn extend_world_bounds(args: &Args, base: i32, raised_for: Option<RaisedFor>) {
+    let (min, max) = match raised_for {
+        Some(r) if !args.bedrock => sized_world_bounds(base, r),
+        _ => (world_min_y(args, true), world_top_y(args, true)),
+    };
+    crate::world_editor::set_world_bounds(min, max);
+}
+
+/// Room over the highest terrain for what the fit does not count: trees, bridges and the
+/// bundled props, the tallest of which is the 197-block wind turbine, and some to build in.
+const PROP_HEADROOM: i32 = 208;
+
+/// Room over the tallest building or model the fit counted, for what rises past its
+/// mapped height: spires, masts and roofs.
+const STRUCTURE_HEADROOM: i32 = 32;
+
+/// The dimension a Java area raised past vanilla needs, within the pack's full -2032..2031.
+/// The floor is the terrain floor the base already puts bedrock on, and never above
+/// vanilla's; the ceiling clears the terrain and what stands on it, never below vanilla's.
+fn sized_world_bounds(base: i32, raised_for: RaisedFor) -> (i32, i32) {
+    let (full_min, full_max) = crate::world_utils::TALL_DATAPACK_FULL_RANGE;
+    let floor = (base - crate::world_editor::common::TERRAIN_FLOOR_DEPTH).div_euclid(16) * 16;
+    let min = floor.clamp(full_min, crate::world_editor::DEFAULT_MIN_Y);
+    let RaisedFor {
+        terrain_top_y,
+        tallest_blocks,
+        ..
+    } = raised_for;
+    let top =
+        (terrain_top_y + PROP_HEADROOM).max(terrain_top_y + tallest_blocks + STRUCTURE_HEADROOM);
+    let max =
+        ((top + 16).div_euclid(16) * 16 - 1).clamp(crate::world_editor::DEFAULT_MAX_Y, full_max);
+    (min, max)
+}
+
+/// Without a relief to fit: None when every tall structure stays under vanilla's ceiling,
+/// else what the raised range has to hold on flat ground at `base`. Takes the hints, so it
+/// is only for a run whose elevation fetch did not take them.
+fn flat_overflow(
+    args: &Args,
+    bbox: &LLBBox,
+    base: i32,
+    peaks: &crate::elevation::PeakSource,
+) -> Option<RaisedFor> {
+    let hints = peaks.take();
+    // Counted whole, as the fit counts them: a tall building the area's edge cuts is still
+    // partly built, and too high a ceiling costs a section where too low a one cuts it off.
+    let tallest = |structures: &[crate::elevation::TallModel]| {
+        structures.iter().map(|m| m.height_m).fold(0.0, f64::max)
+    };
+    // Overture's list can be read only once, so its tallest is kept on the way past.
+    let overture = std::cell::Cell::new(None);
+    let why = crate::elevation::vanilla_misses(
+        &hints,
+        || {
+            let structures = peaks.take_overture();
+            overture.set(Some(tallest(&structures)));
+            structures
+        },
+        |structures| {
+            structures
+                .iter()
+                .filter(|m| crate::elevation::peaks::inside(bbox, m.lat, m.lon))
+                .map(|m| (0.0, m.height_m))
+                .collect()
+        },
+        |tops| {
+            crate::elevation::postprocess::vanilla_overflow(
+                &[],
+                tops,
+                1.0,
+                args.scale,
+                args.ground_level,
+            )
+        },
+    )?;
+    eprintln!("Extended build height: {why}");
+    let tallest_m = tallest(&hints.tall_models)
+        .max(tallest(&hints.tall_structures))
+        .max(overture.get().unwrap_or(0.0));
+    Some(RaisedFor {
+        terrain_top_y: base,
+        tallest_blocks: (tallest_m * args.scale).ceil() as i32,
+        overture_pending: hints.overture_follows && overture.get().is_none(),
+    })
+}
+
+/// After the terrain fit: a run that picked its build height from the area takes the one
+/// its ground settled on, checked again against the disk, and a new Java world gets the
+/// datapack that declares an extended height. A One World installs its pack when it is made.
+pub fn settle_build_height(
+    args: &mut Args,
+    ground: &Ground,
+    bbox: &LLBBox,
+    format: crate::world_editor::WorldFormat,
+    disk_dir: &std::path::Path,
+    new_java_world: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let auto = auto_height(args) && ground.extended_ceiling;
+    // Whether the terrain itself outgrew vanilla's column, rather than a building on it.
+    let vanilla = ground_level_range(args, false);
+    let terrain_taller = ground.base_level() < *vanilla.start()
+        || crate::world_editor::common::terrain_top_y() > *vanilla.end();
+    // Only a height the area picked could be kept vanilla instead: the forcing flag or a base
+    // outside vanilla's range chose theirs.
+    let compressible = auto && vanilla.contains(&args.ground_level);
+    let instead = match (compressible, terrain_taller) {
+        (false, _) => "",
+        (true, true) => " Use --vanilla-height to compress the terrain instead.",
+        (true, false) => {
+            " Use --vanilla-height to keep the vanilla height, which cuts taller buildings off at Y 319."
+        }
+    };
+    if auto {
+        args.disable_height_limit = true;
+        // Caves and filled ground grow with the terrain; under a tower alone they reach only
+        // 64 blocks deeper, which the disk headroom covers.
+        if terrain_taller {
+            crate::world_utils::check_disk_for_extended_height(args, bbox, format, disk_dir)
+                .map_err(|e| {
+                    let keep = if compressible {
+                        "; keep the vanilla height to compress the terrain instead"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{e} The area needs the extended build height, which makes the world \
+                         larger{keep}."
+                    )
+                })?;
+        }
+        if args.bedrock {
+            println!(
+                "Note: the world carries a behavior pack that extends the build height \
+                 (Bedrock 1.21.120+).{instead}"
+            );
+        }
+        crate::progress::emit_gui_progress_update(
+            crate::progress::MESSAGE_ONLY,
+            "Extended build height: this area needs more room than vanilla Minecraft has",
+        );
+    }
+    let Some(dir) = new_java_world else {
+        return Ok(());
+    };
+    if !args.disable_height_limit || args.one_world_run.is_some() {
+        return Ok(());
+    }
+    let (min_y, max_y) = (
+        crate::world_editor::min_y(),
+        crate::world_editor::world_max_y(),
+    );
+    crate::world_utils::install_tall_datapack(dir, min_y, max_y)
+        .map_err(|e| format!("Failed to install tall-world datapack: {e}"))?;
+    println!(
+        "Note: added the tall-world datapack for Y {min_y} to {max_y} (Minecraft 1.21.4+). The \
+         first load asks about experimental features, and the world can't be uploaded to \
+         Realms.{instead}"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1492,6 +1888,9 @@ mod tests {
                 slope_correction: 1.0,
                 ground_level: 0,
                 soft_top: None,
+                extended_ceiling: false,
+                raised_for: None,
+                halo: None,
             }),
             land_cover: None,
             canopy: None,
@@ -1502,6 +1901,8 @@ mod tests {
             climate: crate::climate::Climate::Temperate,
             body: CelestialBody::Earth,
             ecoregions: None,
+            winter: false,
+            origin: (0, 0),
         }
     }
 
@@ -1530,9 +1931,18 @@ mod tests {
         );
         // A cell straddling the two averages only over what was measured.
         assert_eq!(ground.canopy_fraction(XZPoint::new(0, 2), 2), Some(1.0));
+        // The early-out probe agrees with the full scan.
+        for (x, z, span) in [(0, 0, 2), (2, 0, 2), (0, 3, 1), (0, 0, 0)] {
+            let o = XZPoint::new(x, z);
+            assert_eq!(
+                ground.canopy_measured(o, span),
+                ground.canopy_cell(o, span).is_some()
+            );
+        }
         // Without a canopy grid there is nothing to say.
         ground.canopy = None;
         assert_eq!(ground.canopy_fraction(XZPoint::new(0, 0), 2), None);
+        assert!(!ground.canopy_measured(XZPoint::new(0, 0), 2));
     }
 
     // Flat mode (no elevation) still maps land-cover lookups via the stored world dims, with edge clamping.
@@ -1542,10 +1952,9 @@ mod tests {
         let lc = LandCoverData {
             grid: vec![vec![LC_WATER, 10], vec![10, 10]],
             water_distance: vec![vec![1, 0], vec![0, 0]],
-            water_blend_cache: once_cell::sync::OnceCell::with_value(vec![
-                vec![1.0, 0.0],
-                vec![0.0, 0.0],
-            ]),
+            water_blend_cache: once_cell::sync::OnceCell::new(),
+            beach_tiles: once_cell::sync::OnceCell::new(),
+            inland_water: Default::default(),
             width: 2,
             height: 2,
             cells_per_meter: 1.0,
@@ -1558,6 +1967,34 @@ mod tests {
         // Out-of-range coords clamp to the last grid cell instead of panicking.
         assert_eq!(ground.cover_class(XZPoint::new(1000, 1000)), 10);
         assert_eq!(ground.water_distance(XZPoint::new(1000, 1000)), 0);
+    }
+
+    // So a building across a One World seam stands on the same ground in both areas.
+    #[test]
+    fn lookups_past_a_cropped_area_read_the_margin_it_was_fetched_with() {
+        // x + 100 z over a 10 x 8 fetch, cropped by 2 on every side.
+        let padded: Vec<Vec<f32>> = (0..8)
+            .map(|z| (0..10).map(|x| (x + 100 * z) as f32).collect())
+            .collect();
+        let mut g = ground_with(padded);
+        let data = g.elevation_data.as_mut().unwrap();
+        data.crop(2, 2, 6, 4);
+        // Inside, the cropped grid answers, as the later passes left it.
+        data.heights[0][0] = -1.0;
+        assert_eq!(g.level(XZPoint::new(0, 0)), -1);
+        assert_eq!(g.level(XZPoint::new(3, 2)), 405);
+        assert_eq!(g.level(XZPoint::new(-1, 0)), 201);
+        assert_eq!(g.level(XZPoint::new(6, 1)), 308);
+        assert_eq!(g.level(XZPoint::new(2, -2)), 4);
+        assert_eq!(g.level_exact(XZPoint::new(7, 5)), 709.0);
+        assert_eq!(g.level(XZPoint::new(-50, 1)), 300);
+
+        // Without a margin the edge repeats.
+        let edge = ground_with(ramp(1.0));
+        assert_eq!(
+            edge.level(XZPoint::new(-3, 4)),
+            edge.level(XZPoint::new(0, 4))
+        );
     }
 
     // Water snaps to the local floor over small DEM steps, but not across a real cliff.
@@ -1607,6 +2044,9 @@ mod tests {
             slope_correction: 1.0,
             ground_level: 0,
             soft_top: None,
+            extended_ceiling: false,
+            raised_for: None,
+            halo: None,
         };
         // 46 deg snow line is 3000 m; at 0.1 block/m from min 0 m, ground 64 => Y 364.
         assert_eq!(snow_threshold_for(&ed(0.0, 0.1), 46.0, 64), 364);
@@ -1717,6 +2157,67 @@ mod tests {
     }
 
     #[test]
+    fn a_raised_area_gets_only_the_sections_it_reaches() {
+        let raised = |terrain_top_y, tallest_blocks| RaisedFor {
+            terrain_top_y,
+            tallest_blocks,
+            overture_pending: false,
+        };
+        // A flat city with one 400-block tower: the bedrock floor the base already had,
+        // and a ceiling over the tower instead of at 2031.
+        assert_eq!(sized_world_bounds(-62, raised(-40, 400)), (-128, 399));
+        // Mountains to Y 1661 with a 146-block tower somewhere: the props' room wins.
+        assert_eq!(sized_world_bounds(-62, raised(1661, 146)), (-128, 1871));
+        // A base the fit sank keeps its 64 blocks of ground, on a section boundary.
+        assert_eq!(sized_world_bounds(-1500, raised(1900, 0)).0, -1568);
+        // Never more than the pack can declare, never less than vanilla.
+        assert_eq!(sized_world_bounds(-2030, raised(2000, 300)), (-2032, 2031));
+        assert_eq!(sized_world_bounds(-62, raised(-50, 0)), (-128, 319));
+        assert_eq!(sized_world_bounds(100, raised(120, 0)).0, -64);
+        for base in [-2030, -700, -62, 0, 64] {
+            for top in [-60, 0, 319, 777, 1500, 2031] {
+                let (min, max) = sized_world_bounds(base, raised(top, 50));
+                assert_eq!(min.rem_euclid(16), 0);
+                assert_eq!(max.rem_euclid(16), 15);
+                assert!(min <= base - 2 || min == -2032);
+                assert!(max >= top + 50 || max == 2031);
+            }
+        }
+    }
+
+    #[test]
+    fn the_prop_headroom_clears_every_bundled_structure() {
+        // Landmarks count as tall models in the fit (`landmarks::tall_models_in`); every
+        // other bundled schematic has to fit in the margin.
+        let mut paths = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from("assets/structures")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n != "landmarks") {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "schem") {
+                    paths.push(path);
+                }
+            }
+        }
+        assert!(paths.len() > 40, "found only {} schematics", paths.len());
+        for path in paths {
+            let schem =
+                crate::structures::schematic::load_structure(&std::fs::read(&path).unwrap())
+                    .unwrap();
+            let height = schem.voxels.iter().map(|v| v.1).max().unwrap_or(0) + 1;
+            assert!(
+                height + 1 < PROP_HEADROOM,
+                "{} is {height} blocks tall",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn the_extended_ceiling_agrees_with_the_declared_world_top() {
         use clap::Parser;
         let args = |extra: &[&str]| {
@@ -1747,6 +2248,99 @@ mod tests {
             crate::world_editor::DEFAULT_MAX_Y
         );
         assert_eq!(world_top_y_for(&luanti), crate::world_editor::DEFAULT_MAX_Y);
+
+        // A world whose pack was sized keeps that size when generated into again.
+        let mut existing = args(&[]);
+        existing.tall_range = Some((-128, 399));
+        assert_eq!(extended_min_y_for(&existing), -128);
+        assert_eq!(world_top_y_for(&existing), 399);
+        assert_eq!(extended_max_y_for(&existing), 399);
+    }
+
+    fn parse(extra: &[&str]) -> Args {
+        use clap::Parser;
+        let mut cmd = vec!["arnis", "--output-dir", ".", "--bbox", "1,2,3,4"];
+        cmd.extend_from_slice(extra);
+        Args::parse_from(cmd.iter())
+    }
+
+    #[test]
+    fn the_terrain_fit_picks_the_height_unless_it_is_fixed() {
+        let (height, taller) = height_choice(&parse(&[]));
+        assert!(!height.extended);
+        assert_eq!(height.min_y, crate::world_editor::DEFAULT_MIN_Y);
+        assert_eq!(
+            taller,
+            Some(WorldHeight {
+                min_y: -2032,
+                min_ground_level: -2030,
+                extended: true,
+                extended_max_y: 2031,
+            })
+        );
+        // Bedrock's pack raises only the ceiling.
+        assert_eq!(
+            height_choice(&parse(&["--bedrock"])).1,
+            Some(WorldHeight {
+                min_y: crate::world_editor::DEFAULT_MIN_Y,
+                min_ground_level: -62,
+                extended: true,
+                extended_max_y: 512,
+            })
+        );
+
+        for fixed in [
+            &["--vanilla-height"][..],
+            &["--disable-height-limit"][..],
+            &["--luanti"][..],
+            &["--body", "moon"][..],
+            &["--one-world"][..],
+        ] {
+            assert!(!auto_height(&parse(fixed)), "{fixed:?}");
+            assert_eq!(height_choice(&parse(fixed)).1, None, "{fixed:?}");
+        }
+        assert!(
+            height_choice(&parse(&["--disable-height-limit"]))
+                .0
+                .extended
+        );
+        assert!(!height_choice(&parse(&["--vanilla-height"])).0.extended);
+
+        // A base vanilla cannot hold settles it before the fetch.
+        for level in ["305", "-63"] {
+            let (height, taller) = height_choice(&parse(&["--ground-level", level]));
+            assert!(height.extended && taller.is_none(), "{level}");
+        }
+    }
+
+    #[test]
+    fn settling_takes_the_fit_and_installs_the_pack_only_when_needed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bbox = LLBBox::new(48.0, 11.0, 48.001, 11.001).unwrap();
+        let java = crate::world_editor::WorldFormat::JavaAnvil;
+        let pack = crate::world_utils::has_tall_datapack;
+        let settle = |extra: &[&str], tall: bool| {
+            let world =
+                std::path::PathBuf::from(crate::world_utils::create_new_world(tmp.path()).unwrap());
+            let mut args = parse(extra);
+            let mut ground = Ground::new_flat(-62);
+            ground.extended_ceiling = tall;
+            settle_build_height(&mut args, &ground, &bbox, java, tmp.path(), Some(&world)).unwrap();
+            (args.disable_height_limit, pack(&world))
+        };
+
+        assert_eq!(settle(&[], false), (false, false));
+        assert_eq!(settle(&[], true), (true, true));
+        assert_eq!(settle(&["--vanilla-height"], true), (false, false));
+        assert_eq!(settle(&["--disable-height-limit"], false), (true, true));
+
+        // Bedrock carries its pack in the .mcworld, so only the flag changes.
+        let mut args = parse(&["--bedrock"]);
+        let mut ground = Ground::new_flat(-62);
+        ground.extended_ceiling = true;
+        let bedrock = crate::world_editor::WorldFormat::BedrockMcWorld;
+        settle_build_height(&mut args, &ground, &bbox, bedrock, tmp.path(), None).unwrap();
+        assert!(args.disable_height_limit);
     }
 }
 
@@ -1768,6 +2362,39 @@ pub(crate) mod test_support {
             world_width,
             world_height,
         )
+    }
+
+    /// Flat ground at `level`, its land cover water where `water` says and grassland elsewhere.
+    pub(crate) fn ground_with_water(
+        width: usize,
+        height: usize,
+        level: f32,
+        water: impl Fn(usize, usize) -> bool,
+    ) -> Ground {
+        let grid = (0..height)
+            .map(|z| {
+                (0..width)
+                    .map(|x| {
+                        if water(x, z) {
+                            land_cover::LC_WATER
+                        } else {
+                            land_cover::LC_GRASSLAND
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let lc = LandCoverData {
+            grid,
+            water_distance: vec![vec![0u8; width]; height],
+            water_blend_cache: once_cell::sync::OnceCell::new(),
+            beach_tiles: once_cell::sync::OnceCell::new(),
+            inland_water: Default::default(),
+            width,
+            height,
+            cells_per_meter: 1.0,
+        };
+        ground_with_land_cover_and_heights(lc, vec![vec![level; width]; height], width, height)
     }
 
     /// `ground_with_land_cover_and_elevation` over the given terrain, in blocks.
@@ -1793,6 +2420,9 @@ pub(crate) mod test_support {
                 slope_correction: 1.0,
                 ground_level: 0,
                 soft_top: None,
+                extended_ceiling: false,
+                raised_for: None,
+                halo: None,
             }),
             land_cover: Some(land_cover),
             canopy: None,
@@ -1803,6 +2433,8 @@ pub(crate) mod test_support {
             climate: crate::climate::Climate::Temperate,
             body: CelestialBody::Earth,
             ecoregions: None,
+            winter: false,
+            origin: (0, 0),
         }
     }
 }
@@ -1818,7 +2450,6 @@ mod frame_tests {
             mercator: Some(WebMercatorProjection::new(48.1372, 11.5755, 1.0)),
             pad_blocks: pad,
             affine: AffinePolicy::Fit,
-            climate_anchor: Some((48.1372, 11.5755)),
         }
     }
 

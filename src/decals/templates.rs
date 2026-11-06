@@ -87,9 +87,17 @@ fn fit_or_abbreviate(
     if let Some(l) = fit_text(text, max_w, max_h, largest, wrap) {
         return Some(l);
     }
-    if let Some(short) = abbreviate(text) {
-        if let Some(l) = fit_text(&short, max_w, max_h, largest, wrap) {
+    let short = abbreviate(text);
+    if let Some(short) = &short {
+        if let Some(l) = fit_text(short, max_w, max_h, largest, wrap) {
             return Some(l);
+        }
+    }
+    if wrap {
+        for candidate in short.as_deref().into_iter().chain([text]) {
+            if let Some(l) = fit_truncated_two_lines(candidate, max_w, max_h, largest) {
+                return Some(l);
+            }
         }
     }
     // Last resort: truncate with an ellipsis so the plate is never blank.
@@ -100,6 +108,114 @@ fn fit_or_abbreviate(
         if let Some(l) = fit_text(&s, max_w, max_h, largest, false) {
             return Some(l);
         }
+    }
+    None
+}
+
+/// Fewest letters of a cut word on either line, so neither is an orphan.
+const MIN_CARRIED: usize = 3;
+
+/// True if a line may end right before `chars[i]`.
+fn breaks_before(chars: &[char], i: usize) -> bool {
+    chars[i].is_whitespace() || matches!(chars[i - 1], '-' | '/')
+}
+
+/// Fills two lines and truncates only the second one with an ellipsis.
+fn fit_truncated_two_lines(
+    text: &str,
+    max_w: i32,
+    max_h: i32,
+    largest: FontSize,
+) -> Option<TextLayout> {
+    let chars: Vec<char> = text.trim().chars().collect();
+    if chars.len() < 2 {
+        return None;
+    }
+
+    for &size in FontSize::ALL.iter().rev() {
+        if size > largest {
+            continue;
+        }
+        let font = Font::get(size);
+        if font.line_height() * 2 > max_h {
+            continue;
+        }
+
+        let mut first_end = 0;
+        for end in 1..chars.len() {
+            let candidate: String = chars[..end].iter().collect();
+            if font.width(&candidate, 1) > max_w {
+                break;
+            }
+            first_end = end;
+        }
+        if first_end == 0 {
+            continue;
+        }
+        // Break at the last space, '-' or '/' that fits, else cut the word with a hyphen.
+        let (line1, mut rest_start) =
+            if let Some(i) = (1..=first_end).rev().find(|&i| breaks_before(&chars, i)) {
+                let line1: String = chars[..i].iter().collect();
+                (line1.trim_end().to_string(), i)
+            } else {
+                let word_end = chars[first_end..]
+                    .iter()
+                    .position(|&c| c.is_whitespace() || matches!(c, '-' | '/'))
+                    .map_or(chars.len(), |p| first_end + p);
+                let last_cut = first_end.min(word_end.saturating_sub(MIN_CARRIED));
+                let cut = (MIN_CARRIED..=last_cut).rev().find(|&i| {
+                    let line1: String = chars[..i].iter().collect();
+                    font.width(&(line1 + "-"), 1) <= max_w
+                });
+                let Some(cut) = cut else {
+                    continue;
+                };
+                (chars[..cut].iter().collect::<String>() + "-", cut)
+            };
+        while rest_start < chars.len() && chars[rest_start].is_whitespace() {
+            rest_start += 1;
+        }
+        if rest_start >= chars.len() {
+            continue;
+        }
+
+        // A different word break may allow the complete remainder to fit.
+        let remainder: String = chars[rest_start..].iter().collect();
+        if font.width(&remainder, 1) <= max_w {
+            return Some(TextLayout {
+                size,
+                scale: 1,
+                lines: vec![line1, remainder],
+            });
+        }
+
+        let mut second_end = rest_start;
+        for end in rest_start + 1..=chars.len() {
+            let mut candidate: String = chars[rest_start..end]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            candidate.push('…');
+            if font.width(&candidate, 1) > max_w {
+                break;
+            }
+            second_end = end;
+        }
+        if second_end == rest_start {
+            continue;
+        }
+        let mut line2 = chars[rest_start..second_end]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        line2.push('…');
+        return Some(TextLayout {
+            size,
+            scale: 1,
+            lines: vec![line1, line2],
+        });
     }
     None
 }
@@ -120,7 +236,8 @@ pub fn text_sign(canvas: &mut Canvas, style: TextStyle, text: &str) {
                 (DARK_GRAY, GOLD, GOLD),
             ];
             let (plate, fg, border) = schemes[(str_hash(text) % 6) as usize];
-            let (y0, h) = (30, 68);
+            // Tall enough for two lines at 28 px.
+            let (y0, h) = (24, 80);
             canvas.rounded_rect(4, y0, w - 8, h, 6, plate);
             canvas.stroke_rounded_rect(4, y0, w - 8, h, 6, 2, border);
             if let Some(layout) = fit_or_abbreviate(text, w - 24, h - 12, FontSize::S44, true) {
@@ -180,9 +297,12 @@ pub fn text_sign(canvas: &mut Canvas, style: TextStyle, text: &str) {
         }
         TextStyle::StopName => {
             let (y0, h) = (46, 36);
-            canvas.rounded_rect(4, y0, w - 8, h, 3, WHITE);
-            canvas.stroke_rounded_rect(4, y0, w - 8, h, 3, 2, DARK_GRAY);
-            if let Some(layout) = fit_or_abbreviate(text, w - 20, h - 8, FontSize::S28, false) {
+            canvas.rounded_rect(0, y0, w, h, 3, WHITE);
+            canvas.stroke_rounded_rect(0, y0, w, h, 3, 2, DARK_GRAY);
+            // Two lines of the smallest font need 30 px. Keep them inside the existing
+            // 36 px plate and use its width before truncating long stop names. Glyphs
+            // overhang their advance by up to 1 px, so w - 6 keeps them off the border.
+            if let Some(layout) = fit_or_abbreviate(text, w - 6, h - 4, FontSize::S28, true) {
                 layout.draw_centered(canvas, cx, y0 + h / 2, BLACK);
             }
         }
@@ -289,19 +409,25 @@ pub fn traffic_sign(canvas: &mut Canvas, sign: TrafficSign) {
             canvas.fill_rect(30, 28, 68, 14, RED);
         }
         TrafficSign::LevelCrossing => {
-            // Saint Andrew's cross: two white boards with red tips.
+            // Saint Andrew's cross: white boards edged in red. Both reds go down first so
+            // the white centres join where the boards cross.
+            let board = |half_len: f32, half_w: f32, flip: f32| -> Vec<(f32, f32)> {
+                let (s, c) = (0.62f32.sin() * flip, 0.62f32.cos());
+                [
+                    (-half_len, -half_w),
+                    (half_len, -half_w),
+                    (half_len, half_w),
+                    (-half_len, half_w),
+                ]
+                .iter()
+                .map(|(x, y)| (64.0 + x * c - y * s, 64.0 + x * s + y * c))
+                .collect()
+            };
             for flip in [1.0f32, -1.0] {
-                let pts: Vec<(f32, f32)> = [(-56.0, -8.0), (56.0, -8.0), (56.0, 8.0), (-56.0, 8.0)]
-                    .iter()
-                    .map(|(x, y)| {
-                        let (s, c) = (0.62f32.sin() * flip, 0.62f32.cos());
-                        (64.0 + x * c - y * s, 64.0 + x * s + y * c)
-                    })
-                    .collect();
-                canvas.polygon(&pts, WHITE);
+                canvas.polygon(&board(58.0, 11.0, flip), RED);
             }
-            for (x, y) in [(14, 33), (114, 33), (14, 95), (114, 95)] {
-                canvas.disc(x, y, 7, RED);
+            for flip in [1.0f32, -1.0] {
+                canvas.polygon(&board(53.0, 6.0, flip), WHITE);
             }
         }
         TrafficSign::HighVoltage => {
@@ -346,14 +472,16 @@ pub fn traffic_sign(canvas: &mut Canvas, sign: TrafficSign) {
 pub fn speed_limit(canvas: &mut Canvas, value: u16, mph: bool, style: SpeedStyle) {
     let text = value.to_string();
     if style != SpeedStyle::Disc {
-        canvas.rounded_rect(24, 6, 80, 116, 3, WHITE);
-        canvas.stroke_rounded_rect(24, 6, 80, 116, 3, 3, BLACK);
+        // 4:5 like the real plates, wide enough for the legend at 18 px.
+        canvas.rounded_rect(18, 6, 92, 116, 3, WHITE);
+        canvas.stroke_rounded_rect(18, 6, 92, 116, 3, 3, BLACK);
         let small = Font::get(FontSize::S12);
         if style == SpeedStyle::CaPlate {
             small.draw_centered(canvas, 64, 22, "MAXIMUM", BLACK, 1);
         } else {
-            small.draw_centered(canvas, 64, 14, "SPEED", BLACK, 1);
-            small.draw_centered(canvas, 64, 30, "LIMIT", BLACK, 1);
+            let legend = Font::get(FontSize::S18);
+            legend.draw_centered(canvas, 64, 12, "SPEED", BLACK, 1);
+            legend.draw_centered(canvas, 64, 34, "LIMIT", BLACK, 1);
         }
         let size = if text.len() > 2 {
             FontSize::S28
@@ -387,11 +515,13 @@ pub fn route_shield(canvas: &mut Canvas, style: ShieldStyle, text: &str) {
     let (cx, cy) = (64, 64);
     let fit = |max_w: i32, max_h: i32| fit_text(text, max_w, max_h, FontSize::S44, false);
     match style {
-        ShieldStyle::Blue | ShieldStyle::Yellow | ShieldStyle::Green => {
+        ShieldStyle::Blue | ShieldStyle::Yellow | ShieldStyle::Green | ShieldStyle::WhitePlate => {
             let (plate, fg, border) = match style {
                 ShieldStyle::Blue => (BLUE, WHITE, WHITE),
                 ShieldStyle::Yellow => (YELLOW, BLACK, BLACK),
-                _ => (SIGN_GREEN, WHITE, WHITE),
+                ShieldStyle::WhitePlate => (WHITE, BLACK, BLACK),
+                // UK primary routes print the number in yellow on green.
+                _ => (SIGN_GREEN, YELLOW, WHITE),
             };
             let (w, h) = (110, 64);
             canvas.rounded_rect(cx - w / 2, cy - h / 2, w, h, 6, plate);
@@ -482,6 +612,65 @@ mod tests {
     }
 
     #[test]
+    fn truncated_first_line_keeps_a_word_that_ends_at_the_edge() {
+        // The first line is exactly as wide as "Alte Reichenbacher", so the space after it
+        // no longer fits; the word must stay on the line.
+        let max_w = Font::get(FontSize::S12).width("Alte Reichenbacher", 1);
+        let layout = fit_truncated_two_lines(
+            "Alte Reichenbacher Straße Nordwestlicher Abschnitt",
+            max_w,
+            32,
+            FontSize::S12,
+        )
+        .unwrap();
+        assert_eq!(layout.lines[0], "Alte Reichenbacher");
+        assert!(layout.lines[1].ends_with('…'));
+    }
+
+    #[test]
+    fn long_words_break_at_hyphens_and_slashes() {
+        let blade = |name| fit_truncated_two_lines(name, 128 - 20, 44 - 8, FontSize::S28).unwrap();
+        assert_eq!(
+            blade("Aaron-Bernstein-Platz").lines,
+            ["Aaron-", "Bernstein-Platz"]
+        );
+        assert_eq!(
+            blade("Georgenstraße/Am Kupfergraben").lines[0],
+            "Georgenstraße/"
+        );
+    }
+
+    #[test]
+    fn a_word_cut_mid_way_carries_no_orphan() {
+        let blade = |name| fit_truncated_two_lines(name, 128 - 20, 44 - 8, FontSize::S28);
+        assert_eq!(
+            blade("Bethaniendamm").unwrap().lines,
+            ["Bethaniend-", "amm"]
+        );
+        assert_eq!(
+            blade("Friedrichsbrücke").unwrap().lines,
+            ["Friedrichsbrü-", "cke"]
+        );
+        // Too short to cut without one; left to the one-line ellipsis.
+        let max_w = Font::get(FontSize::S12).width("Mitt", 1);
+        assert!(fit_truncated_two_lines("Mitte", max_w, 32, FontSize::S12).is_none());
+    }
+
+    #[test]
+    fn two_line_fallback_tries_the_abbreviation_first() {
+        // The balanced split of the short form is too wide, but the greedy one fits.
+        let layout = fit_or_abbreviate(
+            "Avenue de la Porte Chaumont",
+            128 - 20,
+            44 - 8,
+            FontSize::S28,
+            true,
+        )
+        .unwrap();
+        assert_eq!(layout.lines, ["Ave de la Porte", "Chaumont"]);
+    }
+
+    #[test]
     fn street_blade_keeps_margins_transparent() {
         let mut c = Canvas::new(1, 1);
         text_sign(
@@ -495,6 +684,56 @@ mod tests {
         assert_eq!(c.get(64, 124), TRANSPARENT);
         assert_eq!(c.get(64, 76), WHITE);
         assert!(inked(&c) > 3000);
+    }
+
+    #[test]
+    fn stop_name_uses_two_lines_without_truncating_when_it_fits() {
+        let name = "Zwickau, Zentralhaltestelle";
+        let layout = fit_or_abbreviate(name, 128 - 6, 36 - 4, FontSize::S28, true).unwrap();
+
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines.join(" "), name);
+    }
+
+    #[test]
+    fn stop_and_street_names_truncate_on_the_second_line() {
+        let name = "Alte Reichenbacher Str.";
+        for (max_w, max_h) in [(128 - 6, 36 - 4), (128 - 20, 44 - 8)] {
+            let layout = fit_or_abbreviate(name, max_w, max_h, FontSize::S28, true).unwrap();
+
+            assert_eq!(layout.lines.len(), 2);
+            assert!(!layout.lines[0].contains('…'));
+            assert!(layout.lines[1].ends_with('…'));
+            let visible = format!(
+                "{} {}",
+                layout.lines[0],
+                layout.lines[1].trim_end_matches('…')
+            );
+            assert!(name.starts_with(&visible));
+        }
+    }
+
+    #[test]
+    fn stop_name_text_stays_off_the_border() {
+        let mut plate = Canvas::new(1, 1);
+        plate.rounded_rect(0, 46, 128, 36, 3, WHITE);
+        plate.stroke_rounded_rect(0, 46, 128, 36, 3, 2, DARK_GRAY);
+        // J and f overhang their advance, so a line of them is filled up to the edge.
+        let filled = (1..40).map(|n| format!("J{}", "f".repeat(n)));
+        let names = [
+            "Varian-Fry-Straße/Potsdamer Platz",
+            "Friedrichstraße/Reinhardtstraße",
+            "Mollstraße/Otto-Braun-Straße",
+        ];
+        for name in names.into_iter().map(String::from).chain(filled) {
+            let mut c = Canvas::new(1, 1);
+            text_sign(&mut c, TextStyle::StopName, &name);
+            for x in [0, 1, 126, 127] {
+                for y in 46..82 {
+                    assert_eq!(c.get(x, y), plate.get(x, y), "{name:?} at ({x}, {y})");
+                }
+            }
+        }
     }
 
     #[test]
@@ -539,6 +778,7 @@ mod tests {
             ShieldStyle::Green,
             ShieldStyle::Interstate,
             ShieldStyle::White,
+            ShieldStyle::WhitePlate,
         ] {
             let mut c = Canvas::new(1, 1);
             route_shield(&mut c, style, "A 9");

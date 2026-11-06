@@ -3,15 +3,23 @@ use crate::element_processing::bridge_modules;
 use crate::element_processing::bridge_styles::{
     default_pylons, resolve_bridge_style_with_outline, BridgeOutlineIndex, BridgeStyle,
 };
-use crate::element_processing::highways::highway_block_range;
+use crate::element_processing::bridge_towers::{self, CableSpan, DEFAULT_SIDE_SPAN};
+use crate::element_processing::highways::{
+    highway_block_range, junction_level, road_profile, HighwayConnectivityMap,
+};
 use crate::element_processing::railways;
-use crate::osm_parser::{ProcessedElement, ProcessedWay};
+use crate::osm_parser::{ProcessedElement, ProcessedNode, ProcessedWay};
 use crate::world_editor::WorldEditor;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 const LAYER_HEIGHT_STEP: i32 = 6;
 const FLAT_TERRAIN_DIP_THRESHOLD: i32 = 4;
-const SHORT_BRIDGE_LENGTH_BLOCKS: usize = 30;
+/// A deck shorter than this, along its axis, stays at its ends' level over flat ground:
+/// two of the shortest 15-block ramps would leave it less than 10 level blocks between them.
+const SHORT_BRIDGE_LENGTH_BLOCKS: f32 = 40.0;
+/// A deck tagged as an arch lifts over flat ground for its curve from this length on.
+const ARCH_MIN_SPAN_BLOCKS: f32 = 30.0;
 const BRIDGE_NAME_FUSE_DISTANCE_BLOCKS: i32 = 200;
 const DUAL_CARRIAGEWAY_MAX_DISTANCE_BLOCKS: f32 = 12.0;
 const DUAL_CARRIAGEWAY_HEADING_TOLERANCE_DEG: f32 = 20.0;
@@ -28,7 +36,7 @@ const STREAM_HEADROOM: i32 = 2;
 /// Deck Y above a lower bridge deck this one crosses.
 const STACKED_DECK_HEADROOM: i32 = 6;
 /// Room an arch needs over flat ground for its curve to read.
-const ARCH_MIN_CLEARANCE: i32 = 8;
+pub(crate) const ARCH_MIN_CLEARANCE: i32 = 8;
 /// Steepest climb (blocks per cell) a clearance may force from a deck end.
 const MAX_CLEARANCE_SLOPE: f32 = 1.0;
 /// How far a member may double back along its group's axis and still share one profile.
@@ -37,10 +45,19 @@ const PROFILE_MONOTONIC_TOLERANCE: f32 = 2.0;
 const OBSTACLE_GRID_CELL: i32 = 64;
 /// A deck at least this far below another in the same column is a separate, lower level.
 const LOWER_DECK_GAP: i32 = STACKED_DECK_HEADROOM - 1;
+/// A way passing a mapped tower within its half width plus this (blocks) runs through it.
+const TOWER_PASS_MARGIN: i32 = 12;
+/// Lesser piers this close (metres) to a structure can end its side spans.
+const SIDE_PIER_REACH_M: f64 = 30.0;
+/// A same-named approach this close (metres) to a mapped tower belongs to its bridge.
+const APPROACH_REACH_M: f64 = 1500.0;
 /// Rows a deck's own structure reaches below its surface.
 const DECK_STRUCTURE_DEPTH: i32 = 2;
 /// How far off a road deck a rail bridge's track may run and still ride on it.
 const RAIL_ON_DECK_REACH: i32 = 2;
+/// Track spacing up to which parallel rail decks are decked over as one.
+const RAIL_SIDE_BY_SIDE_DISTANCE: f32 =
+    (2 * railways::RAIL_DECK_HALF_WIDTH + 1 + railways::RAIL_DECK_GAP_FILL) as f32 + 0.5;
 
 fn is_non_vehicular_bridge_highway(highway: &str) -> bool {
     matches!(
@@ -63,6 +80,8 @@ pub struct BridgeMemberInfo {
     pub covered_by_wider: bool,
     // Cable spans: pylon positions from the main span; None stands on piers.
     pub cable_pylons: Option<Vec<(i32, i32)>>,
+    // Cables hung from towers mapped in OSM; where set, piers stand only outside it.
+    pub cable_span: Option<Arc<CableSpan>>,
 }
 
 impl BridgeMemberInfo {
@@ -76,38 +95,72 @@ impl BridgeMemberInfo {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct BridgeRampInfo {
-    // True if way.nodes[0] is the bridge-side end; false if way.nodes[len-1] is.
-    pub bridge_side_at_start: bool,
-    pub deck_y: i32,
-    pub ground_y: i32,
+    // Surface Y per centerline cell, indexed like the renderer's cumulative bresenham walk.
+    ys: Vec<i32>,
 }
 
 impl BridgeRampInfo {
-    pub fn y_at(&self, tds: usize, total_bresenham: usize) -> i32 {
-        if total_bresenham == 0 {
-            return self.deck_y;
-        }
-        let last_idx = total_bresenham - 1;
-        let denom = last_idx.max(1) as f32;
-        let (start_y, end_y) = if self.bridge_side_at_start {
-            (self.deck_y, self.ground_y)
-        } else {
-            (self.ground_y, self.deck_y)
-        };
-        let t = (tds as f32 / denom).min(1.0);
-        let span = (end_y - start_y) as f32;
-        (start_y as f32 + span * t).round() as i32
+    /// Surface Y at centerline cell `tds`; cells past the end keep the last value.
+    pub fn y_at(&self, tds: usize) -> i32 {
+        self.ys
+            .get(tds)
+            .or(self.ys.last())
+            .copied()
+            .unwrap_or_default()
     }
+
+    /// Surface Y per centerline cell.
+    pub fn ys(&self) -> &[i32] {
+        &self.ys
+    }
+}
+
+/// Decks leaving a node within a fan this wide can all end there.
+const EDGE_MAX_FAN: f32 = std::f32::consts::TAU / 3.0;
+/// How far round from the nearest deck a road must leave such a node to land on it.
+const EDGE_ROAD_MARGIN: f32 = std::f32::consts::FRAC_PI_4;
+
+/// Cells a ramp runs at most per block it falls, so a long embankment way meets the ground.
+const RAMP_RUN_PER_BLOCK: f32 = 8.0;
+
+/// A ramp's surface: a straight grade from `deck_y` at the bridge end down to where `ground`
+/// leaves the ramp's far end, never below `ground`.
+fn ramp_profile(ground: &[i32], deck_y: i32, bridge_side_at_start: bool) -> Vec<i32> {
+    let n = ground.len();
+    let foot = if bridge_side_at_start {
+        ground[n - 1]
+    } else {
+        ground[0]
+    };
+    let last = n.saturating_sub(1).max(1) as f32;
+    let fall = ((deck_y - foot) as f32 / last).max(1.0 / RAMP_RUN_PER_BLOCK);
+    ground
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| {
+            let from_deck = if bridge_side_at_start { i } else { n - 1 - i };
+            let grade = (deck_y as f32 - fall * from_deck as f32).round() as i32;
+            grade.max(g)
+        })
+        .collect()
 }
 
 /// How a rail bridge way is carried.
 pub enum RailDeck {
-    /// Its own deck at one Y, shared by every way of the viaduct.
-    Level(i32),
+    /// Its own deck, at a level shared by every way of the viaduct and its side-by-side tracks.
+    Own(OwnRailDeck),
     /// Rides a road deck, at its Y per smoothed centerline cell.
     Carried(Vec<i32>),
+}
+
+pub struct OwnRailDeck {
+    /// Deck Y per smoothed centerline cell, ramps included.
+    pub ys: Vec<i32>,
+    // False where the way continues into another rail bridge.
+    pub start_is_boundary: bool,
+    pub end_is_boundary: bool,
 }
 
 pub struct BridgeStructureMap {
@@ -133,6 +186,7 @@ impl BridgeStructureMap {
     pub fn build(
         elements: &[ProcessedElement],
         editor: &WorldEditor,
+        connectivity: &HighwayConnectivityMap,
         outlines: &BridgeOutlineIndex,
         scale: f64,
     ) -> Self {
@@ -290,6 +344,26 @@ impl BridgeStructureMap {
             }
         }
 
+        // Highways leaving the bridge end nodes, for ends shared by several decks.
+        let mut roads_out: HashMap<(i32, i32), Vec<RoadOut>> = HashMap::new();
+        for way in other_highway_ways.iter().filter(|w| meets_a_deck(w)) {
+            let at_grade = !is_ramp_candidate(way);
+            let vehicular = !is_non_vehicular_bridge_highway(
+                way.tags.get("highway").map(String::as_str).unwrap_or(""),
+            );
+            for (k, n) in way.nodes.iter().enumerate() {
+                if node_to_bridge_indices.contains_key(&(n.x, n.z)) {
+                    roads_out.entry((n.x, n.z)).or_default().extend(
+                        leaving_dirs(&way.nodes, k).into_iter().map(|dir| RoadOut {
+                            dir,
+                            at_grade,
+                            vehicular,
+                        }),
+                    );
+                }
+            }
+        }
+
         let bounds = bridge_ways
             .iter()
             .chain(&rail_bridge_ways)
@@ -297,6 +371,27 @@ impl BridgeStructureMap {
             .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)))
             .unwrap_or_default();
         let obstacles = GradeObstacles::build(elements, scale, bounds);
+
+        let mapped = bridge_towers::collect(elements, editor, scale);
+        // Names of the bridges that run through a mapped tower.
+        let passes_tower = |w: &ProcessedWay| {
+            let reach = i64::from(way_half_width(w, scale) + TOWER_PASS_MARGIN).pow(2);
+            way_cells(w).iter().any(|&(x, z)| {
+                mapped
+                    .towers
+                    .iter()
+                    .any(|t| dist2((x, z), (t.x, t.z)) <= reach)
+            })
+        };
+        let tower_names: HashSet<&str> = if mapped.towers.is_empty() {
+            HashSet::new()
+        } else {
+            bridge_ways
+                .iter()
+                .filter(|w| passes_tower(w))
+                .flat_map(|w| bridge_names(w))
+                .collect()
+        };
 
         // Track ramp ways to make sure each ramp attaches to only one structure.
         let mut claimed_ramp_ways: HashSet<u64> = HashSet::new();
@@ -319,6 +414,64 @@ impl BridgeStructureMap {
                 group_nodes.extend(seen);
             }
             let is_boundary = |xz: (i32, i32)| node_members.get(&xz).copied().unwrap_or(0) <= 1;
+            // Where the area's clip cut a member: the bridge carries on past it.
+            let cut_ends: HashSet<(i32, i32)> = group_indices
+                .iter()
+                .flat_map(|&idx| {
+                    [
+                        bridge_ways[idx].nodes.first(),
+                        bridge_ways[idx].nodes.last(),
+                    ]
+                })
+                .flatten()
+                .filter(|n| crate::clipping::is_invented_node_id(n.id))
+                .map(|n| (n.x, n.z))
+                .collect();
+            // Ends where decks fork and a road leaves outside them: one at grade lands the decks,
+            // a raised one carries them on. A road deck forks only off a road.
+            let mut fork_landings: HashSet<(i32, i32)> = HashSet::new();
+            let mut fork_raised: HashSet<(i32, i32)> = HashSet::new();
+            for &idx in group_indices {
+                let w = bridge_ways[idx];
+                for n in [&w.nodes[0], &w.nodes[w.nodes.len() - 1]] {
+                    let xz = (n.x, n.z);
+                    let Some(roads) = roads_out.get(&xz).filter(|_| !is_boundary(xz)) else {
+                        continue;
+                    };
+                    let mut decks: Vec<(f32, f32)> = Vec::new();
+                    let mut vehicular = false;
+                    for &i in group_indices {
+                        let nodes = &bridge_ways[i].nodes;
+                        for (k, _) in nodes.iter().enumerate().filter(|(_, n)| (n.x, n.z) == xz) {
+                            decks.extend(leaving_dirs(nodes, k));
+                            vehicular |= !is_non_vehicular_bridge_highway(
+                                bridge_ways[i]
+                                    .tags
+                                    .get("highway")
+                                    .map(String::as_str)
+                                    .unwrap_or(""),
+                            );
+                        }
+                    }
+                    let leaves = |at_grade: bool| {
+                        let dirs: Vec<(f32, f32)> = roads
+                            .iter()
+                            .filter(|r| r.at_grade == at_grade && (r.vehicular || !vehicular))
+                            .map(|r| r.dir)
+                            .collect();
+                        leaves_outside(&decks, &dirs)
+                    };
+                    if leaves(true) {
+                        fork_landings.insert(xz);
+                    }
+                    if leaves(false) {
+                        fork_raised.insert(xz);
+                    }
+                }
+            }
+            let is_edge = |xz: (i32, i32)| {
+                is_boundary(xz) || fork_landings.contains(&xz) || fork_raised.contains(&xz)
+            };
             // An end shared with another structure is a joint in the air.
             let joins_other_bridge = |xz: (i32, i32)| {
                 node_to_bridge_indices
@@ -345,7 +498,7 @@ impl BridgeStructureMap {
                 .iter()
                 .map(|&i| way_cells(bridge_ways[i]))
                 .collect();
-            let terrain: Vec<Vec<i32>> = cells
+            let mut terrain: Vec<Vec<i32>> = cells
                 .iter()
                 .map(|cs| {
                     cs.iter()
@@ -353,16 +506,9 @@ impl BridgeStructureMap {
                         .collect()
                 })
                 .collect();
-            let Some(terrain_max) = terrain.iter().flatten().copied().max() else {
+            if terrain.iter().all(Vec::is_empty) {
                 continue;
-            };
-            let terrain_min = terrain
-                .iter()
-                .flatten()
-                .copied()
-                .min()
-                .unwrap_or(terrain_max);
-            let dip = terrain_max - terrain_min;
+            }
             let total_length: usize = group_indices
                 .iter()
                 .map(|&i| way_length_blocks(bridge_ways[i]))
@@ -423,8 +569,11 @@ impl BridgeStructureMap {
                 coverage_samples(way)
                     .iter()
                     .all(|&(px, pz)| lateral_offset_to_way(px, pz, other) <= threshold)
+                    && !continues_past(way, other)
             };
             let mut covered_ids: HashSet<u64> = HashSet::new();
+            // The member whose deck covers each covered one.
+            let mut cover_of: HashMap<usize, usize> = HashMap::new();
             // Survivors that absorbed an equal-width sibling sweep one size wider.
             let mut widened_ids: HashSet<u64> = HashSet::new();
             if structure_has_module && group_indices.len() > 1 {
@@ -444,6 +593,7 @@ impl BridgeStructureMap {
                     for &j in &order {
                         if covers(j, idx, &covered_ids) {
                             is_covered = true;
+                            cover_of.entry(idx).or_insert(j);
                             if member_range(j) == member_range(idx) {
                                 widened_ids.insert(bridge_ways[j].id);
                             }
@@ -472,11 +622,11 @@ impl BridgeStructureMap {
 
             // Tagged ramps carry the deck down; their start Y is filled in once known.
             let mut external_ramp_ends: HashSet<(i32, i32)> = HashSet::new();
-            let mut pending_ramps: Vec<(u64, bool, i32, (i32, i32))> = Vec::new();
+            let mut pending_ramps: Vec<(&ProcessedWay, bool, (i32, i32))> = Vec::new();
             for &idx in group_indices {
                 let (s, e) = ends(idx);
                 for xz in [s, e] {
-                    if !is_boundary(xz) || covered_boundaries.contains(&xz) {
+                    if !is_edge(xz) || covered_boundaries.contains(&xz) {
                         continue;
                     }
                     let Some(other_indices) = node_to_other_highways.get(&xz) else {
@@ -502,8 +652,7 @@ impl BridgeStructureMap {
                         if node_members.contains_key(&(far_node.x, far_node.z)) {
                             continue;
                         }
-                        let ground_y = editor.get_ground_level(far_node.x, far_node.z);
-                        pending_ramps.push((candidate.id, bridge_side_at_start, ground_y, xz));
+                        pending_ramps.push((candidate, bridge_side_at_start, xz));
                         claimed_ramp_ways.insert(candidate.id);
                         external_ramp_ends.insert(xz);
                     }
@@ -511,11 +660,32 @@ impl BridgeStructureMap {
             }
             // Where the deck has to come down to the terrain itself.
             let anchors_end = |xz: (i32, i32)| {
-                is_boundary(xz)
+                (is_boundary(xz) || fork_landings.contains(&xz))
+                    && !cut_ends.contains(&xz)
                     && !covered_boundaries.contains(&xz)
                     && !external_ramp_ends.contains(&xz)
                     && !joins_other_bridge(xz)
             };
+            // A road landing on the deck reaches that node at its junction level.
+            for (m, &idx) in group_indices.iter().enumerate() {
+                let (s, e) = ends(idx);
+                let last = cells[m].len().saturating_sub(1);
+                for (xz, i) in [(s, 0), (e, last)] {
+                    if anchors_end(xz) && connectivity.is_shared(xz.0, xz.1) {
+                        terrain[m][i] = junction_level(editor, xz.0, xz.1);
+                    }
+                }
+            }
+            let Some(terrain_max) = terrain.iter().flatten().copied().max() else {
+                continue;
+            };
+            let terrain_min = terrain
+                .iter()
+                .flatten()
+                .copied()
+                .min()
+                .unwrap_or(terrain_max);
+            let dip = terrain_max - terrain_min;
 
             // Profile axis: the two member ends furthest apart.
             let end_points: Vec<(i32, i32)> = group_indices
@@ -556,6 +726,20 @@ impl BridgeStructureMap {
                 .iter()
                 .map(|cs| cs.iter().map(|&(x, z)| along(x, z)).collect())
                 .collect();
+            // How far the deck reaches along its axis. Not the members' lengths summed, which
+            // counts a footbridge beside the road as more length; but no shorter than its
+            // longest member walks, or a curved ramp would measure only its chord.
+            let (u_min, u_max) = us
+                .iter()
+                .flatten()
+                .fold((f32::MAX, f32::MIN), |(lo, hi), &u| (lo.min(u), hi.max(u)));
+            let span = (u_max - u_min).max(0.0);
+            let longest_member = group_indices
+                .iter()
+                .map(|&i| way_length_blocks(bridge_ways[i]))
+                .max()
+                .unwrap_or(0);
+            let short = span.max(longest_member as f32) < SHORT_BRIDGE_LENGTH_BLOCKS;
             // A loop or hairpin maps two places onto one axis position; keep it level.
             let follows_axis = axis_len >= 1.0
                 && group_indices.iter().enumerate().all(|(m, &idx)| {
@@ -566,8 +750,10 @@ impl BridgeStructureMap {
             let mut reqs: Vec<(f32, f32)> = Vec::new();
             // Where the deck meets the terrain, as (axis position, terrain Y).
             let mut anchors: Vec<(f32, i32)> = Vec::new();
+            // The least each cell must stand at: its ground, what it clears, joints and free ends.
+            let mut needs: Vec<Vec<i32>> = terrain.clone();
             // Free ends (joints, tagged ramps) hold the deck's working level.
-            let mut free_end_us: Vec<f32> = Vec::new();
+            let mut free_ends: Vec<(usize, usize)> = Vec::new();
             let mut raised_top = terrain_max;
             for (m, &idx) in group_indices.iter().enumerate() {
                 if is_covered(idx) {
@@ -584,8 +770,9 @@ impl BridgeStructureMap {
                         anchors.push((us[m][i], joint_y));
                         reqs.push((us[m][i], joint_y as f32));
                         raised_top = raised_top.max(joint_y);
-                    } else if is_boundary(xz) && !covered_boundaries.contains(&xz) {
-                        free_end_us.push(us[m][i]);
+                        needs[m][i] = needs[m][i].max(joint_y);
+                    } else if is_edge(xz) && !covered_boundaries.contains(&xz) {
+                        free_ends.push((m, i));
                     }
                 }
             }
@@ -614,7 +801,9 @@ impl BridgeStructureMap {
                     let (nx, nz) = path[(i + 1).min(path.len() - 1)];
                     let heading = ((nx - px) as f32, (nz - pz) as f32);
                     for seg in obstacles.at(x, z) {
-                        if dist_to_segment(x as f32, z as f32, seg) > seg.reach
+                        // A short deck clears only what cannot pass under it at its level.
+                        if (short && !seg.must_clear)
+                            || dist_to_segment(x as f32, z as f32, seg) > seg.reach
                             || !crosses(heading, seg)
                         {
                             continue;
@@ -640,6 +829,7 @@ impl BridgeStructureMap {
                         let capped = (need as f32).min(reachable(u)).max(ground as f32);
                         reqs.push((u, capped));
                         raised_top = raised_top.max(capped.round() as i32);
+                        needs[m][i] = needs[m][i].max(capped.round() as i32);
                     }
                 }
             }
@@ -647,35 +837,30 @@ impl BridgeStructureMap {
             // Long flat spans rise to their layer, arches to their curve.
             let has_boundary_endpoint = group_indices.iter().any(|&idx| {
                 let (s, e) = ends(idx);
-                is_boundary(s) || is_boundary(e)
+                is_edge(s) || is_edge(e)
             });
-            let flat_span = has_boundary_endpoint
-                && dip < FLAT_TERRAIN_DIP_THRESHOLD
-                && total_length >= SHORT_BRIDGE_LENGTH_BLOCKS;
-            let mut clearance = if flat_span {
+            let flat = has_boundary_endpoint && dip < FLAT_TERRAIN_DIP_THRESHOLD;
+            let mut clearance = if flat && !short {
                 max_layer * LAYER_HEIGHT_STEP
             } else {
                 0
             };
-            if group_style == BridgeStyle::Arch && flat_span {
+            // A mapped arch shows its curve from a shorter span than layer ramps need.
+            if group_style == BridgeStyle::Arch && flat && span >= ARCH_MIN_SPAN_BLOCKS {
                 clearance = clearance.max(ARCH_MIN_CLEARANCE);
             }
             if clearance > 0 {
                 let plateau = terrain_max + clearance;
                 level_deck = level_deck.max(plateau);
-                let (u_min, u_max) = us
-                    .iter()
-                    .flatten()
-                    .fold((f32::MAX, f32::MIN), |(lo, hi), &u| (lo.min(u), hi.max(u)));
-                let span = (u_max - u_min).max(0.0);
                 let ramp = (span * 0.35).clamp(15.0, 50.0).min(span / 2.0);
                 let mut placed = false;
                 for (m, &idx) in group_indices.iter().enumerate() {
                     if is_covered(idx) {
                         continue;
                     }
-                    for &u in &us[m] {
+                    for (i, &u) in us[m].iter().enumerate() {
                         if anchor_us.iter().all(|&a| (u - a).abs() >= ramp) {
+                            needs[m][i] = needs[m][i].max(plateau);
                             reqs.push((u, plateau as f32));
                             placed = true;
                         }
@@ -686,8 +871,38 @@ impl BridgeStructureMap {
                 }
                 raised_top = raised_top.max(plateau);
             }
-            for &u in &free_end_us {
-                reqs.push((u, raised_top as f32));
+            for &(m, i) in &free_ends {
+                reqs.push((us[m][i], raised_top as f32));
+                needs[m][i] = needs[m][i].max(raised_top);
+            }
+
+            // Towers mapped in OSM along this suspension structure, in axis order.
+            let mut towers: Vec<(f32, &bridge_towers::MappedTower)> = Vec::new();
+            if group_style == BridgeStyle::Suspension && follows_axis {
+                let reach = i64::from(
+                    way_half_width_max(group_indices, &bridge_ways, scale) + TOWER_PASS_MARGIN,
+                )
+                .pow(2);
+                for t in &mapped.towers {
+                    let close = cells
+                        .iter()
+                        .flatten()
+                        .any(|&(x, z)| dist2((x, z), (t.x, t.z)) <= reach);
+                    if close {
+                        towers.push((along(t.x, t.z), t));
+                    }
+                }
+                towers.sort_by(|a, b| a.0.total_cmp(&b.0));
+                if towers.len() >= 2 {
+                    // The road runs through each portal at its mapped level.
+                    for &(u, t) in &towers {
+                        if let Some(y) = t.deck_y {
+                            reqs.push((u, y as f32));
+                        }
+                    }
+                } else {
+                    towers.clear();
+                }
             }
 
             let hull = if follows_axis {
@@ -710,51 +925,132 @@ impl BridgeStructureMap {
                 })
                 .collect();
 
-            // Ends below the profile ramp up inside the member.
+            // The ground each tagged ramp would follow at grade, so its foot meets the next road.
+            let ramp_grounds: Vec<Vec<i32>> = pending_ramps
+                .iter()
+                .map(|&(candidate, _, _)| {
+                    road_profile(
+                        editor,
+                        candidate,
+                        highway_block_range(
+                            candidate
+                                .tags
+                                .get("highway")
+                                .map(String::as_str)
+                                .unwrap_or(""),
+                            &candidate.tags,
+                            scale,
+                        ),
+                        connectivity,
+                        |x, z| {
+                            connectivity
+                                .is_shared(x, z)
+                                .then(|| junction_level(editor, x, z))
+                        },
+                    )
+                })
+                .collect();
+            // A short ramp can fall a block a cell at most; the deck comes down for the rest.
+            let mut ramp_caps: HashMap<(i32, i32), i32> = HashMap::new();
+            for (&(_, bridge_side_at_start, xz), ground) in pending_ramps.iter().zip(&ramp_grounds)
+            {
+                let Some(&foot) = (if bridge_side_at_start {
+                    ground.last()
+                } else {
+                    ground.first()
+                }) else {
+                    continue;
+                };
+                let cap = foot + ground.len() as i32 - 1;
+                ramp_caps
+                    .entry(xz)
+                    .and_modify(|c| *c = (*c).min(cap))
+                    .or_insert(cap);
+            }
+            // Where the deck is held: landings, joints to built structures and short ramps.
+            let mut holds: Vec<DeckHold> = Vec::new();
             for (m, &idx) in group_indices.iter().enumerate() {
-                let ys = &mut member_ys[m];
-                let total = ys.len();
-                if is_covered(idx) || total < 2 {
+                let Some(last) = member_ys[m]
+                    .len()
+                    .checked_sub(1)
+                    .filter(|_| !is_covered(idx))
+                else {
+                    continue;
+                };
+                let (s, e) = ends(idx);
+                for (xz, i) in [(s, 0), (e, last)] {
+                    let hold = if anchors_end(xz) {
+                        Some(terrain[m][i])
+                    } else if let Some(&joint_y) = resolved_joints.get(&xz) {
+                        Some(joint_y)
+                    } else {
+                        ramp_caps.get(&xz).map(|&cap| member_ys[m][i].min(cap))
+                    };
+                    if let Some(y) = hold {
+                        holds.push(DeckHold {
+                            member: m,
+                            cell: i,
+                            y,
+                        });
+                    }
+                }
+            }
+            // A covered carriageway landing on a road at grade brings down the deck over it,
+            // where nothing else holds that deck.
+            let slot = |idx: usize| group_indices.iter().position(|&i| i == idx);
+            for &idx in group_indices.iter().filter(|&&i| is_covered(i)) {
+                let highway = bridge_ways[idx].tags.get("highway").map(String::as_str);
+                if is_non_vehicular_bridge_highway(highway.unwrap_or("")) {
                     continue;
                 }
-                let (s, e) = ends(idx);
-                let ground_s = terrain[m][0];
-                let ground_e = terrain[m][total - 1];
-                let ramp_s = anchors_end(s) && ys[0] > ground_s + 1;
-                let ramp_e = anchors_end(e) && ys[total - 1] > ground_e + 1;
-                let cap = if ramp_s && ramp_e {
-                    (total / 2).max(1)
-                } else {
-                    total - 1
+                let Some(c) = cover_of.get(&idx).and_then(|&j| slot(j)) else {
+                    continue;
                 };
-                let len = ((total as f32 * 0.35).clamp(15.0, 50.0) as usize).clamp(1, cap);
-                if ramp_s {
-                    let top = ys[len];
-                    for (k, y) in ys.iter_mut().enumerate().take(len) {
-                        let t = k as f32 / len as f32;
-                        *y = (*y)
-                            .min((ground_s as f32 + (top - ground_s) as f32 * t).round() as i32);
+                let (s, e) = ends(idx);
+                for xz in [s, e] {
+                    let on_grade = roads_out.get(&xz).is_some_and(|roads| {
+                        roads.iter().any(|r| r.at_grade && r.vehicular)
+                            && roads.iter().all(|r| r.at_grade)
+                    });
+                    if !on_grade
+                        || !(is_boundary(xz) || fork_landings.contains(&xz))
+                        || external_ramp_ends.contains(&xz)
+                        || joins_other_bridge(xz)
+                    {
+                        continue;
+                    }
+                    let near = (0..cells[c].len()).min_by_key(|&k| dist2(cells[c][k], xz));
+                    if let Some(k) =
+                        near.filter(|&k| !holds.iter().any(|h| (h.member, h.cell) == (c, k)))
+                    {
+                        holds.push(DeckHold {
+                            member: c,
+                            cell: k,
+                            y: junction_level(editor, xz.0, xz.1),
+                        });
                     }
                 }
-                if ramp_e {
-                    let top = ys[total - 1 - len];
-                    for k in 0..len {
-                        let t = k as f32 / len as f32;
-                        let y = &mut ys[total - 1 - k];
-                        *y = (*y)
-                            .min((ground_e as f32 + (top - ground_e) as f32 * t).round() as i32);
+            }
+            for h in &holds {
+                needs[h.member][h.cell] = h.y;
+            }
+            let live: Vec<bool> = group_indices.iter().map(|&i| !is_covered(i)).collect();
+            settle_deck(&mut member_ys, &cells, &needs, &live, &holds);
+            for ((ys, t), &live) in member_ys.iter_mut().zip(&terrain).zip(&live) {
+                if live {
+                    for (y, &g) in ys.iter_mut().zip(t) {
+                        *y = (*y).max(g);
                     }
-                }
-                // Never bury a ramp in a slope it climbs past.
-                for (y, &g) in ys.iter_mut().zip(&terrain[m]) {
-                    *y = (*y).max(g);
                 }
             }
 
-            for (candidate_id, bridge_side_at_start, ground_y, xz) in pending_ramps {
+            for ((candidate, bridge_side_at_start, xz), ground) in
+                pending_ramps.into_iter().zip(ramp_grounds)
+            {
                 let deck_y = group_indices
                     .iter()
                     .enumerate()
+                    .filter(|&(_, &idx)| !is_covered(idx))
                     .find_map(|(m, &idx)| {
                         let (s, e) = ends(idx);
                         if s == xz {
@@ -766,23 +1062,102 @@ impl BridgeStructureMap {
                         }
                     })
                     .unwrap_or(level_deck);
+                if ground.is_empty() {
+                    continue;
+                }
                 ramps.insert(
-                    candidate_id,
+                    candidate.id,
                     BridgeRampInfo {
-                        bridge_side_at_start,
-                        deck_y,
-                        ground_y,
+                        ys: ramp_profile(&ground, deck_y, bridge_side_at_start),
                     },
                 );
             }
 
+            // Cables from mapped towers, down to a pier or a typical side span each side.
+            let mut cable_span: Option<Arc<CableSpan>> = None;
+            if !towers.is_empty() {
+                let (u_lo, u_hi) = us
+                    .iter()
+                    .flatten()
+                    .fold((f32::MAX, f32::MIN), |(lo, hi), &u| (lo.min(u), hi.max(u)));
+                let (first, last) = (towers[0].0, towers[towers.len() - 1].0);
+                let main = (last - first) / (towers.len() - 1) as f32;
+                let pier_reach = ((SIDE_PIER_REACH_M * scale) as i64).pow(2);
+                let near_path = |x: i32, z: i32| {
+                    cells
+                        .iter()
+                        .flatten()
+                        .any(|&(cx, cz)| dist2((cx, cz), (x, z)) <= pier_reach)
+                };
+                let pier_us: Vec<f32> = mapped
+                    .minor
+                    .iter()
+                    .filter(|&&(x, z)| near_path(x, z))
+                    .map(|&(x, z)| along(x, z))
+                    .collect();
+                // The nearest pier past a typical minimum side span ends it.
+                let side_end = |tower_u: f32, dir: f32| {
+                    pier_us
+                        .iter()
+                        .map(|&u| (u - tower_u) * dir)
+                        .filter(|&d| d >= 0.15 * main && d <= 0.6 * main)
+                        .fold(None, |best: Option<f32>, d| {
+                            Some(best.map_or(d, |b| b.min(d)))
+                        })
+                        .map_or(tower_u + dir * DEFAULT_SIDE_SPAN * main, |d| {
+                            tower_u + dir * d
+                        })
+                };
+                let anchors = (
+                    side_end(first, -1.0).max(u_lo),
+                    side_end(last, 1.0).min(u_hi),
+                );
+                let deck_at = |u: f32| hull_at(&hull, u).round() as i32;
+                let saddles: Vec<(f32, i32)> = towers
+                    .iter()
+                    .map(|&(u, t)| (u, t.top_y - bridge_towers::SADDLE_BELOW_TOP))
+                    .collect();
+                cable_span = CableSpan::new(
+                    (ax, az),
+                    (dir_x, dir_z),
+                    &saddles,
+                    anchors,
+                    deck_at,
+                    towers[0].1.paint,
+                    scale,
+                )
+                .map(Arc::new);
+            }
+
+            // An approach tagged with its bridge's structure: made-up pylons there
+            // would stand a second, smaller bridge beside the real towers.
+            let approach_reach = ((APPROACH_REACH_M * scale) as i64).pow(2);
+            let approach_of_mapped = towers.is_empty()
+                && group_indices
+                    .iter()
+                    .any(|&i| bridge_names(bridge_ways[i]).any(|n| tower_names.contains(n)))
+                && cells.iter().flatten().any(|&(x, z)| {
+                    mapped
+                        .towers
+                        .iter()
+                        .any(|t| dist2((x, z), (t.x, t.z)) <= approach_reach)
+                });
+
             // One pylon set per cable structure, from its longest way.
             let mut cable_carriers: Vec<usize> = Vec::new();
             let mut pylon_points: Vec<(i32, i32)> = Vec::new();
-            if matches!(
+            if let Some(span) = &cable_span {
+                pylon_points = towers.iter().map(|(_, t)| (t.x, t.z)).collect();
+                cable_carriers = group_indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| !is_covered(i) && cells_suspended(&cells, group_indices, i, span))
+                    .collect();
+            } else if matches!(
                 group_style,
                 BridgeStyle::Suspension | BridgeStyle::CableStayed
-            ) {
+            ) && !approach_of_mapped
+            {
                 let main = group_indices
                     .iter()
                     .enumerate()
@@ -872,11 +1247,15 @@ impl BridgeStructureMap {
                     BridgeMemberInfo {
                         ys: std::mem::take(&mut member_ys[m]),
                         style: group_style,
-                        start_is_group_boundary: is_boundary(start_xz),
-                        end_is_group_boundary: is_boundary(end_xz),
+                        start_is_group_boundary: is_edge(start_xz),
+                        end_is_group_boundary: is_edge(end_xz),
                         module_idx,
                         covered_by_wider,
                         cable_pylons: cable_carriers.contains(&idx).then(|| pylon_points.clone()),
+                        cable_span: cable_span
+                            .as_ref()
+                            .filter(|_| cable_carriers.contains(&idx))
+                            .cloned(),
                     },
                 );
             }
@@ -942,6 +1321,29 @@ impl BridgeStructureMap {
             rail_decks.insert(way.id, RailDeck::Carried(ys));
         }
 
+        // Tracks running side by side share a level, so their decks can join.
+        let rail_bboxes: Vec<(i32, i32, i32, i32)> =
+            rail_bridge_ways.iter().map(|w| way_bbox(w)).collect();
+        for a in 0..rail_bridge_ways.len() {
+            for b in (a + 1)..rail_bridge_ways.len() {
+                if rail_decks.contains_key(&rail_bridge_ways[a].id)
+                    || rail_decks.contains_key(&rail_bridge_ways[b].id)
+                    || rail_uf.find(a) == rail_uf.find(b)
+                    || !bboxes_touch(
+                        rail_bboxes[a],
+                        rail_bboxes[b],
+                        RAIL_SIDE_BY_SIDE_DISTANCE.ceil() as i32,
+                    )
+                {
+                    continue;
+                }
+                if rails_side_by_side(rail_bridge_ways[a], rail_bridge_ways[b]) {
+                    rail_uf.union(a, b);
+                }
+            }
+        }
+
+        let rail_internal = railways::rail_bridge_internal_endpoints(&rail_bridge_ways);
         let mut rail_groups: HashMap<usize, Vec<usize>> = HashMap::new();
         for (i, way) in rail_bridge_ways.iter().enumerate() {
             if rail_decks.contains_key(&way.id) {
@@ -1002,8 +1404,38 @@ impl BridgeStructureMap {
             } else {
                 terrain_max
             };
+            let level = deck.max(floor);
             for &i in group {
-                rail_decks.insert(rail_bridge_ways[i].id, RailDeck::Level(deck.max(floor)));
+                let way = rail_bridge_ways[i];
+                let cells = railways::build_smoothed_centerline(way);
+                let terrain: Vec<i32> = cells
+                    .iter()
+                    .map(|&(x, z)| editor.get_ground_level(x, z))
+                    .collect();
+                let internal = |n: usize| {
+                    let node = &way.nodes[n];
+                    rail_internal.contains(&(node.x, node.z))
+                };
+                let start_internal = internal(0);
+                let end_internal = internal(way.nodes.len() - 1);
+                rail_decks.insert(
+                    way.id,
+                    RailDeck::Own(OwnRailDeck {
+                        ys: railways::fit_rail_deck(
+                            &cells,
+                            &terrain,
+                            railways::rail_bridge_profile(
+                                &terrain,
+                                level,
+                                start_internal,
+                                end_internal,
+                            ),
+                            [start_internal, end_internal],
+                        ),
+                        start_is_boundary: !start_internal,
+                        end_is_boundary: !end_internal,
+                    }),
+                );
             }
         }
 
@@ -1060,8 +1492,10 @@ pub struct BridgeSurfaceMap {
     cells: HashMap<(i32, i32), DeckSpan>,
     // Columns under a deck with a road or track at grade.
     grade_crossings: HashSet<(i32, i32)>,
-    // Rail viaduct deck Y per column.
+    // Lowest rail viaduct deck Y per column.
     rail_decks: HashMap<(i32, i32), i32>,
+    // Rail viaduct centerline cells: (way id, deck Y).
+    rail_tracks: HashMap<(i32, i32), (u64, i32)>,
 }
 
 impl BridgeSurfaceMap {
@@ -1072,6 +1506,10 @@ impl BridgeSurfaceMap {
 
     pub fn contains(&self, x: i32, z: i32) -> bool {
         self.cells.contains_key(&(x, z))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
     }
 
     /// True when a deck over (x, z) lies within `tolerance` of `y`.
@@ -1094,7 +1532,18 @@ impl BridgeSurfaceMap {
             cells: HashMap::new(),
             grade_crossings: HashSet::new(),
             rail_decks: HashMap::new(),
+            rail_tracks: HashMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_deck(&mut self, x: i32, z: i32, y: i32) {
+        self.cells.insert((x, z), DeckSpan { low: y, high: y });
+    }
+
+    /// Deck Y of a rail viaduct track running through (x, z), with its way id.
+    pub fn rail_track_at(&self, x: i32, z: i32) -> Option<(u64, i32)> {
+        self.rail_tracks.get(&(x, z)).copied()
     }
 
     /// True when a road or track runs at grade under the deck at (x, z).
@@ -1130,6 +1579,23 @@ impl BridgeSurfaceMap {
     }
 
     // Highest deck Y within `radius`; lets side features mapped just off the deck ride the bridge.
+    /// The deck cell nearest (x, z) within `radius`, (x, z) itself first, and its deck Y.
+    pub fn nearest_deck_cell(&self, x: i32, z: i32, radius: i32) -> Option<((i32, i32), i32)> {
+        let mut best: Option<(i32, (i32, i32), i32)> = None;
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                let cell = (x + dx, z + dz);
+                let d = dx * dx + dz * dz;
+                if let Some(s) = self.cells.get(&cell) {
+                    if best.is_none_or(|(b, _, _)| d < b) {
+                        best = Some((d, cell, s.high));
+                    }
+                }
+            }
+        }
+        best.map(|(_, cell, y)| (cell, y))
+    }
+
     pub fn nearby_deck_y(&self, x: i32, z: i32, radius: i32) -> Option<i32> {
         if let Some(s) = self.cells.get(&(x, z)) {
             return Some(s.high);
@@ -1170,7 +1636,7 @@ impl BridgeSurfaceMap {
             if member.is_some_and(|m| m.covered_by_wider) {
                 continue;
             }
-            let ramp = structures.lookup_ramp(way.id).copied();
+            let ramp = structures.lookup_ramp(way.id);
             if member.is_none() && ramp.is_none() {
                 continue;
             }
@@ -1182,11 +1648,10 @@ impl BridgeSurfaceMap {
                 .unwrap_or_else(|| highway_block_range(highway_type, &way.tags, scale));
 
             let path = way_cells(way);
-            let total_bresenham = path.len();
             for (tds, &(cx, cz)) in path.iter().enumerate() {
                 let cell_y = match (member, ramp) {
                     (Some(info), _) => info.y_at(tds),
-                    (None, Some(info)) => info.y_at(tds, total_bresenham),
+                    (None, Some(info)) => info.y_at(tds),
                     (None, None) => continue,
                 };
                 for dx in -block_range..=block_range {
@@ -1207,22 +1672,37 @@ impl BridgeSurfaceMap {
         }
 
         // Rail viaducts are rendered on their own, but still shelter what runs beneath them.
-        let mut rail_decks: HashMap<(i32, i32), i32> = HashMap::new();
-        for elem in elements {
-            if let ProcessedElement::Way(way) = elem {
-                let Some(RailDeck::Level(y)) = structures.rail_deck(way.id) else {
-                    continue;
-                };
-                for (x, z) in railways::build_smoothed_centerline(way) {
-                    for dx in -1..=1 {
-                        for dz in -1..=1 {
-                            let deck = rail_decks.entry((x + dx, z + dz)).or_insert(*y);
-                            *deck = (*deck).min(*y);
-                        }
-                    }
-                }
+        let own_rail_decks = || {
+            elements.iter().filter_map(|elem| match elem {
+                ProcessedElement::Way(way) => match structures.rail_deck(way.id) {
+                    Some(RailDeck::Own(deck)) => Some((way, deck)),
+                    _ => None,
+                },
+                _ => None,
+            })
+        };
+        let mut rail_tracks: HashMap<(i32, i32), (u64, i32)> = HashMap::new();
+        for (way, deck) in own_rail_decks() {
+            let path = railways::build_smoothed_centerline(way);
+            for (&cell, &y) in path.iter().zip(&deck.ys) {
+                rail_tracks.entry(cell).or_insert((way.id, y));
             }
         }
+        let mut map = Self {
+            cells,
+            grade_crossings: HashSet::new(),
+            rail_decks: HashMap::new(),
+            rail_tracks,
+        };
+        // The footprint the renderer lays, gaps to joined tracks included.
+        let mut rail_decks: HashMap<(i32, i32), i32> = HashMap::new();
+        for (way, deck) in own_rail_decks() {
+            for (cell, y) in railways::rail_deck_footprint(&map, way, &deck.ys) {
+                let low = rail_decks.entry(cell).or_insert(y);
+                *low = (*low).min(y);
+            }
+        }
+        let cells = &map.cells;
 
         let mut grade_crossings: HashSet<(i32, i32)> = HashSet::new();
         if !cells.is_empty() || !rail_decks.is_empty() {
@@ -1244,7 +1724,7 @@ impl BridgeSurfaceMap {
                 if structures.lookup_ramp(way.id).is_some() {
                     continue;
                 }
-                let Some((half, _)) = grade_obstacle(way, scale) else {
+                let Some((half, _, _)) = grade_obstacle(way, scale) else {
                     continue;
                 };
                 // One cell of margin keeps piers off the kerb and the track bed.
@@ -1282,11 +1762,9 @@ impl BridgeSurfaceMap {
             }
         }
 
-        Self {
-            cells,
-            grade_crossings,
-            rail_decks,
-        }
+        map.grade_crossings = grade_crossings;
+        map.rail_decks = rail_decks;
+        map
     }
 }
 
@@ -1302,6 +1780,85 @@ pub(crate) fn is_bridge_way(way: &ProcessedWay) -> bool {
         .get("bridge")
         .map(|v| v.as_str())
         .is_some_and(|v| v != "no")
+}
+
+/// A highway leaving a bridge end node.
+struct RoadOut {
+    dir: (f32, f32),
+    // False for a raised way, tagged like a ramp.
+    at_grade: bool,
+    vehicular: bool,
+}
+
+/// A built highway a deck can run on to: not in a tunnel, nor stairs or a lift up to it.
+fn meets_a_deck(way: &ProcessedWay) -> bool {
+    let highway = way.tags.get("highway").map(String::as_str).unwrap_or("");
+    !matches!(
+        highway,
+        "steps"
+            | "elevator"
+            | "corridor"
+            | "platform"
+            | "construction"
+            | "proposed"
+            | "abandoned"
+            | "razed"
+    ) && way.tags.get("tunnel").is_none_or(|t| t == "no")
+        && way.tags.get("indoor").is_none_or(|t| t == "no")
+}
+
+/// Whether the decks at a node all leave within a narrow fan and a road leaves well outside it.
+fn leaves_outside(decks: &[(f32, f32)], roads: &[(f32, f32)]) -> bool {
+    use std::f32::consts::TAU;
+    let mut angles: Vec<f32> = decks.iter().map(|d| d.1.atan2(d.0)).collect();
+    if angles.is_empty() {
+        return false;
+    }
+    angles.sort_by(f32::total_cmp);
+    // The widest gap between neighbouring deck directions, going round.
+    let (from, gap) = angles
+        .iter()
+        .enumerate()
+        .map(|(i, &a)| {
+            let next = angles.get(i + 1).copied().unwrap_or(angles[0] + TAU);
+            (a, next - a)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap_or((0.0, TAU));
+    TAU - gap <= EDGE_MAX_FAN
+        && roads.iter().any(|r| {
+            let off = (r.1.atan2(r.0) - from).rem_euclid(TAU);
+            off >= EDGE_ROAD_MARGIN && off <= gap - EDGE_ROAD_MARGIN
+        })
+}
+
+/// Unit directions a way leaves node `k` in, towards the first node 3+ blocks off each side.
+fn leaving_dirs(nodes: &[ProcessedNode], k: usize) -> Vec<(f32, f32)> {
+    fn first_clear<'a>(
+        here: &ProcessedNode,
+        others: impl Iterator<Item = &'a ProcessedNode>,
+    ) -> Option<(f32, f32)> {
+        let mut last = None;
+        for n in others {
+            let (dx, dz) = ((n.x - here.x) as f32, (n.z - here.z) as f32);
+            let len = (dx * dx + dz * dz).sqrt();
+            if len > 0.0 {
+                last = Some((dx / len, dz / len));
+                if len >= 3.0 {
+                    break;
+                }
+            }
+        }
+        last
+    }
+    let here = &nodes[k];
+    [
+        first_clear(here, nodes[k + 1..].iter()),
+        first_clear(here, nodes[..k].iter().rev()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn is_ramp_candidate(way: &ProcessedWay) -> bool {
@@ -1325,8 +1882,9 @@ fn is_ramp_candidate(way: &ProcessedWay) -> bool {
     false
 }
 
-/// Half-width and headroom of an at-grade way a bridge must clear.
-pub(crate) fn grade_obstacle(way: &ProcessedWay, scale: f64) -> Option<(i32, i32)> {
+/// Half-width and headroom of an at-grade way a bridge must clear, and whether it carries
+/// traffic that cannot pass at the deck's level: a road or railway, not a path or track.
+pub(crate) fn grade_obstacle(way: &ProcessedWay, scale: f64) -> Option<(i32, i32, bool)> {
     if way.nodes.len() < 2
         || way.tags.get("area").map(String::as_str) == Some("yes")
         || way.tags.get("indoor").map(String::as_str) == Some("yes")
@@ -1359,20 +1917,21 @@ pub(crate) fn grade_obstacle(way: &ProcessedWay, scale: f64) -> Option<(i32, i32
         {
             return None;
         }
-        let headroom = if is_non_vehicular_bridge_highway(highway) || highway == "track" {
-            PATH_HEADROOM
-        } else {
-            ROAD_HEADROOM
-        };
-        return Some((highway_block_range(highway, &way.tags, scale), headroom));
+        let path = is_non_vehicular_bridge_highway(highway) || highway == "track";
+        let headroom = if path { PATH_HEADROOM } else { ROAD_HEADROOM };
+        return Some((
+            highway_block_range(highway, &way.tags, scale),
+            headroom,
+            !path,
+        ));
     }
     if railways::is_at_grade_track(way) {
-        let headroom = match way.tags.get("railway").map(String::as_str) {
-            Some("tram") => ROAD_HEADROOM,
-            Some("miniature") => PATH_HEADROOM,
-            _ => RAIL_HEADROOM,
+        let (headroom, must_clear) = match way.tags.get("railway").map(String::as_str) {
+            Some("tram") => (ROAD_HEADROOM, true),
+            Some("miniature") => (PATH_HEADROOM, false),
+            _ => (RAIL_HEADROOM, true),
         };
-        return Some((1, headroom));
+        return Some((1, headroom, must_clear));
     }
     None
 }
@@ -1401,6 +1960,8 @@ struct GradeSegment {
     // Distance from the centerline still inside the way's footprint.
     reach: f32,
     headroom: i32,
+    // Roads and rails, which a short deck still has to clear; water and paths it need not.
+    must_clear: bool,
     // Index into `GradeObstacles::ways`.
     way: usize,
 }
@@ -1424,8 +1985,8 @@ impl<'a> GradeObstacles<'a> {
             let ProcessedElement::Way(way) = elem else {
                 continue;
             };
-            let Some((half, headroom)) = grade_obstacle(way, scale)
-                .or_else(|| waterway_clearance(way).map(|headroom| (0, headroom)))
+            let Some((half, headroom, must_clear)) = grade_obstacle(way, scale)
+                .or_else(|| waterway_clearance(way).map(|headroom| (0, headroom, false)))
             else {
                 continue;
             };
@@ -1450,6 +2011,7 @@ impl<'a> GradeObstacles<'a> {
                     bz: pair[1].z as f32,
                     reach,
                     headroom,
+                    must_clear,
                     way: w,
                 });
                 for bx in x0.div_euclid(OBSTACLE_GRID_CELL)..=x1.div_euclid(OBSTACLE_GRID_CELL) {
@@ -1507,6 +2069,195 @@ pub(crate) fn way_cells(way: &ProcessedWay) -> Vec<(i32, i32)> {
         cells.extend(line.into_iter().skip(skip).map(|(x, _, z)| (x, z)));
     }
     cells
+}
+
+/// Holds this few cells apart are one landing, as two carriageways meeting one road.
+const NEAR_HOLD_STEPS: i32 = 3;
+
+/// A deck cell held at a level: a landing, joint or short ramp the deck eases to.
+struct DeckHold {
+    member: usize,
+    cell: usize,
+    y: i32,
+}
+
+/// Eases each member's deck to where it is held, then keeps neighbouring cells within a block
+/// of each other. Cells of different members on one spot are one cell of the deck, so a
+/// ramp runs on through the members beyond a short one.
+fn settle_deck(
+    ys: &mut [Vec<i32>],
+    cells: &[Vec<(i32, i32)>],
+    needs: &[Vec<i32>],
+    live: &[bool],
+    holds: &[DeckHold],
+) {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, VecDeque};
+    type Cell = (usize, usize);
+    let lens: Vec<usize> = ys.iter().map(Vec::len).collect();
+    let mut at: HashMap<(i32, i32), Vec<Cell>> = HashMap::new();
+    for (m, cs) in cells.iter().enumerate() {
+        if live[m] {
+            for (i, &c) in cs.iter().enumerate().take(lens[m]) {
+                at.entry(c).or_default().push((m, i));
+            }
+        }
+    }
+    let neighbours = |(m, i): Cell| {
+        let mut out: Vec<(Cell, i32)> = at[&cells[m][i]]
+            .iter()
+            .filter(|&&c| c != (m, i))
+            .map(|&c| (c, 0))
+            .collect();
+        if i > 0 {
+            out.push(((m, i - 1), 1));
+        }
+        if i + 1 < lens[m] {
+            out.push(((m, i + 1), 1));
+        }
+        out
+    };
+    // Steps from a cell to every cell within `reach`, and the cell each was reached from.
+    let around = |from: Cell, reach: i32| {
+        let mut dist: HashMap<Cell, i32> = HashMap::from([(from, 0)]);
+        let mut prev: HashMap<Cell, Cell> = HashMap::new();
+        let mut queue: VecDeque<Cell> = VecDeque::from([from]);
+        while let Some(c) = queue.pop_front() {
+            let d = dist[&c];
+            for (n, w) in neighbours(c) {
+                if d + w <= reach && dist.get(&n).is_none_or(|&old| d + w < old) {
+                    dist.insert(n, d + w);
+                    prev.insert(n, c);
+                    if w == 0 {
+                        queue.push_front(n);
+                    } else {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+        (dist, prev)
+    };
+    // One hold per spot, the lowest; any member there reaches the others at no cost.
+    let mut spots: HashMap<(i32, i32), &DeckHold> = HashMap::new();
+    for h in holds {
+        let spot = spots.entry(cells[h.member][h.cell]).or_insert(h);
+        if h.y < spot.y {
+            *spot = h;
+        }
+    }
+    let mut holds: Vec<&DeckHold> = spots.into_values().collect();
+    holds.sort_by_key(|h| (h.member, h.cell));
+    // A ramp's length, as for an end ramp inside one way.
+    let ease_len = |m: usize| (lens[m] as f32 * 0.35).clamp(15.0, 50.0) as i32;
+    let reached: Vec<_> = holds
+        .iter()
+        .map(|h| around((h.member, h.cell), 2 * ease_len(h.member)))
+        .collect();
+
+    // Ease to each hold over a ramp's length, or half the way to the next hold past its own
+    // landing.
+    let profile: Vec<Vec<i32>> = ys.to_vec();
+    for (k, h) in holds.iter().enumerate() {
+        if (profile[h.member][h.cell] - h.y).abs() <= 1 {
+            ys[h.member][h.cell] = h.y;
+            continue;
+        }
+        let down = profile[h.member][h.cell] > h.y;
+        let dist = &reached[k].0;
+        let next = holds
+            .iter()
+            .enumerate()
+            .filter(|&(o, _)| o != k)
+            .filter_map(|(_, o)| dist.get(&(o.member, o.cell)))
+            .filter(|&&d| d > NEAR_HOLD_STEPS)
+            .min();
+        let len = next
+            .map_or(ease_len(h.member), |d| ease_len(h.member).min(d / 2))
+            .max(1);
+        let Some(far) = dist.values().filter(|&&d| d <= len).max().copied() else {
+            continue;
+        };
+        let rim = dist
+            .iter()
+            .filter(|&(_, &d)| d == far)
+            .map(|(c, _)| profile[c.0][c.1]);
+        let level = if down { rim.max() } else { rim.min() }.unwrap_or(h.y);
+        for (&(m, i), &d) in dist.iter().filter(|&(_, &d)| d <= far) {
+            let t = d as f32 / far.max(1) as f32;
+            let ramp = (h.y as f32 + (level - h.y) as f32 * t).round() as i32;
+            ys[m][i] = if down {
+                ys[m][i].min(ramp)
+            } else {
+                ys[m][i].max(ramp)
+            };
+        }
+    }
+
+    // Between holds that close, the deck runs straight from one to the other unless a cell
+    // on the way needs it higher.
+    for (k, a) in holds.iter().enumerate() {
+        let (dist, prev) = &reached[k];
+        for b in &holds[k + 1..] {
+            let Some(&span) = dist.get(&(b.member, b.cell)).filter(|&&d| d >= 2) else {
+                continue;
+            };
+            let mut path = vec![(b.member, b.cell)];
+            while let Some(&p) = prev.get(path.last().unwrap()) {
+                path.push(p);
+            }
+            let line = |c: &Cell| a.y as f32 + (b.y - a.y) as f32 * dist[c] as f32 / span as f32;
+            if path.iter().all(|c| needs[c.0][c.1] as f32 <= line(c) + 1.0) {
+                for c in &path {
+                    let y = (line(c).round() as i32).max(needs[c.0][c.1]);
+                    ys[c.0][c.1] = ys[c.0][c.1].min(y);
+                }
+            }
+        }
+    }
+
+    // No cell more than a block per cell above a hold.
+    let mut cap: Vec<Vec<i32>> = ys.iter().map(|r| vec![i32::MAX; r.len()]).collect();
+    let mut heap: BinaryHeap<Reverse<(i32, Cell)>> = BinaryHeap::new();
+    for h in &holds {
+        cap[h.member][h.cell] = h.y;
+        heap.push(Reverse((h.y, (h.member, h.cell))));
+    }
+    while let Some(Reverse((y, c))) = heap.pop() {
+        if y > cap[c.0][c.1] {
+            continue;
+        }
+        for (n, w) in neighbours(c) {
+            if y + w < cap[n.0][n.1] {
+                cap[n.0][n.1] = y + w;
+                heap.push(Reverse((y + w, n)));
+            }
+        }
+    }
+    // Nor more than a block per cell below any other; this never lifts a cell past its cap.
+    let mut lift: Vec<Vec<i32>> = ys.iter().map(|r| vec![i32::MIN; r.len()]).collect();
+    let mut heap: BinaryHeap<(i32, Cell)> = BinaryHeap::new();
+    for m in (0..ys.len()).filter(|&m| live[m]) {
+        for i in 0..ys[m].len() {
+            let y = ys[m][i].min(cap[m][i]);
+            lift[m][i] = y;
+            heap.push((y, (m, i)));
+        }
+    }
+    while let Some((y, c)) = heap.pop() {
+        if y < lift[c.0][c.1] {
+            continue;
+        }
+        for (n, w) in neighbours(c) {
+            if y - w > lift[n.0][n.1] {
+                lift[n.0][n.1] = y - w;
+                heap.push((y - w, n));
+            }
+        }
+    }
+    for m in (0..ys.len()).filter(|&m| live[m]) {
+        ys[m].copy_from_slice(&lift[m]);
+    }
 }
 
 /// Least concave majorant: clears every requirement without sagging into a gap.
@@ -1580,6 +2331,40 @@ fn effective_layer(way: &ProcessedWay) -> i32 {
         .unwrap_or_else(|| if is_bridge_way(way) { 1 } else { 0 })
 }
 
+/// Squared distance between two cells, wide enough for any world.
+fn dist2(a: (i32, i32), b: (i32, i32)) -> i64 {
+    let (dx, dz) = (i64::from(a.0 - b.0), i64::from(a.1 - b.1));
+    dx * dx + dz * dz
+}
+
+fn way_half_width_max(indices: &[usize], ways: &[&ProcessedWay], scale: f64) -> i32 {
+    indices
+        .iter()
+        .map(|&i| way_half_width(ways[i], scale))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The names a bridge way goes by.
+fn bridge_names(way: &ProcessedWay) -> impl Iterator<Item = &str> {
+    ["bridge:name", "name"]
+        .into_iter()
+        .filter_map(|k| way.tags.get(k).map(String::as_str))
+}
+
+/// Whether any of member `idx`'s cells hangs from `span`.
+fn cells_suspended(
+    cells: &[Vec<(i32, i32)>],
+    indices: &[usize],
+    idx: usize,
+    span: &CableSpan,
+) -> bool {
+    indices
+        .iter()
+        .position(|&i| i == idx)
+        .is_some_and(|m| cells[m].iter().any(|&(x, z)| span.suspends(x, z)))
+}
+
 fn way_half_width(way: &ProcessedWay, scale: f64) -> i32 {
     highway_block_range(
         way.tags.get("highway").map(String::as_str).unwrap_or(""),
@@ -1632,6 +2417,30 @@ fn headings_parallel(ha: f32, hb: f32) -> bool {
     // Parallel or antiparallel both count — carriageways may be drawn either direction.
     diff <= DUAL_CARRIAGEWAY_HEADING_TOLERANCE_DEG
         || (180.0 - diff).abs() <= DUAL_CARRIAGEWAY_HEADING_TOLERANCE_DEG
+}
+
+/// Rail bridges on one layer close enough for their decks to join.
+fn rails_side_by_side(a: &ProcessedWay, b: &ProcessedWay) -> bool {
+    if effective_layer(a) != effective_layer(b) {
+        return false;
+    }
+    let (Some(ha), Some(hb)) = (heading_deg(a), heading_deg(b)) else {
+        return false;
+    };
+    if !headings_parallel(ha, hb) {
+        return false;
+    }
+    let (short, long) = if way_length_blocks(a) <= way_length_blocks(b) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let samples = coverage_samples(short);
+    let alongside = samples
+        .iter()
+        .filter(|&&(px, pz)| lateral_offset_to_way(px, pz, long) <= RAIL_SIDE_BY_SIDE_DISTANCE)
+        .count();
+    alongside * 2 > samples.len()
 }
 
 /// Parallel bridge ways forming one deck, across layers only when the decks touch.
@@ -1723,6 +2532,42 @@ fn lateral_offset_to_way(px: f32, pz: f32, way: &ProcessedWay) -> f32 {
     best
 }
 
+/// Whether a point lies more than a block past either end of a way, along its end segments.
+fn past_way_end(px: f32, pz: f32, way: &ProcessedWay) -> bool {
+    fn past<'a>(
+        (px, pz): (f32, f32),
+        end: &ProcessedNode,
+        mut inward: impl Iterator<Item = &'a ProcessedNode>,
+    ) -> bool {
+        let Some(n) = inward.find(|n| (n.x, n.z) != (end.x, end.z)) else {
+            return false;
+        };
+        let (dx, dz) = ((end.x - n.x) as f32, (end.z - n.z) as f32);
+        ((px - end.x as f32) * dx + (pz - end.z as f32) * dz) / dx.hypot(dz) > 1.0
+    }
+    match (way.nodes.first(), way.nodes.last()) {
+        (Some(first), Some(last)) => {
+            past((px, pz), first, way.nodes.iter()) || past((px, pz), last, way.nodes.iter().rev())
+        }
+        _ => false,
+    }
+}
+
+/// Whether `way` carries on from an end of `other`, out past it.
+fn continues_past(way: &ProcessedWay, other: &ProcessedWay) -> bool {
+    let (Some(a), Some(b)) = (way.nodes.first(), way.nodes.last()) else {
+        return false;
+    };
+    let ends_of_other = [other.nodes.first(), other.nodes.last()];
+    [(a, b), (b, a)].iter().any(|(joint, far)| {
+        ends_of_other
+            .iter()
+            .flatten()
+            .any(|e| (e.x, e.z) == (joint.x, joint.z))
+            && past_way_end(far.x as f32, far.z as f32, other)
+    })
+}
+
 fn heading_deg(way: &ProcessedWay) -> Option<f32> {
     if way.nodes.len() < 2 {
         return None;
@@ -1778,6 +2623,7 @@ mod tests {
     use super::*;
     use crate::coordinate_system::cartesian::XZBBox;
     use crate::coordinate_system::geographic::LLBBox;
+    use crate::element_processing::highways::build_highway_connectivity_map;
     use crate::osm_parser::ProcessedNode;
     use crate::world_editor::WorldEditor;
     use std::collections::HashMap as StdMap;
@@ -1828,7 +2674,13 @@ mod tests {
         ))];
         let outlines = BridgeOutlineIndex::build(&ways);
 
-        let structures = BridgeStructureMap::build(&ways, &editor, &outlines, 1.0);
+        let structures = BridgeStructureMap::build(
+            &ways,
+            &editor,
+            &build_highway_connectivity_map(&ways),
+            &outlines,
+            1.0,
+        );
         let member = structures.lookup_member(1).expect("member exists");
 
         assert!(
@@ -1847,7 +2699,13 @@ mod tests {
             ProcessedElement::Way(straight_bridge_way(2, "footway", 0, 52, 95, 52)),
         ];
         let outlines = BridgeOutlineIndex::build(&ways);
-        let structures = BridgeStructureMap::build(&ways, &editor, &outlines, 1.0);
+        let structures = BridgeStructureMap::build(
+            &ways,
+            &editor,
+            &build_highway_connectivity_map(&ways),
+            &outlines,
+            1.0,
+        );
         assert!(structures.lookup_member(1).unwrap().module_idx.is_some());
         let footway = structures.lookup_member(2).unwrap();
         assert!(!footway.covered_by_wider);
@@ -1863,7 +2721,13 @@ mod tests {
         ))];
         let outlines = BridgeOutlineIndex::build(&ways);
 
-        let structures = BridgeStructureMap::build(&ways, &editor, &outlines, 1.0);
+        let structures = BridgeStructureMap::build(
+            &ways,
+            &editor,
+            &build_highway_connectivity_map(&ways),
+            &outlines,
+            1.0,
+        );
         let member = structures.lookup_member(2).expect("member exists");
 
         assert!(member.module_idx.is_some());
@@ -1904,7 +2768,13 @@ mod tests {
         let elements: Vec<ProcessedElement> =
             ways.iter().cloned().map(ProcessedElement::Way).collect();
         let outlines = BridgeOutlineIndex::build(&elements);
-        let structures = BridgeStructureMap::build(&elements, &editor, &outlines, 1.0);
+        let structures = BridgeStructureMap::build(
+            &elements,
+            &editor,
+            &build_highway_connectivity_map(&elements),
+            &outlines,
+            1.0,
+        );
         let surface = BridgeSurfaceMap::build(&elements, &structures, 1.0);
         (structures, surface)
     }
@@ -1959,10 +2829,101 @@ mod tests {
         assert!(!surface.support_blocked(15, 40, profile[5]));
     }
 
+    // A One World area cuts the way 64 blocks past its edge; the deck must not land there.
+    #[test]
+    fn a_deck_carries_on_past_the_end_the_clip_cut() {
+        let mut bridge = way_with(1, ROAD_BRIDGE, &[(10, 40), (34, 40)]);
+        bridge.nodes[1].id = 1 << 62;
+        let road = way_with(2, &[("highway", "residential")], &[(22, 10), (22, 70)]);
+        let (structures, _) = structures_over(&[bridge, road], |_| 0.0);
+        let profile = ys(&structures, 1);
+        assert_eq!(profile[0], 0, "the mapped end still lands");
+        assert!(
+            *profile.last().unwrap() >= ROAD_HEADROOM,
+            "stays up at the cut: {profile:?}"
+        );
+    }
+
+    /// Münchener Straße over the Fehlbach in Erding, with the footbridges either side of
+    /// it, at 48.3057, 11.9053: one structure about 30 blocks long, too short for ramps.
+    #[test]
+    fn a_short_road_bridge_with_footbridges_over_a_river_stays_level() {
+        let layer_one = |highway| [("highway", highway), ("bridge", "yes"), ("layer", "1")];
+        let ways = [
+            way_with(1, &layer_one("tertiary"), &[(60, 46), (39, 58), (38, 59)]),
+            way_with(2, &layer_one("footway"), &[(38, 53), (60, 42)]),
+            way_with(
+                3,
+                &layer_one("footway"),
+                &[(37, 65), (43, 60), (52, 54), (61, 49)],
+            ),
+            way_with(4, &[("waterway", "river")], &[(55, 82), (49, 4)]),
+            way_with(5, &[("highway", "tertiary")], &[(69, 42), (60, 46)]),
+            way_with(
+                6,
+                &[("highway", "tertiary")],
+                &[(38, 59), (37, 60), (30, 65)],
+            ),
+            way_with(7, &[("highway", "footway")], &[(60, 42), (68, 37)]),
+            way_with(
+                8,
+                &[("highway", "footway")],
+                &[(38, 53), (36, 50), (30, 45)],
+            ),
+            way_with(9, &[("highway", "footway")], &[(61, 49), (69, 46)]),
+            way_with(10, &[("highway", "footway")], &[(28, 76), (37, 65)]),
+        ];
+        let (structures, _) = structures_over(&ways, |_| 0.0);
+        for id in 1..=3 {
+            let profile = ys(&structures, id);
+            assert!(profile.iter().all(|&y| y == 0), "way {id}: {profile:?}");
+        }
+    }
+
+    #[test]
+    fn a_curved_deck_is_as_long_as_it_walks_not_as_its_chord() {
+        // A half turn about 44 blocks long whose ends are only 28 apart.
+        let curve: Vec<(i32, i32)> = (0..=10)
+            .map(|i| {
+                let a = f64::from(i) * std::f64::consts::PI / 10.0;
+                (
+                    20 + (14.0 * (1.0 - a.cos())).round() as i32,
+                    40 + (14.0 * a.sin()).round() as i32,
+                )
+            })
+            .collect();
+        let bridge = way_with(
+            1,
+            &[
+                ("highway", "residential"),
+                ("bridge", "yes"),
+                ("layer", "1"),
+            ],
+            &curve,
+        );
+        let (structures, _) = structures_over(&[bridge], |_| 0.0);
+        assert!(*ys(&structures, 1).iter().max().unwrap() > 0);
+    }
+
+    #[test]
+    fn a_short_arch_still_lifts_for_its_curve_but_a_short_beam_stays_level() {
+        let arch = &[
+            ("highway", "residential"),
+            ("bridge", "yes"),
+            ("bridge:structure", "arch"),
+        ];
+        let (structures, _) = structures_over(&[way_with(1, arch, &[(10, 40), (44, 40)])], |_| 0.0);
+        assert!(*ys(&structures, 1).iter().max().unwrap() > 0);
+        let (structures, _) =
+            structures_over(&[way_with(1, ROAD_BRIDGE, &[(10, 40), (44, 40)])], |_| 0.0);
+        assert!(ys(&structures, 1).iter().all(|&y| y == 0));
+    }
+
     #[test]
     fn short_bridge_rises_no_steeper_than_a_block_per_cell() {
         let bridge = way_with(1, ROAD_BRIDGE, &[(20, 40), (26, 40)]);
-        let road = way_with(2, &[("highway", "footway")], &[(23, 10), (23, 70)]);
+        // A road, which even a deck this short has to clear.
+        let road = way_with(2, &[("highway", "residential")], &[(23, 10), (23, 70)]);
         let (structures, _) = structures_over(&[bridge, road], |_| 0.0);
         let profile = ys(&structures, 1);
         assert!(*profile.iter().max().unwrap() <= 3, "{profile:?}");
@@ -2068,7 +3029,7 @@ mod tests {
     }
 
     #[test]
-    fn approach_ramp_keeps_its_own_pillars() {
+    fn approach_ramp_slopes_from_the_deck_to_the_road_beyond() {
         let bridge = way_with(
             1,
             &[
@@ -2083,10 +3044,347 @@ mod tests {
             &[("highway", "residential"), ("embankment", "yes")],
             &[(10, 40), (40, 40)],
         );
-        let (structures, surface) = structures_over(&[bridge, ramp], |_| 0.0);
-        let ramp_y = structures.lookup_ramp(2).expect("tagged ramp").y_at(20, 31);
-        assert!(ramp_y > 2, "the ramp is raised there");
-        assert!(!surface.support_blocked(30, 40, ramp_y));
+        let road = way_with(3, &[("highway", "residential")], &[(0, 40), (10, 40)]);
+        let (structures, _) = structures_over(&[bridge, ramp, road], |_| 0.0);
+        let deck = ys(&structures, 1)[0];
+        let ramp = structures.lookup_ramp(2).expect("tagged ramp").ys();
+        assert!(deck > 2, "the bridge is raised");
+        assert_eq!(ramp.last(), Some(&deck), "the ramp meets the deck");
+        assert_eq!(ramp.first(), Some(&0), "and the road beyond at grade");
+        assert!(
+            ramp.windows(2).all(|w| (0..=1).contains(&(w[1] - w[0]))),
+            "{ramp:?}"
+        );
+    }
+
+    #[test]
+    fn ramp_profile_rides_over_ground_above_its_grade() {
+        let mut ground = vec![0; 31];
+        ground[10..14].fill(5);
+        let ys = ramp_profile(&ground, 6, false);
+        assert_eq!((ys[0], ys[30]), (0, 6));
+        assert_eq!(ys[20], 4, "a straight grade elsewhere");
+        for (i, (y, g)) in ys.iter().zip(&ground).enumerate() {
+            assert!(y >= g, "buried at {i}: {ys:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_embankment_way_meets_the_ground_and_follows_it() {
+        let ground = vec![0; 200];
+        let ys = ramp_profile(&ground, 6, true);
+        assert_eq!(ys[0], 6);
+        let landed = ys.iter().position(|&y| y == 0).expect("the ramp lands");
+        assert!(
+            landed <= 6 * RAMP_RUN_PER_BLOCK as usize,
+            "landed at {landed}"
+        );
+        assert!(ys[landed..].iter().all(|&y| y == 0));
+    }
+
+    #[test]
+    fn a_road_reaches_an_anchored_bridge_end_at_its_junction_level() {
+        // The deck starts at the lip of a drop, where the cell and the ground around it differ.
+        let bridge = way_with(1, ROAD_BRIDGE, &[(40, 40), (70, 40)]);
+        let road = way_with(2, &[("highway", "residential")], &[(10, 40), (40, 40)]);
+        let xzbbox = XZBBox::rect_from_xz_lengths(100.0, 100.0).unwrap();
+        let mut editor = test_editor(&xzbbox);
+        let row: Vec<f32> = (0..100).map(|x| if x < 40 { 20.0 } else { 10.0 }).collect();
+        let ground = crate::ground::Ground::new_elevation_test(vec![row; 100], 100, 100);
+        editor.set_ground(Arc::new(ground));
+        let elements = [
+            ProcessedElement::Way(bridge),
+            ProcessedElement::Way(road.clone()),
+        ];
+        let connectivity = build_highway_connectivity_map(&elements);
+        let outlines = BridgeOutlineIndex::build(&elements);
+        let structures =
+            BridgeStructureMap::build(&elements, &editor, &connectivity, &outlines, 1.0);
+        let block_range = highway_block_range("residential", &road.tags, 1.0);
+        let road_ys = road_profile(&editor, &road, block_range, &connectivity, |x, z| {
+            connectivity
+                .is_shared(x, z)
+                .then(|| junction_level(&editor, x, z))
+        });
+        assert_eq!(Some(&ys(&structures, 1)[0]), road_ys.last());
+    }
+
+    fn assert_no_jumps(profile: &[i32]) {
+        for pair in profile.windows(2) {
+            assert!((pair[0] - pair[1]).abs() <= 1, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn decks_forking_off_a_road_come_down_to_it() {
+        let tags = &[("highway", "primary"), ("bridge", "yes"), ("layer", "1")];
+        let south = way_with(1, tags, &[(50, 20), (50, 80)]);
+        let east = way_with(2, tags, &[(50, 20), (80, 70)]);
+        let road = way_with(3, &[("highway", "primary")], &[(50, 0), (50, 20)]);
+        let under = way_with(4, &[("highway", "residential")], &[(0, 50), (99, 50)]);
+        let (structures, _) = structures_over(&[south, east, road, under], |_| 0.0);
+        for id in [1, 2] {
+            let profile = ys(&structures, id);
+            assert_eq!(profile[0], 0, "lands where the road leaves: {profile:?}");
+            assert!(*profile.iter().max().unwrap() >= ROAD_HEADROOM - 1);
+            assert_no_jumps(&profile);
+        }
+    }
+
+    #[test]
+    fn a_side_road_off_a_continuing_deck_does_not_land_it() {
+        let tags = &[("highway", "primary"), ("bridge", "yes"), ("layer", "1")];
+        let west = way_with(1, tags, &[(10, 40), (50, 40)]);
+        let east = way_with(2, tags, &[(50, 40), (90, 40)]);
+        let side = way_with(3, &[("highway", "service")], &[(50, 40), (50, 90)]);
+        let under_w = way_with(4, &[("highway", "residential")], &[(35, 0), (35, 99)]);
+        let under_e = way_with(5, &[("highway", "residential")], &[(65, 0), (65, 99)]);
+        let (structures, _) = structures_over(&[west, east, side, under_w, under_e], |_| 0.0);
+        assert!(
+            *ys(&structures, 1).last().unwrap() > 0,
+            "the joint stays up"
+        );
+    }
+
+    #[test]
+    fn a_way_carrying_on_past_a_deck_end_is_not_beside_it() {
+        let deck = way_with(1, ROAD_BRIDGE, &[(10, 40), (50, 40)]);
+        assert!(!past_way_end(30.0, 43.0, &deck));
+        assert!(!past_way_end(50.5, 40.0, &deck), "rounding at the end");
+        assert!(past_way_end(56.0, 40.0, &deck));
+        assert!(past_way_end(4.0, 40.0, &deck));
+        // Repeated end nodes, which the parser keeps, still have an end.
+        let doubled = way_with(2, ROAD_BRIDGE, &[(10, 40), (10, 40), (50, 40), (50, 40)]);
+        assert!(past_way_end(56.0, 40.0, &doubled));
+        assert!(past_way_end(4.0, 40.0, &doubled));
+        let tail = way_with(3, ROAD_BRIDGE, &[(50, 40), (58, 40)]);
+        assert!(continues_past(&tail, &deck));
+        assert!(continues_past(&tail, &doubled));
+        let beside = way_with(4, ROAD_BRIDGE, &[(12, 43), (48, 43)]);
+        assert!(!continues_past(&beside, &deck));
+    }
+
+    #[test]
+    fn a_carriageway_overhanging_a_wide_deck_stays_covered() {
+        let wide = way_with(
+            1,
+            &[("highway", "primary"), ("bridge", "yes"), ("lanes", "6")],
+            &[(10, 40), (60, 40)],
+        );
+        let narrow = way_with(
+            2,
+            &[("highway", "primary"), ("bridge", "yes"), ("lanes", "1")],
+            &[(8, 42), (62, 42)],
+        );
+        let (structures, _) = structures_over(&[wide, narrow], |_| 0.0);
+        assert!(structures.lookup_member(2).unwrap().covered_by_wider);
+    }
+
+    #[test]
+    fn a_wide_deck_continued_by_a_short_way_lands_at_its_end() {
+        let tags = &[
+            ("highway", "primary"),
+            ("bridge", "yes"),
+            ("layer", "1"),
+            ("lanes", "6"),
+        ];
+        let deck = way_with(1, tags, &[(10, 40), (60, 40)]);
+        let tail = way_with(2, tags, &[(60, 40), (66, 40)]);
+        let road = way_with(3, &[("highway", "primary")], &[(66, 40), (99, 40)]);
+        let under = way_with(4, &[("highway", "residential")], &[(50, 0), (50, 99)]);
+        let (structures, _) = structures_over(&[deck, tail, road, under], |_| 0.0);
+        assert!(!structures.lookup_member(2).unwrap().covered_by_wider);
+        assert_eq!(ys(&structures, 2).last(), Some(&0));
+        let mut profile = ys(&structures, 1);
+        profile.extend(ys(&structures, 2));
+        assert_no_jumps(&profile);
+    }
+
+    #[test]
+    fn a_short_ramp_falls_no_more_than_a_block_a_cell() {
+        let bridge = way_with(
+            1,
+            &[("highway", "footway"), ("bridge", "yes"), ("layer", "2")],
+            &[(40, 40), (80, 40)],
+        );
+        let ramp = way_with(
+            2,
+            &[("highway", "footway"), ("layer", "1")],
+            &[(36, 40), (40, 40)],
+        );
+        let path = way_with(3, &[("highway", "footway")], &[(0, 40), (36, 40)]);
+        let (structures, _) = structures_over(&[bridge, ramp, path], |_| 0.0);
+        let ramp = structures
+            .lookup_ramp(2)
+            .expect("tagged ramp")
+            .ys()
+            .to_vec();
+        assert_eq!(ramp.first(), Some(&0), "{ramp:?}");
+        assert_no_jumps(&ramp);
+        let deck = ys(&structures, 1);
+        assert_eq!(ramp.last(), deck.first());
+        assert!(
+            *deck.iter().max().unwrap() > *ramp.last().unwrap(),
+            "{deck:?}"
+        );
+        assert_no_jumps(&deck);
+    }
+
+    #[test]
+    fn a_covered_carriageway_landing_brings_down_the_deck_over_it() {
+        let wide = way_with(
+            1,
+            &[
+                ("highway", "primary"),
+                ("bridge", "yes"),
+                ("layer", "1"),
+                ("lanes", "6"),
+            ],
+            &[(10, 40), (90, 40)],
+        );
+        let narrow = way_with(
+            2,
+            &[
+                ("highway", "primary"),
+                ("bridge", "yes"),
+                ("layer", "1"),
+                ("lanes", "1"),
+            ],
+            &[(30, 42), (60, 42)],
+        );
+        let road = way_with(3, &[("highway", "primary")], &[(0, 42), (30, 42)]);
+        let under = way_with(4, &[("highway", "residential")], &[(50, 0), (50, 30)]);
+        let (structures, _) = structures_over(&[wide, narrow, road, under], |_| 0.0);
+        assert!(structures.lookup_member(2).unwrap().covered_by_wider);
+        let profile = ys(&structures, 1);
+        assert!(profile[..=20].iter().all(|&y| y == 0), "{profile:?}");
+        assert_no_jumps(&profile);
+    }
+
+    #[test]
+    fn a_covered_carriageway_running_on_raised_keeps_the_deck_up() {
+        let wide = way_with(
+            1,
+            &[
+                ("highway", "primary"),
+                ("bridge", "yes"),
+                ("layer", "1"),
+                ("lanes", "6"),
+            ],
+            &[(10, 40), (90, 40)],
+        );
+        let narrow = way_with(
+            2,
+            &[
+                ("highway", "primary"),
+                ("bridge", "yes"),
+                ("layer", "1"),
+                ("lanes", "1"),
+            ],
+            &[(30, 42), (60, 42)],
+        );
+        let raised = way_with(
+            3,
+            &[("highway", "primary"), ("layer", "1")],
+            &[(0, 42), (30, 42)],
+        );
+        let under = way_with(4, &[("highway", "residential")], &[(25, 0), (25, 30)]);
+        let (structures, _) = structures_over(&[wide, narrow, raised, under], |_| 0.0);
+        assert!(structures.lookup_member(2).unwrap().covered_by_wider);
+        let profile = ys(&structures, 1);
+        assert!(profile[15] > 0, "over the road below: {profile:?}");
+        assert!(
+            profile[..40].windows(2).all(|w| w[1] >= w[0]),
+            "climbs from its end without a dip: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn a_ramp_at_a_fork_starts_at_the_drawn_deck() {
+        let narrow = way_with(
+            1,
+            &[
+                ("highway", "primary"),
+                ("bridge", "yes"),
+                ("layer", "1"),
+                ("lanes", "1"),
+            ],
+            &[(20, 42), (55, 42), (60, 40)],
+        );
+        let wide = way_with(
+            2,
+            &[
+                ("highway", "primary"),
+                ("bridge", "yes"),
+                ("layer", "1"),
+                ("lanes", "6"),
+            ],
+            &[(10, 40), (60, 40)],
+        );
+        let ramp = way_with(
+            3,
+            &[("highway", "primary"), ("layer", "1")],
+            &[(60, 40), (63, 40)],
+        );
+        let road = way_with(4, &[("highway", "primary")], &[(63, 40), (99, 40)]);
+        let under = way_with(5, &[("highway", "residential")], &[(40, 0), (40, 99)]);
+        let (structures, _) = structures_over(&[narrow, wide, ramp, road, under], |_| 0.0);
+        assert!(structures.lookup_member(1).unwrap().covered_by_wider);
+        if let Some(ramp) = structures.lookup_ramp(3) {
+            let ramp = ramp.ys().to_vec();
+            assert_eq!(ramp.first(), ys(&structures, 2).last(), "{ramp:?}");
+            assert_no_jumps(&ramp);
+        }
+    }
+
+    #[test]
+    fn a_path_off_a_road_fork_does_not_land_it() {
+        let tags = &[("highway", "primary"), ("bridge", "yes"), ("layer", "1")];
+        for path in ["footway", "construction"] {
+            let south = way_with(1, tags, &[(50, 20), (50, 80)]);
+            let east = way_with(2, tags, &[(50, 20), (80, 70)]);
+            let walk = way_with(3, &[("highway", path)], &[(50, 0), (50, 20)]);
+            let under = way_with(4, &[("highway", "residential")], &[(0, 30), (99, 30)]);
+            let (structures, _) = structures_over(&[south, east, walk, under], |_| 0.0);
+            assert!(ys(&structures, 1)[0] > 0, "{path} lands the fork");
+        }
+    }
+
+    #[test]
+    fn landings_a_cell_or_two_apart_ease_down_as_one() {
+        // A raised deck held at its end and, two cells in, by a carriageway landing beside it.
+        let cells = vec![(0..40).map(|x| (x, 0)).collect::<Vec<_>>()];
+        let mut ys = vec![vec![6; 40]];
+        let needs = vec![vec![0; 40]];
+        let holds = [
+            DeckHold {
+                member: 0,
+                cell: 0,
+                y: 0,
+            },
+            DeckHold {
+                member: 0,
+                cell: 2,
+                y: 0,
+            },
+        ];
+        settle_deck(&mut ys, &cells, &needs, &[true], &holds);
+        let profile = &ys[0];
+        assert!(profile[8] <= 3, "a ramp, not a stair: {profile:?}");
+        assert_no_jumps(profile);
+    }
+
+    #[test]
+    fn decks_fan_out_from_a_road_only_away_from_it() {
+        let deg = |a: f32| (a.to_radians().cos(), a.to_radians().sin());
+        // Decks to the south and south east, the road north: an end.
+        assert!(leaves_outside(&[deg(90.0), deg(40.0)], &[deg(260.0)]));
+        // An L corner with the road leaving its outer side.
+        assert!(leaves_outside(&[deg(90.0), deg(180.0)], &[deg(0.0)]));
+        // A deck running on through the node, with a road off its side.
+        assert!(!leaves_outside(&[deg(0.0), deg(180.0)], &[deg(90.0)]));
+        // A road leaving between the decks runs under them.
+        assert!(!leaves_outside(&[deg(0.0), deg(100.0)], &[deg(50.0)]));
     }
 
     #[test]
@@ -2115,11 +3413,12 @@ mod tests {
             &[(40, 10), (40, 70)],
         );
         let (structures, surface) = structures_over(&[rail, road], |_| 0.0);
-        let Some(RailDeck::Level(rail_y)) = structures.rail_deck(1) else {
+        let Some(RailDeck::Own(deck)) = structures.rail_deck(1) else {
             panic!("rail viaduct has its own deck");
         };
+        let rail_y = deck.ys[30];
         assert!(surface.support_blocked(40, 40, rail_y + STACKED_DECK_HEADROOM));
-        assert!(!surface.support_blocked(40, 40, *rail_y));
+        assert!(!surface.support_blocked(40, 40, rail_y));
     }
 
     #[test]
@@ -2149,10 +3448,40 @@ mod tests {
         let b = way_with(2, tags, &[(40, 40), (70, 40)]);
         let (structures, _) = structures_over(&[a, b], |x| if x > 50 { 12.0 } else { 0.0 });
         let level = |id| match structures.rail_deck(id) {
-            Some(RailDeck::Level(y)) => *y,
+            Some(RailDeck::Own(deck)) => deck.ys.iter().copied().max().unwrap_or_default(),
             _ => panic!("rail bridge {id} has its own deck"),
         };
         assert_eq!(level(1), level(2));
         assert!(level(1) >= 12);
+    }
+
+    #[test]
+    fn decked_gap_between_rail_tracks_blocks_supports_above() {
+        let tags = &[("railway", "rail"), ("bridge", "yes")];
+        let a = way_with(1, tags, &[(10, 40), (70, 40)]);
+        let b = way_with(2, tags, &[(10, 47), (70, 47)]);
+        let (structures, surface) = structures_over(&[a, b], |_| 0.0);
+        let Some(RailDeck::Own(deck)) = structures.rail_deck(1) else {
+            panic!("rail bridge has its own deck");
+        };
+        let upper = deck.ys[30] + STACKED_DECK_HEADROOM;
+        for z in [43, 44] {
+            assert!(surface.support_blocked(40, z, upper), "gap column z={z}");
+        }
+    }
+
+    #[test]
+    fn side_by_side_rail_bridges_share_a_level() {
+        let tags = &[("railway", "rail"), ("bridge", "yes")];
+        let a = way_with(1, tags, &[(10, 40), (70, 40)]);
+        let b = way_with(2, tags, &[(10, 46), (45, 46)]);
+        let far = way_with(3, tags, &[(10, 70), (45, 70)]);
+        let (structures, _) = structures_over(&[a, b, far], |x| if x > 50 { 12.0 } else { 0.0 });
+        let level = |id| match structures.rail_deck(id) {
+            Some(RailDeck::Own(deck)) => deck.ys.iter().copied().max().unwrap_or_default(),
+            _ => panic!("rail bridge {id} has its own deck"),
+        };
+        assert_eq!(level(1), level(2), "neighbouring tracks line up");
+        assert!(level(3) < level(1), "a track further off keeps its own");
     }
 }

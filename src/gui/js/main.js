@@ -51,9 +51,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Before the store restores values, so the cards follow the restored ones.
   initSettingsLayout();
   initDialogs();
-  initVoxyLightingCoupling();
+  initLodLightingCoupling();
   initCavesFillCoupling();
+  initDisastersCoupling();
+  initMobSpawningLockout();
   refreshHeightLimitRow();
+  refreshGameplayRows();
   // After initSettings(), so the slider label and rotation handlers exist
   // before restored values are applied. Labels get localized a few lines below.
   initSettingsStore({ resetWorldFormat: () => setWorldFormat('java') });
@@ -453,16 +456,54 @@ function closeOnBackdrop(modal, close) {
   });
 }
 
-// License, version info and the 3D preview are read-only, so a click beside
-// them may close them. The consent dialog is left alone: it wants an answer.
+// License, version info, the 3D preview and the Discord invite ask nothing, so
+// a click beside them may close them. The consent dialog is left alone: it
+// wants an answer.
 function initDialogs() {
   const license = document.getElementById("license-modal");
   const update = document.getElementById("update-modal");
   const preview3d = document.getElementById("preview3d-modal");
+  const discord = document.getElementById("discord-modal");
   if (license) closeOnBackdrop(license, () => window.closeLicense());
   if (update) closeOnBackdrop(update, closeUpdateModal);
   if (preview3d) closeOnBackdrop(preview3d, () => window.closePreview3D && window.closePreview3D());
+  if (discord) closeOnBackdrop(discord, closeDiscordModal);
 }
+
+const DISCORD_INVITE_URL = "https://discord.gg/Tba5NKzKjT";
+const DISCORD_PROMPT_KEY = "discord-prompt-shown";
+let sessionGenerations = 0;
+
+// Invites once ever, after the second finished world of a session. If another
+// dialog is up at that moment, it waits for the next one.
+function noteGenerationDone() {
+  sessionGenerations++;
+  if (sessionGenerations < 2) return;
+  // A beat later, so the green "Done!" registers before the dialog covers it.
+  setTimeout(() => {
+    if (localStorage.getItem(DISCORD_PROMPT_KEY)) return;
+    const modal = document.getElementById("discord-modal");
+    const busy = [...document.querySelectorAll(".modal, #settings-modal")]
+      .some((m) => m.style.display === "flex");
+    if (!modal || busy) return;
+    // Marked on show, so closing Arnis without answering also counts.
+    localStorage.setItem(DISCORD_PROMPT_KEY, "true");
+    showModal(modal);
+  }, 1000);
+}
+
+function closeDiscordModal() {
+  const modal = document.getElementById("discord-modal");
+  if (modal) hideModal(modal);
+}
+
+function joinDiscord() {
+  openExternal(DISCORD_INVITE_URL);
+  closeDiscordModal();
+}
+
+window.closeDiscordModal = closeDiscordModal;
+window.joinDiscord = joinDiscord;
 
 function openUpdateInBrowser() {
   const url =
@@ -501,6 +542,8 @@ var selectedCelestialBody = 'earth';
 const EARTH_ONLY_SETTINGS = [
   'generation-mode-select',
   'overture-toggle',
+  'winter-toggle',
+  'post-apocalyptic-toggle',
   'use-3d-toggle',
   'interior-toggle',
   'canopy-height-toggle',
@@ -513,7 +556,7 @@ const EARTH_ONLY_SETTINGS = [
   'tile-theme-select',
   'custom-tile-url'
 ];
-const EARTH_ONLY_SEGMENTED = ['max-tree-size-group', 'signage-group'];
+const EARTH_ONLY_SEGMENTED = ['max-tree-size-group', 'field-preset-group', 'signage-group'];
 
 // A tile URL template Leaflet can actually fill in. Deliberately permissive
 // about the host - the entire point is to reach something we do not know about -
@@ -711,6 +754,8 @@ function setCelestialBody(body) {
   // loop: the height-limit pack is also format-gated and the facade rows read
   // the world format and the stored source too.
   refreshHeightLimitRow();
+  refreshGameplayRows();
+  refreshWorldTypeRow();
   refreshFacadeRows();
   refreshOneWorldState();
 
@@ -1082,6 +1127,7 @@ function setupProgressListener() {
         // A generation just built facades into the same cache, so the preview
         // has something new to say.
         window.arnisPreview3D?.refreshFacades();
+        noteGenerationDone();
       } else {
         progressInfo.style.color = "#ececec";
       }
@@ -1220,12 +1266,15 @@ function initSettings() {
 
     const licenseModal = document.getElementById("license-modal");
     const updateModal = document.getElementById("update-modal");
+    const discordModal = document.getElementById("discord-modal");
     const licenseOpen = licenseModal && licenseModal.style.display === "flex";
     const updateOpen = updateModal && updateModal.style.display === "flex";
+    const discordOpen = discordModal && discordModal.style.display === "flex";
 
     if (licenseOpen) closeLicense();
     if (updateOpen) closeUpdateModal();
-    if (!licenseOpen && !updateOpen && settingsModal.style.display === "flex") {
+    if (discordOpen) closeDiscordModal();
+    if (!licenseOpen && !updateOpen && !discordOpen && settingsModal.style.display === "flex") {
       closeSettings();
     }
   });
@@ -1269,32 +1318,19 @@ function initSettings() {
   });
   refreshHeightDisplay();
 
-  // Game mode segmented control
-  const gamemodeGroup = document.getElementById("gamemode-group");
-  gamemodeGroup.querySelectorAll(".segment").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      gamemodeGroup.querySelectorAll(".segment").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
+  // Segmented controls whose click only moves the active segment
+  ["gamemode-group", "world-type-group", "mob-spawning-group", "signage-group"].forEach((id) => {
+    const group = document.getElementById(id);
+    group.querySelectorAll(".segment").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        group.querySelectorAll(".segment").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+      });
     });
   });
 
-  // World type segmented control
-  const worldTypeGroup = document.getElementById("world-type-group");
-  worldTypeGroup.querySelectorAll(".segment").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      worldTypeGroup.querySelectorAll(".segment").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-    });
-  });
-
-  // Signage segmented control
-  const signageGroup = document.getElementById("signage-group");
-  signageGroup.querySelectorAll(".segment").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      signageGroup.querySelectorAll(".segment").forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-    });
-  });
+  // Blueprint greys out the traffic lights.
+  document.getElementById("generation-mode-select").addEventListener("change", () => refreshGameplayRows());
 
   // A reloaded map comes back on Earth; restore whatever was picked.
   const bodyMapFrame = getMapFrame();
@@ -1305,6 +1341,14 @@ function initSettings() {
   maxTreeSizeGroup.querySelectorAll(".segment").forEach((btn) => {
     btn.addEventListener("click", () => {
       maxTreeSizeGroup.querySelectorAll(".segment").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+    });
+  });
+
+  const fieldPresetGroup = document.getElementById("field-preset-group");
+  fieldPresetGroup.querySelectorAll(".segment").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      fieldPresetGroup.querySelectorAll(".segment").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
     });
   });
@@ -1649,27 +1693,32 @@ let selectedWorldFormat = 'bedrock'; // Default to Bedrock on Android/mobile
 
 const VALID_FORMATS = ['java', 'bedrock', 'luanti'];
 
-// Voxy renders distant terrain from the per-voxel light stored in its LOD
-// cache, so pre-generating one without baked lighting would give a black
-// horizon. Keep the two toggles consistent in the UI rather than quietly
+// Sets a toggle another one depends on. Dispatches, so the settings store persists the
+// knock-on change too.
+function setChecked(el, value) {
+  if (el.checked === value) return;
+  el.checked = value;
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+// Voxy and Distant Horizons render distant terrain from the light stored in
+// their LOD caches, so pre-generating one without baked lighting would give a
+// black horizon. Keep the toggles consistent in the UI rather than quietly
 // overriding the user's choice at generation time.
-function initVoxyLightingCoupling() {
-  const voxy = document.getElementById('voxy-lod-toggle');
+function initLodLightingCoupling() {
   const bake = document.getElementById('bake-lighting-toggle');
-  if (!voxy || !bake) return;
+  const lods = ['voxy-lod-toggle', 'dh-lod-toggle']
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+  if (!bake) return;
 
-  // Dispatch so the settings store persists the knock-on change too.
-  const set = (el, value) => {
-    if (el.checked === value) return;
-    el.checked = value;
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  };
-
-  voxy.addEventListener('change', () => {
-    if (voxy.checked) set(bake, true);
-  });
+  for (const lod of lods) {
+    lod.addEventListener('change', () => {
+      if (lod.checked) setChecked(bake, true);
+    });
+  }
   bake.addEventListener('change', () => {
-    if (!bake.checked) set(voxy, false);
+    if (!bake.checked) lods.forEach((lod) => setChecked(lod, false));
   });
 }
 
@@ -1680,18 +1729,31 @@ function initCavesFillCoupling() {
   const fill = document.getElementById('fillground-toggle');
   if (!caves || !fill) return;
 
-  // Dispatch so the settings store persists the knock-on change too.
-  const set = (el, value) => {
-    if (el.checked === value) return;
-    el.checked = value;
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  };
-
   caves.addEventListener('change', () => {
-    if (caves.checked) set(fill, true);
+    if (caves.checked) setChecked(fill, true);
   });
   fill.addEventListener('change', () => {
-    if (!fill.checked) set(caves, false);
+    if (!fill.checked) setChecked(caves, false);
+  });
+}
+
+// Disasters open up the ground and send people indoors, so turning them on turns on Fill
+// Ground and interiors. Turning Fill Ground off takes the disasters with it, as with caves.
+function initDisastersCoupling() {
+  const disasters = document.getElementById('disasters-toggle');
+  const fill = document.getElementById('fillground-toggle');
+  const interior = document.getElementById('interior-toggle');
+  if (!disasters || !fill || !interior) return;
+
+  // Only on a click: restoring saved settings fires change events too, and must not undo a
+  // choice to leave interiors off.
+  disasters.addEventListener('change', (event) => {
+    if (!disasters.checked || !event.isTrusted) return;
+    setChecked(fill, true);
+    if (!interior.disabled) setChecked(interior, true);
+  });
+  fill.addEventListener('change', () => {
+    if (!fill.checked) setChecked(disasters, false);
   });
 }
 
@@ -1787,13 +1849,85 @@ function refreshHeightLimitRow(format) {
 
 // Bedrock and Luanti keep their own flat generators, so the choice only means
 // something for Java. Greyed rather than hidden, like the other format gates.
+// A One World's areas sit at their real heights and a superflat off Earth is
+// grass, so the backend makes both void.
 function refreshWorldTypeRow(format) {
-  const group = document.getElementById('world-type-group');
+  const available = (format || selectedWorldFormat) === 'java'
+    && selectedCelestialBody === 'earth' && !isOneWorldEnabled();
+  setSegmentedRowAvailable('world-type-group', available);
+}
+
+// Greyed the way the settings store reads it: every segment disabled, so the row is out of
+// the tab order and never shows as modified, and inert like a greyed toggle's row. The
+// active segment stays, so the choice comes back with the row.
+function setSegmentedRowAvailable(groupId, available) {
+  const group = document.getElementById(groupId);
   if (!group) return;
-  const java = (format || selectedWorldFormat) === 'java';
-  group.classList.toggle('segmented-disabled', !java);
+  group.classList.toggle('segmented-disabled', !available);
+  group.querySelectorAll('.segment').forEach((btn) => { btn.disabled = !available; });
   const row = group.closest('.settings-row');
-  if (row) row.classList.toggle('settings-row-unavailable', !java);
+  if (row) {
+    row.classList.toggle('settings-row-unavailable', !available);
+    row.toggleAttribute('inert', !available);
+  }
+}
+
+// The extras are a Java data pack, and each One World area would write its own over
+// the last one's. Vehicles also run on Bedrock, from an add-on of their own. Off Earth
+// there are no roads or places, and gravity only differs there. Blueprint builds no
+// signal heads, so there are no lights to run.
+function refreshGameplayRows(format) {
+  // The effective state: a ticked One World is off on the Moon and Mars, and greyed out there.
+  const current = format || selectedWorldFormat;
+  const pack = current === 'java' && !isOneWorldEnabled();
+  const vehicles = pack || current === 'bedrock';
+  const earth = selectedCelestialBody === 'earth';
+  const mode = document.getElementById('generation-mode-select');
+  const blueprint = !!mode && mode.value === 'blueprint';
+  setSettingsRowAvailable('pause-menu-toggle', pack);
+  setSettingsRowAvailable('zombie-outbreak-toggle', pack);
+  setSettingsRowAvailable('disasters-toggle', pack);
+  setSettingsRowAvailable('discoveries-toggle', pack && earth);
+  setSettingsRowAvailable('traffic-lights-toggle', pack && earth && !blueprint);
+  setSettingsRowAvailable('moving-cars-toggle', vehicles && earth);
+  setSettingsRowAvailable('body-gravity-toggle', pack && !earth);
+  // Last, as it reads whether the outbreak and the disasters are still available.
+  refreshMobSpawningRow(current);
+}
+
+// Mineclonia spawns by settings outside the world, nothing lives off Earth, and the Zombie
+// Outbreak and Disasters bring their own mobs on their own difficulty. The backend turns it
+// off in all of these too.
+function mobSpawningAvailable(format) {
+  const current = format || selectedWorldFormat;
+  return (current === 'java' || current === 'bedrock')
+    && selectedCelestialBody === 'earth'
+    && !gameplayToggle('zombie-outbreak-toggle')
+    && !gameplayToggle('disasters-toggle');
+}
+
+function refreshMobSpawningRow(format) {
+  setSegmentedRowAvailable('mob-spawning-group', mobSpawningAvailable(format));
+}
+
+// Off wherever the row is greyed, so a stale choice is never sent.
+function getMobSpawning() {
+  if (!mobSpawningAvailable()) return 'off';
+  const btn = document.querySelector('#mob-spawning-group .segment.active');
+  return btn ? btn.dataset.mobSpawning : 'off';
+}
+
+function initMobSpawningLockout() {
+  ['zombie-outbreak-toggle', 'disasters-toggle'].forEach((id) => {
+    const toggle = document.getElementById(id);
+    if (toggle) toggle.addEventListener('change', () => refreshMobSpawningRow());
+  });
+}
+
+// Disabled means unavailable for this format or body, so a stale tick is never sent.
+function gameplayToggle(id) {
+  const el = document.getElementById(id);
+  return !!(el && el.checked && !el.disabled);
 }
 
 function updateFormatToggleUI(format) {
@@ -1802,6 +1936,7 @@ function updateFormatToggleUI(format) {
   const luantiBtn = document.getElementById('format-luanti');
 
   refreshHeightLimitRow(format);
+  refreshGameplayRows(format);
   refreshWorldTypeRow(format);
 
   javaBtn.classList.remove('format-active');
@@ -3027,11 +3162,12 @@ function restoreNaturalRows() {
   setSettingsRowAvailable('height-multiplier-slider', true);
   setSettingsRowAvailable('aws-only-elevation-toggle', selectedCelestialBody === 'earth');
   setSettingsRowAvailable('voxy-lod-toggle', true);
+  setSettingsRowAvailable('dh-lod-toggle', true);
   setSettingsRowAvailable('disable-height-limit-toggle', true);
   refreshHeightLimitRow();
 }
 
-// Rotation stays 0, the Voxy cache off and the build height extended while
+// Rotation stays 0, the LOD caches off and the build height extended while
 // the mode is on; scale, build height and elevation source follow the world
 // once it exists.
 function applyOneWorldPins(info) {
@@ -3040,6 +3176,7 @@ function applyOneWorldPins(info) {
   if (rotationInput && parseFloat(rotationInput.value) !== 0 && window.updateRotation) window.updateRotation(0);
   setSettingsRowAvailable('rotation-angle-input', false);
   setSettingsRowAvailable('voxy-lod-toggle', false);
+  setSettingsRowAvailable('dh-lod-toggle', false);
   postToMap({ type: 'setRotationLocked', locked: true });
 
   const exists = !!(info && info.exists);
@@ -3050,6 +3187,7 @@ function applyOneWorldPins(info) {
     exists && typeof info.disable_height_limit === 'boolean' ? info.disable_height_limit : true);
   restoreNaturalRows();
   setSettingsRowAvailable('voxy-lod-toggle', false);
+  setSettingsRowAvailable('dh-lod-toggle', false);
   setSettingsRowAvailable('disable-height-limit-toggle', false);
   if (exists) {
     setSettingsRowAvailable('scale-value-slider', false);
@@ -3230,6 +3368,10 @@ function initOneWorld() {
   if (!toggle) return;
   // Also fires when the settings store restores the value.
   toggle.addEventListener('change', refreshOneWorldState);
+  toggle.addEventListener('change', () => {
+    refreshGameplayRows();
+    refreshWorldTypeRow();
+  });
   const mode = document.getElementById('generation-mode-select');
   if (mode) mode.addEventListener('change', renderOneWorldStatus);
   const nameToggle = document.getElementById('custom-world-name-toggle');
@@ -3318,7 +3460,9 @@ async function startGeneration() {
     resetProgressUi(STARTING_MESSAGE);
 
     const oneWorld = isOneWorldEnabled();
-    if (oneWorld && !(await prepareOneWorldRun())) {
+    const oneWorldBBox = selectedBBox;
+    // The overlap dialog leaves the page live, so the body, format or area may have changed under it.
+    if (oneWorld && (!(await prepareOneWorldRun()) || !isOneWorldEnabled() || selectedBBox !== oneWorldBBox)) {
       const info = document.getElementById('progress-info');
       if (info && info.textContent === STARTING_MESSAGE) info.textContent = "";
       return;
@@ -3369,10 +3513,10 @@ async function startGeneration() {
     }
     console.log("Starting generation with spawnPoint:", spawnPoint);
 
-    // Get generation mode from dropdown
+    // Get generation mode from dropdown, named as the CLI's --mode
     var generationMode = document.getElementById("generation-mode-select").value;
-    var terrain = (generationMode === "geo-terrain" || generationMode === "terrain-only");
-    var skipOsmObjects = (generationMode === "terrain-only");
+    var winter = document.getElementById("winter-toggle").checked;
+    var postApocalyptic = document.getElementById("post-apocalyptic-toggle").checked;
 
     var interior = document.getElementById("interior-toggle").checked;
     var fill_ground = document.getElementById("fillground-toggle").checked;
@@ -3381,6 +3525,8 @@ async function startGeneration() {
     var canopy_height = document.getElementById("canopy-height-toggle").checked;
     var maxTreeSizeBtn = document.querySelector("#max-tree-size-group .segment.active");
     var maxTreeSize = maxTreeSizeBtn ? maxTreeSizeBtn.dataset.maxTreeSize : "giant";
+    var fieldPresetBtn = document.querySelector("#field-preset-group .segment.active");
+    var fieldPreset = fieldPresetBtn ? fieldPresetBtn.dataset.fieldPreset : "patchwork";
     var overture = document.getElementById("overture-toggle").checked;
     var tiledGenToggle = document.getElementById("tiled-generation-toggle");
     var tiled_generation = tiledGenToggle ? tiledGenToggle.checked : true;
@@ -3435,6 +3581,7 @@ async function startGeneration() {
     var aws_only_elevation = document.getElementById("aws-only-elevation-toggle").checked;
     var bake_lighting = document.getElementById("bake-lighting-toggle").checked;
     var voxy_lod = document.getElementById("voxy-lod-toggle").checked;
+    var dh_lod = document.getElementById("dh-lod-toggle").checked;
     var scale = parseFloat(document.getElementById("scale-value-slider").value);
     var heightMultiplier = parseFloat(document.getElementById("height-multiplier-slider").value) || 1;
     if (oneWorld && oneWorldInfo && oneWorldInfo.exists) {
@@ -3450,6 +3597,10 @@ async function startGeneration() {
 
     // Validate ground_level
     ground_level = isNaN(ground_level) || ground_level < -62 ? -62 : ground_level;
+    // A world the CLI made may sit on another level, and the backend refuses any but its own.
+    if (oneWorld && oneWorldInfo && oneWorldInfo.exists && typeof oneWorldInfo.ground_level === 'number') {
+      ground_level = oneWorldInfo.ground_level;
+    }
 
     // Get telemetry consent (defaults to false if not set)
     const telemetryConsent = window.getTelemetryConsent ? window.getTelemetryConsent() : false;
@@ -3486,13 +3637,15 @@ async function startGeneration() {
         worldScale: scale,
         heightMultiplier: heightMultiplier,
         groundLevel: ground_level,
-        terrainEnabled: terrain,
-        skipOsmObjects: skipOsmObjects,
+        generationMode: generationMode,
+        winterEnabled: winter,
+        postApocalypticEnabled: postApocalyptic,
         interiorEnabled: interior,
         fillgroundEnabled: fill_ground,
         cavesEnabled: caves,
         legacyTreesEnabled: legacy_trees,
         maxTreeSize: maxTreeSize,
+        fieldPreset: fieldPreset,
         canopyHeightEnabled: canopy_height,
         overtureEnabled: overture,
         use3dEnabled: use_3d,
@@ -3500,6 +3653,7 @@ async function startGeneration() {
         awsOnlyElevation: aws_only_elevation,
         bakeLightingEnabled: bake_lighting,
         voxyLodEnabled: voxy_lod,
+        dhLodEnabled: dh_lod,
         isNewWorld: true,
         spawnPoint: spawnPoint,
         telemetryConsent: telemetryConsent || false,
@@ -3508,6 +3662,7 @@ async function startGeneration() {
         gamemode: gamemode,
         worldTime: worldTime,
         worldType: worldType,
+        mobSpawning: getMobSpawning(),
         mapItem: mapItem,
         signage: signage,
         mapillaryToken: getMapillaryToken(),
@@ -3516,6 +3671,13 @@ async function startGeneration() {
         buildingFacadesEnabled: getBuildingFacadesEnabled(),
         facadeDetail: getFacadeDetail(),
         celestialBodyName: selectedCelestialBody,
+        pauseMenu: gameplayToggle('pause-menu-toggle'),
+        discoveries: gameplayToggle('discoveries-toggle'),
+        trafficLights: gameplayToggle('traffic-lights-toggle'),
+        movingVehicles: gameplayToggle('moving-cars-toggle'),
+        zombieOutbreak: gameplayToggle('zombie-outbreak-toggle'),
+        disasters: gameplayToggle('disasters-toggle'),
+        bodyGravity: gameplayToggle('body-gravity-toggle'),
         oneWorld: oneWorld,
         oneWorldName: oneWorld ? oneWorldFolderName() : "",
         tiledGeneration: tiled_generation,

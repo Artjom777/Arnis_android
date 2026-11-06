@@ -8,21 +8,25 @@ use std::time::Duration;
 #[command(author, version, about)]
 pub struct Args {
     /// Bounding box of the area (min_lat,min_lng,max_lat,max_lng).
-    /// Required unless --file supplies a local .osm/.xml file to derive it from
-    /// (terrain-only mode ignores --file, so it always requires --bbox).
+    /// Required unless --file supplies a local OSM file to derive it from. Below scale 0.3
+    /// and on the Moon or Mars no OSM data is loaded and --file is ignored, so there it is
+    /// always required.
     #[arg(long, allow_hyphen_values = true, value_parser = LLBBox::from_str)]
     pub bbox: Option<LLBBox>,
 
-    /// JSON file containing OSM data (optional)
+    /// Local OSM data to generate from instead of downloading it: an .osm/.xml file (OSM XML)
+    /// or Overpass JSON. Without --bbox, the area is taken from the file.
     #[arg(long, group = "location")]
     pub file: Option<String>,
 
-    /// JSON file to save OSM data to (optional)
+    /// Save the OSM data this run uses to a file (Overpass JSON), to generate from it again
+    /// later with --file
     #[arg(long, group = "location")]
     pub save_json_file: Option<String>,
 
-    /// Output directory for the generated world (required for Java, optional for Bedrock).
-    /// Use --output-dir (or the deprecated --path alias) to specify where the world is created.
+    /// Folder the new world is created in, e.g. your Minecraft saves folder. Required for
+    /// Java (and the saves folder with --one-world). Bedrock defaults to the Desktop and
+    /// Luanti to its worlds folder. --path is a deprecated alias.
     #[arg(long = "output-dir", alias = "path")]
     pub path: Option<PathBuf>,
 
@@ -34,7 +38,8 @@ pub struct Args {
     #[arg(long)]
     pub luanti: bool,
 
-    /// Downloader method (requests/curl/wget) (optional)
+    /// How Overpass is queried when the data comes from there: requests (built in), curl or
+    /// wget
     #[arg(long, default_value = "requests")]
     pub downloader: String,
 
@@ -86,6 +91,10 @@ pub struct Args {
     #[arg(skip)]
     pub one_world_run: Option<crate::one_world::RunContext>,
 
+    /// The range an existing world's tall datapack declares, which a run into it keeps.
+    #[arg(skip)]
+    pub tall_range: Option<(i32, i32)>,
+
     /// Ground level to use in the Minecraft world
     #[arg(long, default_value_t = -62, allow_hyphen_values = true)]
     pub ground_level: i32,
@@ -93,9 +102,21 @@ pub struct Args {
     /// What to generate, mirroring the GUI's generation mode dropdown:
     /// geo-terrain: OSM objects on real elevation terrain (default)
     /// geo-only: OSM objects on flat ground
-    /// terrain-only: real elevation terrain, no OSM or Overture objects (--overture has no effect)
+    /// terrain-only: real elevation terrain with OSM water and nature, but no buildings, roads
+    /// or Overture objects (--overture has no effect); towns and fields turn back into nature
+    /// blueprint: real elevation terrain with roads, rails, water and nature, and buildings
+    /// drawn only as outlines on the ground
     #[arg(long, value_enum, default_value_t = GenerationMode::GeoTerrain)]
     pub mode: GenerationMode,
+
+    /// Turn the world into a ruin: buildings partly collapsed and broken open, roads cracked
+    /// and overgrown, lights out
+    #[arg(long, default_value_t = false, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub post_apocalyptic: bool,
+
+    /// Deep winter: snow on the ground, roofs and trees, frozen rivers and lakes, snowy biomes
+    #[arg(long, default_value_t = false, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub winter: bool,
 
     /// Deprecated: terrain is on by default, use --mode geo-only for flat ground.
     /// Accepted as a no-op so existing scripts keep working.
@@ -149,6 +170,12 @@ pub struct Args {
     /// Schematic trees are on by default; this flag opts out.
     #[arg(long, default_value_t = false)]
     pub legacy_trees: bool,
+
+    /// Farmland style: classic (one sheet of mixed crops), smallholding (narrow strips),
+    /// patchwork (mixed fields of medium width) or prairie (wide, wheat-led fields).
+    /// Anything but classic gives each field one crop, split inside its OSM outline.
+    #[arg(long, value_enum, default_value_t)]
+    pub fields: crate::element_processing::field_texture::FieldPreset,
 
     /// Largest schematic tree to place: small (<=6 blocks), medium (<=12),
     /// big (<=20), tall (<=28) or giant. Oversized picks fall back to a smaller
@@ -206,9 +233,17 @@ pub struct Args {
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
     pub rotation: f64,
 
-    /// Extend build height via a bundled pack (Java 1.21.4+: Y=-2032..2031;
-    /// Bedrock 1.21.40+: Y=-512..512). Both are experimental.
-    #[arg(long, default_value_t = false)]
+    /// Keep the vanilla build height (Y -64 to 319) and compress taller terrain to fit. By
+    /// default an area that needs more room gets a bundled pack that extends the build
+    /// height (Java 1.21.4+: Y -2032 to 2031, experimental; Bedrock 1.21.120+: up to Y 511).
+    #[arg(long, default_value_t = false, conflicts_with = "disable_height_limit")]
+    pub vanilla_height: bool,
+
+    /// Add the extended build height pack even where the area fits the vanilla height.
+    /// Before the terrain fit this says the height is fixed as extended (this flag or a
+    /// One World); `ground::settle_build_height` then sets it for an area that needs it,
+    /// so from there on it is the world's height.
+    #[arg(long, default_value_t = false, hide = true)]
     pub disable_height_limit: bool,
 
     /// Use only the legacy AWS Terrain Tiles source (~30m) instead of
@@ -231,11 +266,18 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub voxy_lod: bool,
 
+    /// Pre-generate the Distant Horizons mod's LOD database so the world renders
+    /// to the horizon on first join, instead of DH building it chunk by chunk.
+    /// Java only; implies --bake-lighting.
+    #[arg(long, default_value_t = false)]
+    pub dh_lod: bool,
+
     /// Render a top-down PNG map preview of the generated world (Java and Bedrock)
     #[arg(long, default_value_t = false)]
     pub map_preview: bool,
 
-    /// Give the player a locked map item showing the whole world (Java only)
+    /// Give the player a map: on Java a locked map item showing the whole world, on Bedrock
+    /// the game's starting map
     #[arg(long = "map-item", default_value_t = true, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub map_item: bool,
 
@@ -251,6 +293,13 @@ pub struct Args {
     #[arg(long = "world-type", value_enum, default_value_t = WorldType::Void)]
     pub world_type: WorldType,
 
+    /// Natural mob spawning, Java and Bedrock. `animals` puts the world on Peaceful, so only
+    /// animals, fish and bats turn up; `all` puts it on Normal for monsters too, with mob
+    /// griefing off so creepers and endermen leave the city standing. Earth only; Zombie
+    /// Outbreak and Disasters keep it off, as they bring their own mobs.
+    #[arg(long = "mob-spawning", value_enum, default_value_t = MobSpawning::Off)]
+    pub mob_spawning: MobSpawning,
+
     /// Readable image signs, Java only. `basic` covers public signage: street names,
     /// traffic signs, transit stops, information boards and billboards. `full` adds
     /// building signage: shop name plates, house numbers and crossing signs.
@@ -259,12 +308,7 @@ pub struct Args {
 
     /// Mapillary API token, from https://www.mapillary.com/developer. Required by
     /// --mapillary-facades and --mapillary-probe.
-    ///
-    /// `hide_env_values` because clap prints `[env: NAME=value]` in `--help` by
-    /// default, and this value is a credential: `arnis --help` with the variable
-    /// set would put the token on stdout, which is where a bug report or a CI log
-    /// picks it up. The variable's name still shows, so the help still says where
-    /// the token can come from.
+    // A credential: --help shows the variable's name but never its value.
     #[arg(long, env = "MAPILLARY_TOKEN", hide_env_values = true)]
     pub mapillary_token: Option<String>,
 
@@ -334,7 +378,7 @@ pub struct Args {
     /// Texture resolution of the facade panels in pixels per block (4, 8, 16 or
     /// 32), for the Mapillary photos and the preset facades alike. Lowered
     /// automatically when the panels would not fit the atlas --facade-detail
-    /// allows.
+    /// allows; walls that still do not fit at 4 are left without a panel.
     #[arg(long, default_value_t = 16, value_parser = parse_facade_px)]
     pub facade_px: u32,
 
@@ -343,6 +387,45 @@ pub struct Args {
     /// replacement one.
     #[arg(long)]
     pub building_facades_dir: Option<PathBuf>,
+
+    /// Moon and Mars: lower gravity for players and mobs, with fall damage scaled to
+    /// match. Runs from a data pack in the world. Java 1.21.4+.
+    #[arg(long, default_value_t = false)]
+    pub body_gravity: bool,
+
+    /// Signal heads whose lamps cycle red, amber and green, with pedestrian heads at
+    /// signalised crossings. Runs from a data pack in the world. Java 1.21.4+.
+    #[arg(long, default_value_t = false)]
+    pub traffic_lights: bool,
+
+    /// An advancement tab for the area's landmarks, museums, parks, stations and more,
+    /// each unlocked by walking there. Java 1.21.4+.
+    #[arg(long, default_value_t = false)]
+    pub discoveries: bool,
+
+    /// An "Arnis" button in the pause menu with travel, discoveries and the data
+    /// credits. Java 1.21.6+; older versions get the credits in chat instead.
+    #[arg(long, default_value_t = false)]
+    pub pause_menu: bool,
+
+    /// Zombie Outbreak: five nights of growing waves through the streets, a boss on the
+    /// last, and a supply drop every morning. Starts the world in survival. Java 1.21.6+.
+    #[arg(long, default_value_t = false)]
+    pub zombie_outbreak: bool,
+
+    /// Disasters: a meteor shower, a tornado, a flood, an earthquake and more, one every few
+    /// minutes in random order, picked from those the area can have. Floods rise from the
+    /// mapped rivers and the sea. Starts the world in survival. Implies --fillground and a
+    /// ground level of at least -40, as sinkholes and cracks open up the ground. Java 1.21.6+.
+    #[arg(long, default_value_t = false)]
+    pub disasters: bool,
+
+    /// Cars that drive the streets at the speed limit, queue behind each other, turn at
+    /// junctions and, with --traffic-lights, stop at red; and trains, S-Bahns, metros and
+    /// trams that run the mapped tracks and stop at their stations. Java 1.21.4+ or
+    /// Bedrock 1.21.120+; Bedrock has no traffic lights to stop at.
+    #[arg(long, alias = "moving-cars", default_value_t = false)]
+    pub moving_vehicles: bool,
 }
 
 /// Accepts the panel resolutions the atlas budget logic can halve cleanly.
@@ -439,8 +522,10 @@ pub enum GenerationMode {
     GeoTerrain,
     /// OSM objects on flat ground
     GeoOnly,
-    /// Real elevation terrain without any OSM or Overture objects
+    /// Real elevation terrain with OSM water and nature, but no buildings or roads
     TerrainOnly,
+    /// Roads, water and nature on real elevation, with buildings as outlines only
+    Blueprint,
 }
 
 impl GenerationMode {
@@ -449,9 +534,23 @@ impl GenerationMode {
         !matches!(self, GenerationMode::GeoOnly)
     }
 
-    /// Whether OSM and Overture objects are skipped entirely.
+    /// Whether every man-made object is left out: buildings, roads, Overture, landmarks.
     pub fn skip_objects(self) -> bool {
         matches!(self, GenerationMode::TerrainOnly)
+    }
+
+    /// Mode named by the GUI, as `--mode` spells it. Unknown names fall back to the default.
+    pub fn from_name(name: &str) -> Self {
+        <Self as clap::ValueEnum>::from_str(name, true).unwrap_or_default()
+    }
+
+    /// Whether built-up land and fields in the land cover turn back into natural cover. A
+    /// blueprint draws its plan on that clean ground, not on paving where buildings would be.
+    pub fn natural_land_cover(self) -> bool {
+        matches!(
+            self,
+            GenerationMode::TerrainOnly | GenerationMode::Blueprint
+        )
     }
 }
 
@@ -523,6 +622,12 @@ impl Args {
     /// Whether objects are being skipped only because the scale is below `OBJECT_SKIP_SCALE`.
     pub fn skip_objects_due_to_scale(&self) -> bool {
         !self.mode.skip_objects() && self.scale < OBJECT_SKIP_SCALE
+    }
+
+    /// Whether no OpenStreetMap data is loaded at all: too small a scale, or another body.
+    /// Terrain-only still loads it, for the water and nature it keeps.
+    pub fn skip_osm(&self) -> bool {
+        self.scale < OBJECT_SKIP_SCALE || !self.body.is_earth()
     }
 
     /// The Mapillary token, if one was given and is not blank.
@@ -624,6 +729,57 @@ impl WorldType {
     }
 }
 
+/// What spawns in the world on its own. Monsters only spawn above Peaceful on every version
+/// Arnis supports, so the difficulty is what separates the two kinds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+pub enum MobSpawning {
+    /// Nothing, as the game rules Arnis has always written.
+    #[default]
+    Off,
+    /// Animals, fish and bats, on Peaceful.
+    Animals,
+    /// Animals and monsters, on Normal, with mob griefing off.
+    All,
+}
+
+impl MobSpawning {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "animals" => MobSpawning::Animals,
+            "all" => MobSpawning::All,
+            _ => MobSpawning::Off,
+        }
+    }
+
+    /// The `doMobSpawning` game rule.
+    pub fn spawns(self) -> bool {
+        self != MobSpawning::Off
+    }
+
+    /// Whether monsters come too, which takes a difficulty above Peaceful and mob griefing
+    /// off, so creepers and endermen cannot take the generated city apart.
+    pub fn monsters(self) -> bool {
+        self == MobSpawning::All
+    }
+
+    /// Normal for monsters, else Peaceful, as the template has always been.
+    pub fn java_difficulty(self) -> i8 {
+        if self.monsters() {
+            2
+        } else {
+            0
+        }
+    }
+
+    /// Normal, as Arnis has always written, except Peaceful where only animals are to spawn.
+    pub fn bedrock_difficulty(self) -> i32 {
+        match self {
+            MobSpawning::Animals => 0,
+            MobSpawning::Off | MobSpawning::All => 2,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum GameMode {
     Survival,
@@ -657,15 +813,43 @@ impl GameMode {
     }
 }
 
+/// Lowest ground a world with disasters is built on. The default puts the lowest ground two
+/// blocks above bedrock, which leaves sinkholes and cracks nothing to open into.
+pub const DISASTER_GROUND_LEVEL: i32 = -40;
+
+/// What some features need from the rest of the world: caves carve into the filled ground,
+/// and disasters dig holes in it, with rock under even the lowest ground. The Zombie
+/// Outbreak sends its own waves, and Disasters play on Normal, which would let monsters in
+/// beside Animals, and need mob griefing for their meteors to crater, so both keep natural
+/// spawning off.
+pub fn apply_feature_needs(args: &mut Args) {
+    if args.caves || args.disasters {
+        args.fillground = true;
+    }
+    if args.disasters {
+        args.ground_level = args.ground_level.max(DISASTER_GROUND_LEVEL);
+    }
+    if args.zombie_outbreak || args.disasters {
+        args.mob_spawning = MobSpawning::Off;
+    }
+}
+
 /// Validates CLI arguments after parsing.
 /// For Java Edition: `--path` is required. If the directory doesn't exist, it will be created.
 /// For Bedrock Edition (`--bedrock`): `--path` is optional (defaults to Desktop output).
 /// Non-Earth bodies drive their own scale and force terrain-only. Shared by the
-/// CLI and the GUI so the two cannot disagree about what Moon/Mars means.
+/// CLI and the GUI so the two cannot disagree about what Moon/Mars means, or
+/// what a blueprint leaves out.
 pub fn apply_body_defaults(args: &mut Args) {
+    apply_mode_defaults(args);
     if args.body.is_earth() {
         return;
     }
+    // Snow and ruins dress Earth weather and Earth towns.
+    args.winter = false;
+    args.post_apocalyptic = false;
+    // The superflat template is a grass plain with villages.
+    args.world_type = WorldType::Void;
     args.scale = args.body.world_scale();
     args.mode = GenerationMode::TerrainOnly;
     args.overture = false;
@@ -683,11 +867,33 @@ pub fn apply_body_defaults(args: &mut Args) {
     args.mapillary_facades = Some(false);
     // Relief already fits vanilla height, so the pack would add only empty sky.
     args.disable_height_limit = false;
+    args.vanilla_height = true;
+    // No roads or places off Earth.
+    args.traffic_lights = false;
+    args.discoveries = false;
+    args.moving_vehicles = false;
+    // Nothing lives there, and the one barren biome would still spawn zombies.
+    args.mob_spawning = MobSpawning::Off;
     // Airless bodies look right at night. Only a default: comparing against the
     // flag's own default lets an explicit --world-time win.
     if args.world_time == DEFAULT_WORLD_TIME {
         args.world_time = MIDNIGHT_TICKS;
     }
+}
+
+/// A blueprint shows where buildings stand, not what they look like, so whatever
+/// dresses a building or stands in for one is off, and so is street furniture.
+fn apply_mode_defaults(args: &mut Args) {
+    if args.mode != GenerationMode::Blueprint {
+        return;
+    }
+    args.use_3d = false;
+    args.interior = false;
+    args.building_facades = false;
+    args.mapillary_facades = Some(false);
+    args.signage = SignageLevel::None;
+    // Signal nodes are left out, so cars would stop at lights that were never built.
+    args.traffic_lights = false;
 }
 
 /// Clap's `--world-time` default, so `apply_body_defaults` can tell left-alone
@@ -715,8 +921,41 @@ pub fn validate_args(args: &Args) -> Result<(), String> {
         );
     }
 
+    let extras = [
+        (args.pause_menu, "--pause-menu"),
+        (args.discoveries, "--discoveries"),
+        (args.traffic_lights, "--traffic-lights"),
+        (args.zombie_outbreak, "--zombie-outbreak"),
+        (args.disasters, "--disasters"),
+        (args.body_gravity, "--body-gravity"),
+        (args.moving_vehicles, "--moving-vehicles"),
+    ];
+    if args.bedrock || args.luanti {
+        // Bedrock runs the vehicles from an add-on of its own.
+        let java_only = |flag: &str| args.luanti || flag != "--moving-vehicles";
+        if let Some((_, flag)) = extras.iter().find(|(on, flag)| *on && java_only(flag)) {
+            return Err(format!(
+                "{flag} runs from a Java Edition data pack and is not available for Bedrock or Luanti worlds."
+            ));
+        }
+    }
+    // Each area would write its pack over the last one's.
+    if args.one_world {
+        if let Some((_, flag)) = extras.iter().find(|(on, _)| *on) {
+            return Err(format!("{flag} is not available with --one-world yet."));
+        }
+    }
+    if args.body_gravity && args.body.is_earth() {
+        return Err("--body-gravity only applies to --body moon or --body mars.".to_string());
+    }
+
     if args.map_preview && args.luanti {
         return Err("--map-preview is not supported for Luanti worlds.".to_string());
+    }
+
+    // Mineclonia spawns by its own settings, which live outside the world.
+    if args.mob_spawning.spawns() && args.luanti {
+        return Err("--mob-spawning is not available for Luanti worlds.".to_string());
     }
 
     if args.one_world {
@@ -863,11 +1102,11 @@ pub fn validate_args(args: &Args) -> Result<(), String> {
     }
 
     // A bounding box is required unless a local --file supplies one to derive it from.
-    // Terrain-only mode ignores --file (it never loads OSM objects), so it always needs --bbox.
+    // A run that loads no OSM data ignores --file, so it always needs --bbox.
     if args.bbox.is_none() {
-        if args.skip_objects() {
+        if args.skip_osm() {
             return Err(
-                "--mode terrain-only requires --bbox (a local --file is ignored in terrain-only mode)."
+                "--bbox is required: below scale 0.3, or off Earth, no OpenStreetMap data is loaded and --file is ignored."
                     .to_string(),
             );
         }
@@ -934,8 +1173,8 @@ pub fn validate_args(args: &Args) -> Result<(), String> {
             let llpoint =
                 LLPoint::new(lat, lng).map_err(|e| format!("Invalid spawn coordinates: {e}"))?;
 
-            // Validate that spawn point is within the bounding box. Only enforceable when the
-            // bbox is known up front; a file-derived bbox isn't available until the file is parsed.
+            // Validate that spawn point is within the bounding box. A file-derived bbox is
+            // checked in run_cli once the file is parsed.
             if let Some(bbox) = args.bbox {
                 if !bbox.contains(&llpoint) {
                     return Err(
@@ -966,12 +1205,12 @@ pub fn validate_args(args: &Args) -> Result<(), String> {
 
 /// Legal `--ground-level` range for the chosen output format. The scaler clamps every column
 /// into `[ground_level, ceiling]`, so a base above the ceiling makes that clamp's min exceed
-/// its max and aborts the run after the whole elevation download.
+/// its max and aborts the run after the whole elevation download. A run that picks its build
+/// height from the area may use the extended range: a base outside vanilla's makes it extend.
 fn ground_level_bounds(args: &Args) -> (i32, i32) {
-    let floor = crate::ground::extended_min_y_for(args) + 2;
-    let ceiling =
-        crate::ground::world_top_y_for(args) - crate::elevation::postprocess::TERRAIN_HEIGHT_BUFFER;
-    (floor, ceiling)
+    let extended = args.disable_height_limit || crate::ground::auto_height(args);
+    let range = crate::ground::ground_level_range(args, extended);
+    (*range.start(), *range.end())
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -982,6 +1221,106 @@ fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gameplay_extras_are_java_only_but_vehicles_and_gravity_needs_another_body() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmp_path = tmpdir.path().to_str().unwrap();
+        let parse = |extra: &[&str]| {
+            let mut cmd = vec!["arnis", "--output-dir", tmp_path, "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            let mut args = Args::parse_from(cmd.iter());
+            apply_body_defaults(&mut args);
+            args
+        };
+        assert!(validate_args(&parse(&["--traffic-lights", "--zombie-outbreak"])).is_ok());
+        let bedrock = validate_args(&parse(&["--bedrock", "--discoveries"])).unwrap_err();
+        assert!(bedrock.contains("--discoveries"), "{bedrock}");
+        // Vehicles come with an add-on of their own on Bedrock, but not on Luanti.
+        assert!(validate_args(&parse(&["--bedrock", "--moving-vehicles"])).is_ok());
+        let luanti = validate_args(&parse(&["--luanti", "--moving-vehicles"])).unwrap_err();
+        assert!(luanti.contains("--moving-vehicles"), "{luanti}");
+        let lights = validate_args(&parse(&[
+            "--bedrock",
+            "--moving-vehicles",
+            "--traffic-lights",
+        ]))
+        .unwrap_err();
+        assert!(lights.contains("--traffic-lights"), "{lights}");
+        assert!(validate_args(&parse(&["--body-gravity"])).is_err());
+        assert!(validate_args(&parse(&["--body", "moon", "--body-gravity"])).is_ok());
+        let one_world = validate_args(&parse(&["--one-world", "--pause-menu"])).unwrap_err();
+        assert!(one_world.contains("--pause-menu"), "{one_world}");
+    }
+
+    #[test]
+    fn disasters_bring_filled_ground_with_rock_under_the_lowest_point() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmp_path = tmpdir.path().to_str().unwrap();
+        let parse = |extra: &[&str]| {
+            let mut cmd = vec!["arnis", "--output-dir", tmp_path, "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            let mut args = Args::parse_from(cmd.iter());
+            apply_body_defaults(&mut args);
+            apply_feature_needs(&mut args);
+            args
+        };
+        let plain = parse(&[]);
+        assert!(!plain.fillground);
+        assert_eq!(plain.ground_level, -62);
+        let disasters = parse(&["--disasters"]);
+        assert!(disasters.fillground);
+        assert_eq!(disasters.ground_level, DISASTER_GROUND_LEVEL);
+        assert!(validate_args(&disasters).is_ok());
+        let higher = parse(&["--disasters", "--ground-level", "10"]);
+        assert_eq!(higher.ground_level, 10);
+        assert!(parse(&["--caves"]).fillground);
+    }
+
+    #[test]
+    fn mob_spawning_stays_off_where_the_world_brings_its_own_mobs() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmp_path = tmpdir.path().to_str().unwrap();
+        let parse = |extra: &[&str]| {
+            let mut cmd = vec!["arnis", "--output-dir", tmp_path, "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            let mut args = Args::parse_from(cmd.iter());
+            apply_body_defaults(&mut args);
+            apply_feature_needs(&mut args);
+            args
+        };
+        assert_eq!(parse(&[]).mob_spawning, MobSpawning::Off);
+        let animals = parse(&["--mob-spawning", "animals"]);
+        assert_eq!(animals.mob_spawning, MobSpawning::Animals);
+        assert!(validate_args(&animals).is_ok());
+        let bedrock = parse(&["--bedrock", "--mob-spawning", "all"]);
+        assert_eq!(bedrock.mob_spawning, MobSpawning::All);
+        assert!(validate_args(&bedrock).is_ok());
+
+        for extra in [
+            &["--zombie-outbreak"][..],
+            &["--disasters"],
+            &["--body", "moon"],
+        ] {
+            let mut cmd = extra.to_vec();
+            cmd.extend(["--mob-spawning", "all"]);
+            assert_eq!(parse(&cmd).mob_spawning, MobSpawning::Off, "{extra:?}");
+        }
+
+        let luanti = validate_args(&parse(&["--luanti", "--mob-spawning", "animals"])).unwrap_err();
+        assert!(luanti.contains("--mob-spawning"), "{luanti}");
+        assert!(validate_args(&parse(&["--luanti"])).is_ok());
+
+        assert_eq!(MobSpawning::from_str_lossy("animals"), MobSpawning::Animals);
+        assert_eq!(MobSpawning::from_str_lossy("all"), MobSpawning::All);
+        assert_eq!(MobSpawning::from_str_lossy("bogus"), MobSpawning::Off);
+        assert!(!MobSpawning::Off.spawns() && !MobSpawning::Off.monsters());
+        assert!(MobSpawning::Animals.spawns() && !MobSpawning::Animals.monsters());
+        assert!(MobSpawning::All.spawns() && MobSpawning::All.monsters());
+        let difficulties = [MobSpawning::Off, MobSpawning::Animals, MobSpawning::All]
+            .map(|m| (m.java_difficulty(), m.bedrock_difficulty()));
+        assert_eq!(difficulties, [(0, 2), (0, 0), (2, 2)]);
+    }
 
     #[test]
     fn test_generation_mode() {
@@ -1099,19 +1438,39 @@ mod tests {
 
         assert!(validate_args(&parse(&[])).is_ok());
         // Vanilla ceiling is 319 - 15; above it the scaler's clamp has min > max and panics.
-        assert!(gl(&[], 304).is_ok());
-        assert!(gl(&[], 305).is_err());
-        assert!(gl(&[], 400).is_err());
+        let vanilla: &[&str] = &["--vanilla-height"];
+        assert!(gl(vanilla, 304).is_ok());
+        assert!(gl(vanilla, 305).is_err());
+        assert!(gl(vanilla, 400).is_err());
         // Below the bedrock plane there is nothing to stand on.
-        assert!(gl(&[], -63).is_err());
+        assert!(gl(vanilla, -63).is_err());
 
         // The tall datapack raises the ceiling to 2031; Bedrock's pack stops far below it.
-        let dhl: &[&str] = &["--disable-height-limit"];
-        assert!(gl(dhl, 2016).is_ok());
-        assert!(gl(dhl, 2017).is_err());
-        assert!(gl(dhl, -2030).is_ok());
-        assert!(gl(dhl, -2031).is_err());
+        // By default a base outside vanilla's range is what makes the run extend.
+        for extended in [&[][..], &["--disable-height-limit"][..]] {
+            assert!(gl(extended, 2016).is_ok(), "{extended:?}");
+            assert!(gl(extended, 2017).is_err(), "{extended:?}");
+            assert!(gl(extended, -2030).is_ok(), "{extended:?}");
+            assert!(gl(extended, -2031).is_err(), "{extended:?}");
+        }
         assert!(gl(&["--bedrock", "--disable-height-limit"], 500).is_err());
+        assert!(gl(&["--bedrock"], 500).is_err());
+    }
+
+    #[test]
+    fn vanilla_height_and_the_forced_pack_exclude_each_other() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmp_path = tmpdir.path().to_str().unwrap();
+        let cmd = |extra: &[&'static str]| {
+            let mut cmd = vec!["arnis", "--output-dir", tmp_path, "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            cmd
+        };
+        let args = Args::try_parse_from(cmd(&["--vanilla-height"])).unwrap();
+        assert!(args.vanilla_height && !args.disable_height_limit);
+        assert!(
+            Args::try_parse_from(cmd(&["--vanilla-height", "--disable-height-limit"])).is_err()
+        );
     }
 
     #[test]
@@ -1129,7 +1488,8 @@ mod tests {
         for flags in [
             &["--luanti"][..],
             &["--luanti", "--disable-height-limit"][..],
-            &["--bedrock"][..],
+            &["--bedrock", "--vanilla-height"][..],
+            &["--body", "moon"][..],
         ] {
             assert!(gl(flags, -62).is_ok(), "{flags:?} rejected the default");
             assert!(gl(flags, 304).is_ok(), "{flags:?} rejected 304");
@@ -1138,10 +1498,14 @@ mod tests {
         }
 
         // Bedrock's behavior pack raises the ceiling to 511 but leaves the floor vanilla.
-        let bedrock_dhl: &[&str] = &["--bedrock", "--disable-height-limit"];
-        assert!(gl(bedrock_dhl, 496).is_ok());
-        assert!(gl(bedrock_dhl, 497).is_err());
-        assert!(gl(bedrock_dhl, -63).is_err());
+        for bedrock in [
+            &["--bedrock"][..],
+            &["--bedrock", "--disable-height-limit"][..],
+        ] {
+            assert!(gl(bedrock, 496).is_ok(), "{bedrock:?}");
+            assert!(gl(bedrock, 497).is_err(), "{bedrock:?}");
+            assert!(gl(bedrock, -63).is_err(), "{bedrock:?}");
+        }
     }
 
     #[test]
@@ -1177,6 +1541,7 @@ mod tests {
         assert!(!args.disable_height_limit);
         assert!(!args.bake_lighting);
         assert!(!args.voxy_lod);
+        assert!(!args.dh_lod);
         assert!(!args.map_preview);
         assert_eq!(args.signage, SignageLevel::Basic);
         let cmd = [
@@ -1352,11 +1717,11 @@ mod tests {
     }
 
     #[test]
-    fn test_terrain_only_requires_bbox_even_with_file() {
+    fn test_terrain_only_reads_a_file_but_small_scale_needs_a_bbox() {
         let tmpdir = tempfile::tempdir().unwrap();
         let tmp_path = tmpdir.path().to_str().unwrap();
 
-        // terrain-only ignores --file, so a bbox is still required.
+        // Terrain-only loads OSM for its water, so a file can supply the bbox.
         let cmd = [
             "arnis",
             "--output-dir",
@@ -1367,20 +1732,108 @@ mod tests {
             "terrain-only",
         ];
         let args = Args::try_parse_from(cmd.iter()).unwrap();
-        assert!(validate_args(&args).is_err());
+        assert!(!args.skip_osm());
+        assert!(validate_args(&args).is_ok());
 
-        // With --bbox it validates.
+        // Below the object scale nothing is loaded, so --file is ignored.
         let cmd = [
             "arnis",
             "--output-dir",
             tmp_path,
-            "--bbox",
-            "1,2,3,4",
-            "--mode",
-            "terrain-only",
+            "--file",
+            "area.osm",
+            "--scale",
+            "0.1",
         ];
         let args = Args::try_parse_from(cmd.iter()).unwrap();
-        assert!(validate_args(&args).is_ok());
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn blueprint_turns_off_whatever_dresses_a_building() {
+        let parse = |extra: &[&str]| {
+            let mut cmd = vec!["arnis", "--output-dir", "out", "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            Args::parse_from(cmd.iter())
+        };
+        let mut args = parse(&["--mode", "blueprint", "--interior", "--building-facades"]);
+        assert!(args.terrain());
+        assert!(!args.skip_objects());
+        apply_body_defaults(&mut args);
+        assert!(!args.use_3d && !args.interior && !args.building_facades);
+        assert_eq!(args.mapillary_facades, Some(false));
+    }
+
+    #[test]
+    fn a_blueprint_has_no_street_furniture() {
+        let parse = |extra: &[&str]| {
+            let mut cmd = vec!["arnis", "--output-dir", "out", "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            let mut args = Args::parse_from(cmd.iter());
+            apply_body_defaults(&mut args);
+            args
+        };
+        let args = parse(&["--traffic-lights", "--signage", "full"]);
+        assert!(args.traffic_lights && args.signage.full());
+        let args = parse(&[
+            "--mode",
+            "blueprint",
+            "--traffic-lights",
+            "--signage",
+            "full",
+        ]);
+        assert!(!args.traffic_lights && !args.signage.enabled());
+    }
+
+    #[test]
+    fn gui_mode_names_match_the_cli() {
+        assert_eq!(
+            GenerationMode::from_name("blueprint"),
+            GenerationMode::Blueprint
+        );
+        assert_eq!(
+            GenerationMode::from_name("terrain-only"),
+            GenerationMode::TerrainOnly
+        );
+        assert_eq!(
+            GenerationMode::from_name("geo-only"),
+            GenerationMode::GeoOnly
+        );
+        assert_eq!(
+            GenerationMode::from_name("nonsense"),
+            GenerationMode::GeoTerrain
+        );
+    }
+
+    #[test]
+    fn winter_and_ruins_stay_on_earth() {
+        let parse = |extra: &[&str]| {
+            let mut cmd = vec!["arnis", "--output-dir", "out", "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            Args::parse_from(cmd.iter())
+        };
+        let mut args = parse(&["--winter", "--post-apocalyptic"]);
+        apply_body_defaults(&mut args);
+        assert!(args.winter && args.post_apocalyptic);
+        let mut args = parse(&["--winter", "--post-apocalyptic", "--body", "moon"]);
+        apply_body_defaults(&mut args);
+        assert!(!args.winter && !args.post_apocalyptic);
+    }
+
+    #[test]
+    fn the_grass_plain_stays_on_earth() {
+        let parse = |extra: &[&str]| {
+            let mut cmd = vec!["arnis", "--output-dir", "out", "--bbox", "1,2,3,4"];
+            cmd.extend_from_slice(extra);
+            let mut args = Args::parse_from(cmd.iter());
+            apply_body_defaults(&mut args);
+            args
+        };
+        assert_eq!(parse(&["--world-type", "flat"]).world_type, WorldType::Flat);
+        for body in ["moon", "mars"] {
+            let args = parse(&["--world-type", "flat", "--body", body]);
+            assert_eq!(args.world_type, WorldType::Void);
+        }
     }
 
     /// `--help` must not print the Mapillary token.
@@ -1411,6 +1864,7 @@ mod tests {
             "the help should name the variable without its value"
         );
         assert!(!help.contains("MAPILLARY_TOKEN="));
+        assert!(!help.contains("hide_env_values"));
     }
 
     #[test]

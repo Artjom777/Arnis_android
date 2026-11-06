@@ -134,28 +134,29 @@ pub struct PrescanResult {
 }
 
 impl PrescanResult {
-    /// Exactly the regions the stamps touch. The shared region_keys_around pads by a whole
-    /// region each side, which for a 27 block model pins about four times more than needed.
-    pub fn deferred_region_keys(&self) -> Vec<(i32, i32)> {
-        let mut out = Vec::new();
-        for p in &self.placements {
-            let (rx0, rx1) = (
-                (p.anchor_x - PLANE_REACH_BLOCKS) >> 9,
-                (p.anchor_x + PLANE_REACH_BLOCKS) >> 9,
-            );
-            let (rz0, rz1) = (
-                (p.anchor_z - PLANE_REACH_BLOCKS) >> 9,
-                (p.anchor_z + PLANE_REACH_BLOCKS) >> 9,
-            );
-            for rx in rx0..=rx1 {
-                for rz in rz0..=rz1 {
-                    out.push((rx, rz));
-                }
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        out
+    pub fn placement_count(&self) -> usize {
+        self.placements.len()
+    }
+
+    /// Exactly the regions each plane's stamps touch. The shared region_keys_around pads by a
+    /// whole region each side, which for a 27 block model pins about four times more than needed.
+    pub fn placement_regions(&self) -> Vec<Vec<(i32, i32)>> {
+        self.placements
+            .iter()
+            .map(|p| {
+                let (rx0, rx1) = (
+                    (p.anchor_x - PLANE_REACH_BLOCKS) >> 9,
+                    (p.anchor_x + PLANE_REACH_BLOCKS) >> 9,
+                );
+                let (rz0, rz1) = (
+                    (p.anchor_z - PLANE_REACH_BLOCKS) >> 9,
+                    (p.anchor_z + PLANE_REACH_BLOCKS) >> 9,
+                );
+                (rx0..=rx1)
+                    .flat_map(|rx| (rz0..=rz1).map(move |rz| (rx, rz)))
+                    .collect()
+            })
+            .collect()
     }
 }
 
@@ -177,8 +178,9 @@ pub fn prescan(elements: &[ProcessedElement], args: &Args) -> PrescanResult {
 }
 
 /// Stamp the planes, after ground generation so the runway Y is final.
-pub fn place_plane_models(editor: &mut WorldEditor, prescan: &PrescanResult) {
-    if prescan.placements.is_empty() || !editor.place_schematics() {
+/// Places `indices` (into the prescan's placements, ascending).
+pub fn place_plane_models(editor: &mut WorldEditor, prescan: &PrescanResult, indices: &[usize]) {
+    if indices.is_empty() || !editor.place_schematics() {
         return;
     }
 
@@ -189,18 +191,14 @@ pub fn place_plane_models(editor: &mut WorldEditor, prescan: &PrescanResult) {
     println!(
         "{} Placing {} plane{}...",
         "  [+]".bold(),
-        prescan.placements.len(),
-        if prescan.placements.len() == 1 {
-            ""
-        } else {
-            "s"
-        }
+        indices.len(),
+        if indices.len() == 1 { "" } else { "s" }
     );
 
     let mut parked = 0usize;
     let mut climbing = 0usize;
 
-    for p in &prescan.placements {
+    for p in indices.iter().map(|&i| &prescan.placements[i]) {
         let fleet = fleet(p.kind == PlaneKind::Parked);
         if fleet.is_empty() {
             continue;
@@ -315,6 +313,14 @@ fn extract_aeroway_segment(element: &ProcessedElement) -> Option<Seg> {
     };
     // Skip area representations — we only place planes along linear centerlines.
     if w.tags.get("area").map(|s| s.as_str()) == Some("yes") {
+        return None;
+    }
+    // Grass and dirt strips serve light aircraft, not the airliner model. Gravel stays:
+    // jets land on gravel runways in the Arctic.
+    if matches!(
+        w.tags.get("surface").map(String::as_str),
+        Some("grass" | "dirt" | "ground" | "earth" | "soil" | "sand" | "mud" | "clay")
+    ) {
         return None;
     }
     if w.nodes.len() < 2 {
@@ -816,6 +822,30 @@ mod tests {
         let mut tags = StdMap::new();
         tags.insert("aeroway".to_string(), "taxiway".to_string());
         ProcessedElement::Way(ProcessedWay { id, nodes, tags })
+    }
+
+    #[test]
+    fn grass_strips_get_no_airliner() {
+        let mut tags = runway_tags();
+        tags.insert("surface".to_string(), "grass".to_string());
+        let grass = ProcessedElement::Way(ProcessedWay {
+            id: 1,
+            nodes: vec![mk_node(1, 0, 0), mk_node(2, 500, 0)],
+            tags,
+        });
+        assert!(collect_aeroways(&[grass]).is_empty());
+
+        let paved = runway_way(2, vec![mk_node(3, 0, 0), mk_node(4, 500, 0)]);
+        assert_eq!(collect_aeroways(&[paved]).len(), 1);
+
+        let mut tags = runway_tags();
+        tags.insert("surface".to_string(), "gravel".to_string());
+        let gravel = ProcessedElement::Way(ProcessedWay {
+            id: 3,
+            nodes: vec![mk_node(5, 0, 0), mk_node(6, 500, 0)],
+            tags,
+        });
+        assert_eq!(collect_aeroways(&[gravel]).len(), 1);
     }
 
     #[test]

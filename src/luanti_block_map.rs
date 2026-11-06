@@ -1,6 +1,8 @@
 use crate::block_definitions::Block;
 use fastnbt::Value;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /* * This file contains data converted from MC2MT.
  * Original C++ Source Copyright (C) 2016 rollerozxa
@@ -156,19 +158,33 @@ fn conv_stair(props: Option<&Value>, name: &'static str) -> LuantiNode {
     LuantiNode { name, param2 }
 }
 
-/// MC2MT `CONV_SLAB` equivalent.
+/// MC2MT `CONV_SLAB` equivalent, for every slab at once.
 ///
-/// MC2MT expands CONV_SLAB(id, mcn, dbottom, dtop, mtn) into 2 entries:
-///   bottom → mtn,        param2 = 0
-///   top    → mtn "_top", param2 = 0
-#[allow(dead_code)]
-fn conv_slab(props: Option<&Value>, bottom: &'static str, top: &'static str) -> LuantiNode {
-    let name = if prop_eq(props, "type", "top") {
-        top
-    } else {
-        bottom
+/// Mineclonia registers each slab `mcl_stairs:slab_X` as three nodes:
+///   bottom → `slab_X`, top → `slab_X_top`, double → `slab_X_double`.
+/// The half comes from the stored `type`, else from the block's own default
+/// (a few slab ids are the top half unless told otherwise).
+fn slab_half(block: Block, props: Option<&Value>, name: &'static str) -> &'static str {
+    if !name.starts_with("mcl_stairs:slab_") || name.ends_with("_double") {
+        return name;
+    }
+    let half = prop_str(props, "type").or_else(|| {
+        (block == crate::block_definitions::OAK_SLAB_TOP
+            || block == crate::block_definitions::QUARTZ_SLAB_TOP)
+            .then_some("top")
+    });
+    let suffix = match half {
+        Some("top") => "_top",
+        Some("double") => "_double",
+        _ => return name,
     };
-    LuantiNode { name, param2: 0 }
+    // A few dozen slab names in all, each spelled out once.
+    static NAMES: Lazy<Mutex<HashMap<(&'static str, &'static str), &'static str>>> =
+        Lazy::new(Default::default);
+    let mut names = NAMES.lock().unwrap_or_else(|p| p.into_inner());
+    names
+        .entry((name, suffix))
+        .or_insert_with(|| Box::leak(format!("{name}{suffix}").into_boxed_str()))
 }
 
 /// Java `facing` of a block growing out of a surface (amethyst buds) → Luanti wallmounted
@@ -259,6 +275,20 @@ fn conv_pointed_dripstone(props: Option<&Value>) -> LuantiNode {
     LuantiNode { name, param2: 0 }
 }
 
+/// Mineclonia chains are facedir nodes: 0 stands upright, 4 lies along z and 12 along x.
+fn conv_chain(block: Block, props: Option<&Value>) -> LuantiNode {
+    let defaults = block.properties();
+    let param2 = match prop_str(props.or(defaults.as_ref()), "axis") {
+        Some("x") => 12,
+        Some("z") => 4,
+        _ => 0,
+    };
+    LuantiNode {
+        name: "mcl_lanterns:chain",
+        param2,
+    }
+}
+
 /// Maps an Arnis Block to a Luanti node for the given game pack.
 ///
 /// Directional blocks (stairs, trapdoors, etc.) use the optional `props`
@@ -289,7 +319,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         15 => "mcl_core:stonebrickcracked",
         16 => "mcl_colorblocks:concrete_cyan",
         17 => return conv_stair(props, "mcl_stairs:stair_cobble"), // COBBLESTONE_STAIRS
-        18 => "mcl_nether:magma",                                  // MAGMA_BLOCK
+        18 => "mcl_wool:grey",
         19 => "mcl_trees:wood_dark_oak",
         20 => "mcl_deepslate:deepslate_bricks",
         21 => "mcl_core:diorite",
@@ -309,7 +339,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         35 => "mcl_farming:hay_block",
         36 => "mcl_panes:bar_flat",
         37 => "mcl_core:ironblock",
-        38 => return conv_stair(props, "mcl_stairs:stair_copper_cut"), // WAXED_CUT_COPPER_STAIRS
+        38 => "mcl_amethyst:calcite",
         39 => "mcl_colorblocks:concrete_yellow",
         40 => "mcl_core:snow", // SNOW_LAYER
         41 => "mcl_colorblocks:hardened_clay_light_blue",
@@ -318,7 +348,9 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         44 => "mcl_core:mossycobble",
         45 => "mcl_mud:mud_bricks",
         46 => "mcl_nether:nether_brick",
-        47 => "mcl_nether:netheriteblock",
+        // No invisible light node in the Mineclonia family. Building interiors
+        // use flush ceiling lamps for Luanti instead, so this is never placed.
+        47 => "air",
         48 => "mcl_fences:oak_fence",
         49 => "mcl_trees:leaves_oak",
         50 => "mcl_trees:tree_oak",
@@ -349,7 +381,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         75 => return conv_stair(props, "mcl_stairs:stair_spruce"), // SPRUCE_STAIRS
         76 => "mcl_core:sandstonesmooth2",
         77 => "mcl_stairs:slab_stone_double",
-        78 => "mcl_sponges:sponge",
+        78 => "mcl_trees:wood_birch",
         79 => "mcl_trees:tree_spruce",
         80 => "mcl_trees:wood_spruce",
         81 => "mcl_stairs:slab_stone",
@@ -368,11 +400,17 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         94 => "mcl_flowers:dandelion",
         95 => "mcl_core:water_source", // SEA_PICKLE
         96 => "mcl_nether:soul_sand",  // SOUL_SAND
-        97 => return conv_stair(props, "mcl_stairs:stair_red_nether_brick"), // RED_NETHER_BRICK_STAIRS
+        97 => return conv_stair(props, "mcl_stairs:stair_deepslate_cobbled"), // COBBLED_DEEPSLATE_STAIRS
         98 => "mcl_walls:sandstone",
         99 => "mcl_stairs:slab_sandstonesmooth",
         100 => "mcl_colorblocks:concrete_red",
-        101 => "mcl_doors:iron_trapdoor", // IRON_TRAPDOOR
+        101 => {
+            return conv_trapdoor(
+                props,
+                "mcl_doors:iron_trapdoor",
+                "mcl_doors:iron_trapdoor_open",
+            )
+        } // IRON_TRAPDOOR
         102 => return conv_stair(props, "mcl_stairs:stair_copper_oxidized_cut"), // WAXED_OXIDIZED_CUT_COPPER_STAIRS
         103 => "mcl_copper:block_oxidized", // WAXED_OXIDIZED_COPPER (waxed variant approximated as oxidized)
         104 => "mcl_colorblocks:hardened_clay_yellow",
@@ -382,7 +420,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         109 => "mcl_farming:wheat_7",
         110 => "mcl_core:bedrock",
         111 => "mcl_core:snowblock",
-        112 => return conv_stair(props, "mcl_stairs:stair_andesite"), // ANDESITE_STAIRS
+        112 => "mcl_trees:wood_cherry_blossom",
         113 => {
             return conv_trapdoor(
                 props,
@@ -410,7 +448,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         140 => "mcl_furnaces:furnace",
         141 => "mcl_wool:white_carpet",
         142 => "mcl_books:bookshelf",
-        143 => "mcl_trees:wood_oak",
+        143 => "mcl_stairs:slab_quartz_smooth",
         144 => return conv_stair(props, "mcl_stairs:stair_oak"),
         145 => "mcl_colorblocks:concrete_orange",
         146 => "mcl_colorblocks:concrete_purple",
@@ -425,7 +463,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         155 => "mcl_chests:chest",
         156 => "mcl_buttons:button_stone_off",
         157 => "mcl_anvils:anvil",
-        158 => "mcl_noteblock:noteblock",
+        158 => "mcl_wool:silver",
         159 => "mcl_deepslate:deepslatepolishedwall",
         160 => "mcl_brewing:stand_000",
         161 | 162 | 165..=168 | 294 | 295 => return conv_bed(block, props, "red"),
@@ -434,7 +472,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         169 => "mcl_core:glass_grey",
         170 => "mcl_core:glass_silver",
         171 => "mcl_core:glass_brown",
-        172 => "mcl_core:glass",
+        172 => "mcl_colorblocks:concrete_powder_silver",
         173 => "mcl_colorblocks:concrete_magenta",
         174 => "mcl_colorblocks:concrete_brown",
         175 => "mcl_colorblocks:hardened_clay_black",
@@ -444,7 +482,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         179 => return conv_stair(props, "mcl_stairs:stair_blackstone_brick_polished"),
         180 => return conv_stair(props, "mcl_stairs:stair_brick_block"),
         181 => return conv_stair(props, "mcl_stairs:stair_granite_smooth"),
-        182 => return conv_stair(props, "mcl_stairs:stair_end_bricks"),
+        182 => "mcl_mushrooms:brown_mushroom_block_stem_full",
         183 => return conv_stair(props, "mcl_stairs:stair_diorite_smooth"),
         184 => return conv_stair(props, "mcl_stairs:stair_sandstone"),
         185 => return conv_stair(props, "mcl_stairs:stair_quartzblock"),
@@ -455,7 +493,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         190 => "mcl_colorblocks:concrete_lime",
         191 => "mcl_colorblocks:concrete_blue",
         192 => "mcl_panes:pane_grey_flat",
-        193 => "mcl_fences:oak_fence_gate",
+        193 => "mcl_stairs:slab_granite_smooth",
         194 => "mcl_fences:spruce_fence_gate",
         195 => "mcl_copper:block", // WAXED_COPPER_BLOCK
         196 => "mcl_panes:pane_natural_flat",
@@ -466,13 +504,13 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         201 => "mcl_lightning_rods:rod",
         202 => "mcl_flowerpots:flower_pot",
         203 => "mcl_ocean:sea_lantern",
-        204 => "mcl_copper:block_exposed_chiseled", // WAXED_EXPOSED_CHISELED_COPPER
-        205 => "mcl_stairs:slab_warped",
-        206 => return conv_stair(props, "mcl_stairs:stair_warped"), // WARPED_STAIRS
+        204 => "mcl_stairs:slab_diorite_smooth",
+        205 => "mcl_farming:beetroot", // BEETROOTS
+        206 => "mcl_farming:wheat_7",  // WHEAT_YOUNG, exported ripe
         207 => "mcl_colorblocks:concrete_green",
         208 => "mcl_walls:brick",
-        209 => "mcl_redstone_torch:redstoneblock",
-        210 | 362 => "mcl_lanterns:chain",
+        209 => "mcl_farming:carrot_7", // CARROTS_YOUNG, exported ripe
+        210 | 362 => return conv_chain(block, props),
         211 => {
             return conv_trapdoor(
                 props,
@@ -480,10 +518,10 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
                 "mcl_doors:trapdoor_warped_open",
             )
         } // WARPED_TRAPDOOR
-        212 => "mcl_trees:stripped_warped",
-        213 => "mcl_trees:bark_stripped_warped",
-        214 => "mcl_stairs:slab_stone_double",
-        215 => "mcl_copper:block_exposed_cut", // WAXED_EXPOSED_CUT_COPPER
+        212 => "mcl_farming:potato_4", // POTATOES_YOUNG, exported ripe
+        213 => "mcl_farming:beetroot", // BEETROOTS_YOUNG, exported ripe
+        214 => "mcl_stairs:slab_stone",
+        215 => "mcl_stairs:slab_deepslate_cobbled",
         216 => "mcl_colorblocks:hardened_clay_silver",
         217 => "mcl_stairs:slab_oak",
         218 => "mcl_redstone_lamp:lamp_on", // REDSTONE_LAMP (only placed lit)
@@ -500,7 +538,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         229 => "mcl_daylight_detector:daylight_detector",
         230 => "mcl_trees:tree_cherry_blossom", // CHERRY_LOG (Mineclonia may not have cherry yet)
         231 => "mcl_trees:leaves_cherry_blossom", // CHERRY_LEAVES (fallback if cherry missing)
-        232 => "mcl_colorblocks:concrete_powder_brown", // BROWN_CONCRETE_POWDER
+        232 => return conv_stair(props, "mcl_stairs:stair_granite"), // GRANITE_STAIRS
         233 => "mcl_trees:leaves_mangrove",
         234 => "mcl_trees:leaves_azalea",
         235 => "mcl_flowers:poppy",
@@ -557,7 +595,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         265 => "mcl_stairs:slab_cobble",
         266 => "mcl_fences:nether_brick_fence",
         267 => "mcl_fences:birch_fence",
-        268 => "mcl_stairs:slab_quartz_smooth",
+        268 => "mcl_trees:wood_oak",
         269 => return conv_stair(props, "mcl_stairs:stair_quartz_smooth"), // SMOOTH_QUARTZ_STAIRS
         270 => return conv_stair(props, "mcl_stairs:stair_blackstone"),    // BLACKSTONE_STAIRS
         271 => "mcl_blackstone:wall",
@@ -597,12 +635,12 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         308 => "mcl_fences:spruce_fence",
         309 => "mcl_stairs:slab_spruce",
         310 => "mcl_stairs:slab_andesite",
-        311 => "mcl_stairs:slab_deepslate_cobbled",
-        312 => return conv_stair(props, "mcl_stairs:stair_deepslate_cobbled"), // COBBLED_DEEPSLATE_STAIRS
+        311 => "mcl_copper:block_exposed_cut", // WAXED_EXPOSED_CUT_COPPER
+        312 => return conv_stair(props, "mcl_stairs:stair_red_nether_brick"), // RED_NETHER_BRICK_STAIRS
         313 => "mcl_fences:dark_oak_fence",
         314 => "mcl_pressureplates:pressure_plate_dark_oak_off",
         317 => "mcl_banners:hanging_banner",
-        318 => "mcl_wool:grey",
+        318 => "mcl_nether:magma", // MAGMA_BLOCK
         319 => "mcl_nether:nether_wart_block",
         321 => "mcl_blackstone:basalt_polished",
         322 => "mcl_buttons:button_polished_blackstone_off",
@@ -634,14 +672,21 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         343 => "mcl_stairs:slab_stonebrickmossy",
         344 => "mcl_ocean:prismarine",
         345 => "mcl_end:end_rod",
+        // Mineclonia has no tripwire hook; a button is as small and hangs on the same wall.
+        346 => {
+            return LuantiNode {
+                name: "mcl_buttons:button_stone_off",
+                param2: facing_to_wallmounted(prop_str(props, "facing").unwrap_or("north")),
+            }
+        }
         347 => "mcl_signs:wall_sign_spruce",
-        348 => return conv_stair(props, "mcl_stairs:stair_granite"), // GRANITE_STAIRS
+        348 => "mcl_colorblocks:concrete_powder_brown", // BROWN_CONCRETE_POWDER
         349 => return conv_stair(props, "mcl_stairs:stair_diorite"), // DIORITE_STAIRS
         350 => "mcl_deepslate:deepslate_tiles",
         351 => "mcl_stairs:slab_deepslate_tiles",
         352 => "mcl_deepslate:deepslatetileswall",
         353 => "mcl_stairs:slab_blackstone_polished",
-        354 => "mcl_stairs:slab_diorite_smooth",
+        354 => "mcl_copper:block_exposed_chiseled", // WAXED_EXPOSED_CHISELED_COPPER
         355 => "mcl_lanterns:soul_lantern_floor",
         356 => "mcl_nether:quartz_chiseled",
         357 => "mcl_nether:quartz_pillar",
@@ -660,7 +705,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         371 => "mcl_trees:wood_crimson",
         372 => "mcl_stairs:slab_crimson",
         373 => return conv_stair(props, "mcl_stairs:stair_crimson"),
-        374 => "mcl_trees:wood_cherry_blossom",
+        374 => return conv_stair(props, "mcl_stairs:stair_andesite"), // ANDESITE_STAIRS
         375 => "mcl_stairs:slab_cherry_blossom",
         376 => return conv_stair(props, "mcl_stairs:stair_cherry_blossom"),
         377 => "mcl_ocean:prismarine_dark",
@@ -683,7 +728,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         387 => "mcl_core:ice",
         388 => "mcl_core:blue_ice",
         389 => "mcl_powder_snow:powder_snow",
-        390 => "mcl_amethyst:calcite",
+        390 => return conv_stair(props, "mcl_stairs:stair_copper_cut"), // WAXED_CUT_COPPER_STAIRS
         391 => "mcl_amethyst:amethyst_block",
         392 => "mcl_amethyst:budding_amethyst_block",
         393..=396 => {
@@ -735,7 +780,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         419 => "mcl_mushrooms:mushroom_brown",
         420 => "mcl_mushrooms:red_mushroom_block_cap_111111",
         421 => "mcl_mushrooms:brown_mushroom_block_cap_111111",
-        422 => "mcl_mushrooms:brown_mushroom_block_stem_full",
+        422 => return conv_stair(props, "mcl_stairs:stair_end_bricks"),
         423 => "mcl_crimson:shroomlight",
         424 => "mcl_ocean:tube_coral_block",
         425 => "mcl_ocean:brain_coral_block",
@@ -787,7 +832,7 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         470 => "mcl_core:cactus",
         471 => "mcl_core:dirt_with_grass_snow",
         472 => "mcl_core:podzol",
-        473 => "mcl_colorblocks:concrete_powder_silver",
+        473 => "mcl_core:glass",
         474 => "mcl_core:snow_2",
         475 => "mcl_core:snow_3",
         476 => "mcl_core:snow_4",
@@ -801,24 +846,140 @@ fn to_mineclonia_node(block: Block, props: Option<&Value>) -> LuantiNode {
         484 => "mcl_farming:melon",
         485 => "mcl_loom:loom",
         486 => "mcl_smithing_table:table",
+        487 => "mcl_nether:netheriteblock",
+        488 => "mcl_trees:wood_mangrove",
+        489 => return conv_stair(props, "mcl_stairs:stair_mangrove"),
+        490 => "mcl_stairs:slab_mangrove",
+        491 => return conv_stair(props, "mcl_stairs:stair_deepslate_tiles"),
+        492 => "mcl_stairs:slab_nether_brick",
+        493 => "mcl_stairs:slab_copper_oxidized_cut",
+        494 => {
+            return LuantiNode {
+                name: "mcl_fences:oak_fence_gate",
+                param2: facing_to_facedir(prop_str(props, "facing").unwrap_or("north")),
+            }
+        }
+        495 => "mcl_sponges:sponge",
+        496 => "mcl_noteblock:noteblock",
+        497 => "mcl_colorblocks:hardened_clay_pink",
+        498 => "mcl_colorblocks:hardened_clay_lime",
+        // Wallmounted toward the wall; MC north (-z) is Luanti +z.
+        499..=502 => {
+            return LuantiNode {
+                name: "mcl_core:vine",
+                param2: [4, 2, 5, 3][usize::from(block.id() - 499)],
+            }
+        }
+        503 => "mcl_nether:netherrack",
+        // On netherrack the game's own fire never goes out either.
+        504 => "mcl_fire:eternal_fire",
+        505 => "mcl_deepslate:deepslate_bricks_cracked",
+        506 => "mcl_deepslate:deepslate_tiles_cracked",
+        507 => "mcl_blackstone:blackstone_brick_polished_cracked",
+        508 => "mcl_nether:cracked_nether_brick",
+        509 => "mcl_walls:mossycobble",
+        510 => return conv_chain(block, props),
+        511 => "mcl_colorblocks:concrete_pink",
+        512 => "mcl_core:glass_orange",
+        513 => "mcl_core:glass_yellow",
+        514 => "mcl_core:glass_red",
+        515 => "mcl_core:glass_lime",
+        516 => "mcl_core:sandstonecarved",
+        517 => "mcl_core:sandstonesmooth",
+        518 => "mcl_raw_ores:raw_gold_block",
+        519 => "mcl_core:lapisblock",
+        520 => "mcl_core:redsand",
+        521 => "mcl_core:redsandstone",
+        522 => "mcl_stairs:slab_warped",
+        523 => return conv_stair(props, "mcl_stairs:stair_warped"), // WARPED_STAIRS
+        524 => "mcl_redstone_torch:redstoneblock",
+        525 => "mcl_trees:stripped_warped",
+        526 => "mcl_trees:bark_stripped_warped",
         _ => "mcl_core:stone",
     };
-    LuantiNode { name, param2: 0 }
+    LuantiNode {
+        name: slab_half(block, props, name),
+        param2: 0,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_definitions::{RED_BED_EAST_FOOT, RED_BED_EAST_HEAD, STONE, WHITE_BED};
+    use crate::block_definitions::{
+        CHAIN_X, CHAIN_Y, CHAIN_Z, OAK_FENCE_GATE, RED_BED_EAST_FOOT, RED_BED_EAST_HEAD, STONE,
+        VINES, WHITE_BED,
+    };
     use std::collections::HashMap;
 
     /// Blocks Mineclonia has no node for, so they can only fall back. Keep this
     /// list short: every entry is a block that exports as plain stone.
-    const NO_MINECLONIA_NODE: &[&str] = &["tripwire_hook"];
+    const NO_MINECLONIA_NODE: &[&str] = &[];
 
     /// The fallback arm is silent -- an unmapped block turns into stone in the
     /// exported world rather than failing. Walk the whole palette so that adding
     /// a block without a Mineclonia node fails here instead of in someone's map.
+    #[test]
+    fn open_iron_trapdoors_stay_open() {
+        use crate::block_definitions::IRON_TRAPDOOR;
+        let open = Value::Compound(HashMap::from([
+            ("open".to_string(), Value::String("true".to_string())),
+            ("facing".to_string(), Value::String("east".to_string())),
+        ]));
+        assert_eq!(
+            to_mineclonia_node(IRON_TRAPDOOR, Some(&open)).name,
+            "mcl_doors:iron_trapdoor_open"
+        );
+        assert_eq!(
+            to_mineclonia_node(IRON_TRAPDOOR, None).name,
+            "mcl_doors:iron_trapdoor"
+        );
+    }
+
+    #[test]
+    fn slabs_export_their_half() {
+        use crate::block_definitions::{
+            POLISHED_GRANITE_SLAB, QUARTZ_SLAB_TOP, SMOOTH_STONE_SLAB, STONE_BRICK_SLAB,
+        };
+        let typed = |t: &str| {
+            Value::Compound(HashMap::from([(
+                "type".to_string(),
+                Value::String(t.to_string()),
+            )]))
+        };
+        let name = |block, props: Option<&Value>| to_mineclonia_node(block, props).name;
+        assert_eq!(
+            name(POLISHED_GRANITE_SLAB, None),
+            "mcl_stairs:slab_granite_smooth"
+        );
+        assert_eq!(
+            name(POLISHED_GRANITE_SLAB, Some(&typed("top"))),
+            "mcl_stairs:slab_granite_smooth_top"
+        );
+        assert_eq!(
+            name(STONE_BRICK_SLAB, Some(&typed("double"))),
+            "mcl_stairs:slab_stonebrick_double"
+        );
+        assert_eq!(
+            name(STONE_BRICK_SLAB, Some(&typed("bottom"))),
+            "mcl_stairs:slab_stonebrick"
+        );
+        assert_eq!(name(SMOOTH_STONE_SLAB, None), "mcl_stairs:slab_stone");
+        assert_eq!(
+            name(SMOOTH_STONE_SLAB, Some(&typed("top"))),
+            "mcl_stairs:slab_stone_top"
+        );
+        // A slab id that is the top half by default stays on top.
+        assert_eq!(
+            name(QUARTZ_SLAB_TOP, None),
+            "mcl_stairs:slab_quartzblock_top"
+        );
+        assert_eq!(
+            name(QUARTZ_SLAB_TOP, Some(&typed("bottom"))),
+            "mcl_stairs:slab_quartzblock"
+        );
+    }
+
     #[test]
     fn beds_export_head_and_foot_facing_their_head() {
         let foot = to_mineclonia_node(RED_BED_EAST_FOOT, None);
@@ -832,6 +993,49 @@ mod tests {
         ]));
         let white = to_mineclonia_node(WHITE_BED, Some(&props));
         assert_eq!((white.name, white.param2), ("mcl_beds:bed_white_top", 2));
+    }
+
+    #[test]
+    fn chains_lie_along_their_axis() {
+        let param2 = |b| to_mineclonia_node(b, None).param2;
+        assert_eq!(
+            (param2(CHAIN_X), param2(CHAIN_Z), param2(CHAIN_Y)),
+            (12, 4, 0)
+        );
+    }
+
+    #[test]
+    fn vines_hang_on_their_wall() {
+        // North, east, south, west, with the Z flip like the multiface blocks.
+        assert_eq!(
+            VINES.map(|v| to_mineclonia_node(v, None).param2),
+            [4, 2, 5, 3]
+        );
+    }
+
+    #[test]
+    fn tripwire_hooks_become_buttons_on_their_wall() {
+        use crate::block_definitions::TRIPWIRE_HOOK;
+        let hook = |facing: &str| {
+            let props = Value::Compound(HashMap::from([(
+                "facing".to_string(),
+                Value::String(facing.to_string()),
+            )]));
+            to_mineclonia_node(TRIPWIRE_HOOK, Some(&props))
+        };
+        assert_eq!(hook("east").name, "mcl_buttons:button_stone_off");
+        assert_eq!((hook("east").param2, hook("south").param2), (3, 4));
+    }
+
+    #[test]
+    fn fence_gates_keep_their_facing() {
+        let props = Value::Compound(HashMap::from([(
+            "facing".to_string(),
+            Value::String("east".to_string()),
+        )]));
+        let gate = to_mineclonia_node(OAK_FENCE_GATE, Some(&props));
+        assert_eq!((gate.name, gate.param2), ("mcl_fences:oak_fence_gate", 1));
+        assert_eq!(to_mineclonia_node(OAK_FENCE_GATE, None).param2, 0);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 pub mod args;
+pub mod bedrock_addon;
 pub mod bedrock_block_map;
 pub mod bench;
 pub mod biome;
@@ -14,8 +15,11 @@ pub mod clipping;
 pub mod colors;
 pub mod coordinate_system;
 pub mod data_processing;
+pub mod datapack;
 pub mod decals;
+pub mod deferred_placement;
 pub mod deterministic_rng;
+pub mod distant_horizons;
 pub mod ecoregion;
 pub mod element_processing;
 pub mod elevation;
@@ -36,6 +40,7 @@ pub mod map_preview;
 pub mod map_renderer;
 pub mod map_transformation;
 pub mod mapillary;
+pub mod mode_filter;
 pub mod models_3d;
 pub mod net;
 pub mod one_world;
@@ -60,11 +65,14 @@ pub mod trees;
 pub mod version_check;
 pub mod voxy;
 pub mod water_depth;
+pub mod water_steps;
 pub mod world_editor;
 pub mod world_utils;
 
 #[cfg(feature = "gui")]
 pub mod gui;
+#[cfg(all(feature = "gui", any(target_os = "linux", all(test, unix))))]
+pub mod linux_gui;
 
 #[cfg(not(feature = "gui"))]
 pub mod progress {

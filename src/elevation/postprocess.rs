@@ -45,10 +45,9 @@ const LEVEL_RUN_M: f64 = 30.0;
 /// Runs iteratively so that multi-pixel artifact clusters are eroded from the outside
 /// in — each pass fixes boundary pixels that have enough normal neighbors.
 ///
-/// Each pass reads from a row-snapshot of the grid taken at the top of the pass and
-/// writes only into the inner cells of `heights`, so the per-row work is independent
-/// and parallelised with rayon. On a 16k² grid (the worst case the elevation
-/// pipeline allows) this is the dominant elevation post-processing cost.
+/// Every cell of a pass reads the grid as the pass found it, and the repairs land after.
+/// Repairs are rare, so after the first pass only the cells that read a repaired one are
+/// judged again: the rest see the same inputs as before and reach the same verdict.
 ///
 /// `m_per_cell` keeps the erosion reach at a constant physical scale: the window is
 /// cell-based, so at tens of metres per cell (a capped grid, or a very low `--scale`)
@@ -69,92 +68,120 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
     // At block resolution this is the 6 m / 10 pass behaviour; past a few metres per cell the
     // window covers real landforms, so widen the gate and stop early.
     let abs_threshold = 6.0f64.max(0.25 * m_per_cell);
-    #[cfg(target_os = "android")]
-    let passes = if m_per_cell > 4.0 { 1 } else { 2 };
-    #[cfg(not(target_os = "android"))]
     let passes = if m_per_cell > 4.0 { 2 } else { 10 };
 
     let r = RADIUS as usize;
-    let mut total_repaired = 0usize;
-    let mut passes_ran = 0usize;
-
-    for pass in 0..passes {
-        // Collect anomaly repairs per row reading immutably from heights
-        let row_repairs: Vec<(usize, Vec<(usize, f64)>)> = heights
-            .par_iter()
-            .enumerate()
-            .filter(|(y, _)| *y >= r && *y < grid_h - r)
-            .map_init(
-                || (Vec::with_capacity(24), Vec::with_capacity(24)),
-                |(neighbors, abs_devs), (y, row)| {
-                    let mut repairs = Vec::new();
-                    for x in r..grid_w - r {
-                        let center = row[x];
-                        if !center.is_finite() {
-                            continue;
-                        }
-
-                        neighbors.clear();
-                        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-                        for dy in -RADIUS..=RADIUS {
-                            for dx in -RADIUS..=RADIUS {
-                                if dy == 0 && dx == 0 {
-                                    continue;
-                                }
-                                let v = heights[(y as i32 + dy) as usize]
-                                    [(x as i32 + dx) as usize];
-                                if v.is_finite() {
-                                    neighbors.push(v);
-                                    lo = lo.min(v);
-                                    hi = hi.max(v);
-                                }
-                            }
-                        }
-                        if neighbors.len() < 8 {
-                            continue;
-                        }
-                        // The median lies within the neighbours' range, so a centre within
-                        // the threshold of both ends cannot deviate past it. Most terrain is
-                        // that smooth, and this skips both selects there.
-                        if center - lo <= abs_threshold && hi - center <= abs_threshold {
-                            continue;
-                        }
-
-                        let mid = neighbors.len() / 2;
-                        neighbors.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-                        let median = neighbors[mid];
-
-                        abs_devs.clear();
-                        abs_devs.extend(neighbors.iter().map(|&v| (v - median).abs()));
-                        let mad_mid = abs_devs.len() / 2;
-                        abs_devs.select_nth_unstable_by(mad_mid, |a, b| a.partial_cmp(b).unwrap());
-                        let mad = abs_devs[mad_mid];
-
-                        let deviation = (center - median).abs();
-                        if deviation > abs_threshold && deviation > RELATIVE_FACTOR * mad.max(1.0) {
-                            repairs.push((x, median));
-                        }
-                    }
-                    (y, repairs)
-                },
-            )
-            .filter(|(_, rep)| !rep.is_empty())
-            .collect();
-
-        if row_repairs.is_empty() {
-            break;
+    // The median cell (y, x) is repaired to, if it is an outlier.
+    let judge = |heights: &[Vec<f64>],
+                 y: usize,
+                 x: usize,
+                 (neighbors, abs_devs): &mut (Vec<f64>, Vec<f64>)|
+     -> Option<f64> {
+        let center = heights[y][x];
+        if !center.is_finite() {
+            return None;
         }
 
-        let mut pass_repaired = 0usize;
-        for (y, repairs) in row_repairs {
-            pass_repaired += repairs.len();
-            for (x, median) in repairs {
-                heights[y][x] = median;
+        neighbors.clear();
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for dy in -RADIUS..=RADIUS {
+            for dx in -RADIUS..=RADIUS {
+                if dy == 0 && dx == 0 {
+                    continue;
+                }
+                let v = heights[(y as i32 + dy) as usize][(x as i32 + dx) as usize];
+                if v.is_finite() {
+                    neighbors.push(v);
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
             }
         }
+        if neighbors.len() < 8 {
+            return None;
+        }
+        // The median lies within the neighbours' range, so a centre within
+        // the threshold of both ends cannot deviate past it. Most terrain is
+        // that smooth, and this skips both selects there.
+        if center - lo <= abs_threshold && hi - center <= abs_threshold {
+            return None;
+        }
 
-        total_repaired += pass_repaired;
+        let mid = neighbors.len() / 2;
+        neighbors.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+        let median = neighbors[mid];
+
+        abs_devs.clear();
+        abs_devs.extend(neighbors.iter().map(|&v| (v - median).abs()));
+        let mad_mid = abs_devs.len() / 2;
+        abs_devs.select_nth_unstable_by(mad_mid, |a, b| a.partial_cmp(b).unwrap());
+        let mad = abs_devs[mad_mid];
+
+        let deviation = (center - median).abs();
+        (deviation > abs_threshold && deviation > RELATIVE_FACTOR * mad.max(1.0)).then_some(median)
+    };
+    let scratch = || (Vec::with_capacity(24), Vec::with_capacity(24));
+
+    let mut total_repaired = 0usize;
+    let mut passes_ran = 0usize;
+    // Cells to judge in the next pass, a bit each in rows of `words`; None for all of them.
+    // A bitmap stays at one bit per cell however dense the repairs get.
+    let words = grid_w.div_ceil(64);
+    let mut candidates: Option<Vec<u64>> = None;
+
+    for pass in 0..passes {
+        let grid: &[Vec<f64>] = heights;
+        let repairs: Vec<(u32, u32, f64)> = match &candidates {
+            None => (r..grid_h - r)
+                .into_par_iter()
+                .map_init(scratch, |buf, y| {
+                    (r..grid_w - r)
+                        .filter_map(|x| judge(grid, y, x, buf).map(|m| (y as u32, x as u32, m)))
+                        .collect::<Vec<_>>()
+                })
+                .flatten()
+                .collect(),
+            Some(bits) => bits
+                .par_chunks(words)
+                .enumerate()
+                .map_init(scratch, |buf, (y, row)| {
+                    let mut found = Vec::new();
+                    for (w, &word) in row.iter().enumerate() {
+                        let mut word = word;
+                        while word != 0 {
+                            let x = w * 64 + word.trailing_zeros() as usize;
+                            word &= word - 1;
+                            if let Some(m) = judge(grid, y, x, buf) {
+                                found.push((y as u32, x as u32, m));
+                            }
+                        }
+                    }
+                    found
+                })
+                .flatten()
+                .collect(),
+        };
+        if repairs.is_empty() {
+            break;
+        }
+        for &(y, x, median) in &repairs {
+            heights[y as usize][x as usize] = median;
+        }
+        total_repaired += repairs.len();
         passes_ran = pass + 1;
+        if passes_ran == passes {
+            break;
+        }
+        let bits = candidates.get_or_insert_with(|| vec![0; words * grid_h]);
+        bits.fill(0);
+        for &(y, x, _) in &repairs {
+            let (y, x) = (y as usize, x as usize);
+            for ny in y.saturating_sub(r).max(r)..(y + r + 1).min(grid_h - r) {
+                for nx in x.saturating_sub(r).max(r)..(x + r + 1).min(grid_w - r) {
+                    bits[ny * words + nx / 64] |= 1 << (nx % 64);
+                }
+            }
+        }
     }
 
     if total_repaired > 0 {
@@ -232,7 +259,7 @@ pub fn apply_land_cover_repair(
     // surface (ESA-misclassified riverbank walls / piers / shoreline
     // structures kept at their DSM elevation). Without this, the downstream
     // renderer still sees them as water, can't place water above the real
-    // water level, and falls through to grass + shoreline sand — producing
+    // water level, and falls through to land ground, producing
     // visible embankments and grid-aligned ridges INSIDE the water body.
     //
     // After reclassification the water_distance grid must be refreshed so
@@ -486,7 +513,7 @@ fn level_water_surfaces(
             // tight bulk (near-zero IQR) even with a few noisy cells; a
             // river descending 5+ m over the bbox has a broad bulk because
             // roughly half the cells are at each end of the gradient.
-            let iqr = interquartile_range(&values);
+            let iqr = interquartile_range(&mut values);
 
             // In place: the mode below does not depend on the order.
             let fallback_median = {
@@ -775,11 +802,11 @@ fn smooth_sparse_field(cells: &[(u32, u32, f32)], sigma_cells: f64) -> Vec<f64> 
 /// Compute the interquartile range of a slice of elevations.
 /// Uses `select_nth_unstable_by` twice — O(n) total, no full sort.
 /// Returns 0.0 for slices with fewer than 4 elements.
-fn interquartile_range(values: &[f64]) -> f64 {
-    if values.len() < 4 {
+/// Reorders `v`; quantiles don't depend on the order, so no copy is made.
+fn interquartile_range(v: &mut [f64]) -> f64 {
+    if v.len() < 4 {
         return 0.0;
     }
-    let mut v = values.to_vec();
     let q1_idx = v.len() / 4;
     let q3_idx = (v.len() * 3) / 4;
     v.select_nth_unstable_by(q1_idx, |a, b| a.partial_cmp(b).unwrap());
@@ -2193,40 +2220,138 @@ const BLUR_CHUNKS: usize = 10;
 /// Edges are handled by renormalizing over the valid samples.
 #[inline]
 fn blur_line(len: usize, kernel: &[f64], half: i32, get: impl Fn(usize) -> f64) -> Vec<f64> {
-    let line_len = len as i32;
     let vals: Vec<f64> = (0..len).map(get).collect();
-    let bad = prefix_counts(&vals, |v| !v.is_finite());
+    blur_values(&vals, kernel, half, false)
+}
+
+/// `blur_line` over `vals`. With `binary`, a window of all 0.0 or all 1.0 takes its exact
+/// answer (see `window_hits`) instead of the full kernel.
+fn blur_values(vals: &[f64], kernel: &[f64], half: i32, binary: bool) -> Vec<f64> {
+    let len = vals.len();
+    let bad = prefix_counts(vals, |v| !v.is_finite());
+    let uniform = binary.then(|| {
+        (
+            prefix_counts(vals, |&v| v == 1.0),
+            prefix_counts(vals, |&v| v == 0.0),
+        )
+    });
     // Same additions in the same order as the edge path's `wsum`, so interior output is bit-identical.
     let full_wsum = kernel.iter().fold(0.0, |acc, &k| acc + k);
     let h = half as usize;
-    (0..len)
-        .map(|i| {
-            if i >= h && i + h < len && bad[i + h + 1] == bad[i - h] {
-                let mut sum = 0.0;
-                for (&k, &v) in kernel.iter().zip(&vals[i - h..=i + h]) {
-                    sum += v * k;
-                }
-                return sum / full_wsum;
+    // Interior cells are summed LANES at a time, each with its own accumulator and tap
+    // order, so the output is unchanged but the add chains overlap instead of queueing.
+    const LANES: usize = 8;
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        if let Some((ones, zeros)) = &uniform {
+            let (n, window) = window_hits(ones, i, half, len);
+            if n == window {
+                out.push(1.0);
+                i += 1;
+                continue;
             }
-            let mut sum = 0.0;
-            let mut wsum = 0.0;
+            let (n, window) = window_hits(zeros, i, half, len);
+            if n == window {
+                out.push(0.0);
+                i += 1;
+                continue;
+            }
+        }
+        if i >= h && i + LANES + h <= len && bad[i + LANES + h] == bad[i - h] {
+            let window = &vals[i - h..i + LANES + h];
+            let mut sums = [0.0f64; LANES];
             for (j, &k) in kernel.iter().enumerate() {
-                let idx = i as i32 + j as i32 - half;
-                if idx >= 0 && idx < line_len {
-                    let v = vals[idx as usize];
-                    if v.is_finite() {
-                        sum += v * k;
-                        wsum += k;
-                    }
+                for (sum, &v) in sums.iter_mut().zip(&window[j..j + LANES]) {
+                    *sum += v * k;
                 }
             }
-            if wsum > 0.0 {
-                sum / wsum
-            } else {
-                f64::NAN
+            out.extend(sums.map(|sum| sum / full_wsum));
+            i += LANES;
+            continue;
+        }
+        if i >= h && i + h < len && bad[i + h + 1] == bad[i - h] {
+            let mut sum = 0.0;
+            for (&k, &v) in kernel.iter().zip(&vals[i - h..=i + h]) {
+                sum += v * k;
             }
+            out.push(sum / full_wsum);
+            i += 1;
+            continue;
+        }
+        let mut sum = 0.0;
+        let mut wsum = 0.0;
+        for (j, &k) in kernel.iter().enumerate() {
+            let idx = i as i32 + j as i32 - half;
+            if idx >= 0 && (idx as usize) < len {
+                let v = vals[idx as usize];
+                if v.is_finite() {
+                    sum += v * k;
+                    wsum += k;
+                }
+            }
+        }
+        out.push(if wsum > 0.0 { sum / wsum } else { f64::NAN });
+        i += 1;
+    }
+    out
+}
+
+/// Blurs columns `x0..x1` of `src` as (first column, row-major values of up to eight
+/// columns). Columns are gathered eight at a time: one cache line per row instead of one
+/// per cell.
+fn blur_column_chunk(
+    src: &[Vec<f64>],
+    x0: usize,
+    x1: usize,
+    kernel: &[f64],
+    half: i32,
+    binary: bool,
+) -> Vec<(usize, Vec<f64>)> {
+    const GROUP: usize = 8;
+    (x0..x1)
+        .step_by(GROUP)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|gx| {
+            let gw = GROUP.min(x1 - gx);
+            let mut cols: Vec<Vec<f64>> = vec![Vec::with_capacity(src.len()); gw];
+            for row in src {
+                for (c, col) in cols.iter_mut().enumerate() {
+                    col.push(row[gx + c]);
+                }
+            }
+            let cols: Vec<Vec<f64>> = cols
+                .iter()
+                .map(|col| blur_values(col, kernel, half, binary))
+                .collect();
+            let mut rows = Vec::with_capacity(src.len() * gw);
+            for y in 0..src.len() {
+                rows.extend(cols.iter().map(|col| col[y]));
+            }
+            (gx, rows)
         })
         .collect()
+}
+
+/// Writes `blur_column_chunk` output into `dst`, a row per task.
+fn store_column_chunk<T: Send>(
+    dst: &mut [Vec<T>],
+    groups: &[(usize, Vec<f64>)],
+    cast: impl Fn(f64) -> T + Sync,
+) {
+    let h = dst.len();
+    dst.par_iter_mut().enumerate().for_each(|(y, row)| {
+        for (gx, vals) in groups {
+            let gw = vals.len() / h;
+            for (cell, &v) in row[*gx..gx + gw]
+                .iter_mut()
+                .zip(&vals[y * gw..(y + 1) * gw])
+            {
+                *cell = cast(v);
+            }
+        }
+    });
 }
 
 /// Vertical half of the separable blur, written back over the horizontal result.
@@ -2244,33 +2369,8 @@ fn gaussian_blur_vertical_in_place(
     let mut x0 = 0usize;
     while x0 < w {
         let x1 = (x0 + col_chunk).min(w);
-        let blurred: Vec<(usize, Vec<f64>)> = {
-            let src: &[Vec<f64>] = after_h;
-            // Columns are gathered eight at a time: one cache line per row instead of one per cell.
-            const GROUP: usize = 8;
-            (x0..x1)
-                .step_by(GROUP)
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .flat_map_iter(|gx| {
-                    let gw = GROUP.min(x1 - gx);
-                    let mut cols: Vec<Vec<f64>> = vec![Vec::with_capacity(src.len()); gw];
-                    for row in src {
-                        for (c, col) in cols.iter_mut().enumerate() {
-                            col.push(row[gx + c]);
-                        }
-                    }
-                    cols.into_iter().enumerate().map(move |(c, column)| {
-                        (gx + c, blur_line(column.len(), kernel, half, |i| column[i]))
-                    })
-                })
-                .collect()
-        };
-        for (x, col) in blurred {
-            for (y, v) in col.into_iter().enumerate() {
-                after_h[y][x] = v;
-            }
-        }
+        let groups = blur_column_chunk(after_h, x0, x1, kernel, half, false);
+        store_column_chunk(after_h, &groups, |v| v);
         x0 = x1;
         report(0.5 + 0.5 * (x0 as f64 / w as f64));
     }
@@ -2314,46 +2414,18 @@ pub(crate) fn gaussian_blur_mask_to_f32_reported(
         return vec![Vec::new(); h];
     }
 
-    const CHUNKS: usize = 10;
-
-    // Horizontal pass: rows are independent, mask read on the fly.
-    let row_chunk = h.div_ceil(CHUNKS);
+    // Horizontal pass: rows are independent.
+    let row_chunk = h.div_ceil(BLUR_CHUNKS);
     let mut after_h: Vec<Vec<f64>> = Vec::with_capacity(h);
     for rows in grid[..h].chunks(row_chunk) {
         let mut part: Vec<Vec<f64>> = rows
             .par_iter()
             .map(|row| {
-                let len = row.len().min(width);
-                let row_len = len as i32;
-                let hits = prefix_counts(&row[..len], |&c| c == target);
-                (0..len)
-                    .map(|i| {
-                        match window_hits(&hits, i, half, len) {
-                            (0, _) => return 0.0,
-                            (n, window) if n == window => return 1.0,
-                            _ => {}
-                        }
-                        let mut sum = 0.0;
-                        let mut wsum = 0.0;
-                        for (j, &k) in kernel.iter().enumerate() {
-                            let idx = i as i32 + j as i32 - half;
-                            if idx >= 0 && idx < row_len {
-                                let v = if row[idx as usize] == target {
-                                    1.0
-                                } else {
-                                    0.0
-                                };
-                                sum += v * k;
-                                wsum += k;
-                            }
-                        }
-                        if wsum > 0.0 {
-                            sum / wsum
-                        } else {
-                            f64::NAN
-                        }
-                    })
-                    .collect()
+                let vals: Vec<f64> = row[..row.len().min(width)]
+                    .iter()
+                    .map(|&c| if c == target { 1.0 } else { 0.0 })
+                    .collect();
+                blur_values(&vals, &kernel, half, true)
             })
             .collect();
         after_h.append(&mut part);
@@ -2361,55 +2433,13 @@ pub(crate) fn gaussian_blur_mask_to_f32_reported(
     }
 
     // Vertical pass: f64 throughout, cast only on store.
-    let col_chunk = w.div_ceil(CHUNKS);
+    let col_chunk = w.div_ceil(BLUR_CHUNKS);
     let mut out: Vec<Vec<f32>> = vec![vec![0.0; w]; h];
     let mut x0 = 0usize;
     while x0 < w {
         let x1 = (x0 + col_chunk).min(w);
-        let blurred: Vec<(usize, Vec<f32>)> = (x0..x1)
-            .into_par_iter()
-            .map(|x| {
-                let column: Vec<f64> = after_h.iter().map(|row| row[x]).collect();
-                let col_len = column.len() as i32;
-                let ones = prefix_counts(&column, |&v| v == 1.0);
-                let zeros = prefix_counts(&column, |&v| v == 0.0);
-                let col: Vec<f32> = (0..column.len())
-                    .map(|y| {
-                        let (n, window) = window_hits(&ones, y, half, column.len());
-                        if n == window {
-                            return 1.0;
-                        }
-                        let (n, window) = window_hits(&zeros, y, half, column.len());
-                        if n == window {
-                            return 0.0;
-                        }
-                        let mut sum = 0.0;
-                        let mut wsum = 0.0;
-                        for (j, &k) in kernel.iter().enumerate() {
-                            let idx = y as i32 + j as i32 - half;
-                            if idx >= 0 && idx < col_len {
-                                let v = column[idx as usize];
-                                if v.is_finite() {
-                                    sum += v * k;
-                                    wsum += k;
-                                }
-                            }
-                        }
-                        if wsum > 0.0 {
-                            (sum / wsum) as f32
-                        } else {
-                            f64::NAN as f32
-                        }
-                    })
-                    .collect();
-                (x, col)
-            })
-            .collect();
-        for (x, col) in blurred {
-            for (y, v) in col.into_iter().enumerate() {
-                out[y][x] = v;
-            }
-        }
+        let groups = blur_column_chunk(&after_h, x0, x1, &kernel, half, true);
+        store_column_chunk(&mut out, &groups, |v| v as f32);
         x0 = x1;
         report(0.5 + 0.5 * (x0 as f64 / w as f64));
     }
@@ -2476,13 +2506,17 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
         return;
     }
 
+    // One snapshot buffer for the whole loop; refreshed in place per iteration.
+    let mut snapshot: Vec<Vec<f64>> = height_grid.to_vec();
     loop {
-        let fills: Vec<(usize, Vec<(usize, f64)>)> = height_grid
-            .par_iter()
+        let snapshot_ref: &[Vec<f64>] = &snapshot;
+
+        let any_changed = height_grid
+            .par_iter_mut()
             .enumerate()
             .map(|(y, row)| {
-                let mut row_fills = Vec::new();
-                for (x, &cell) in row.iter().enumerate().take(width) {
+                let mut row_changed = false;
+                for (x, cell) in row.iter_mut().enumerate().take(width) {
                     if !cell.is_nan() {
                         continue;
                     }
@@ -2493,7 +2527,7 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
                             let ny: i32 = y as i32 + dy;
                             let nx: i32 = x as i32 + dx;
                             if ny >= 0 && ny < height as i32 && nx >= 0 && nx < width as i32 {
-                                let val: f64 = height_grid[ny as usize][nx as usize];
+                                let val: f64 = snapshot_ref[ny as usize][nx as usize];
                                 if !val.is_nan() {
                                     sum += val;
                                     count += 1;
@@ -2502,23 +2536,21 @@ pub fn fill_nan_values(height_grid: &mut [Vec<f64>]) {
                         }
                     }
                     if count > 0 {
-                        row_fills.push((x, sum / count as f64));
+                        *cell = sum / count as f64;
+                        row_changed = true;
                     }
                 }
-                (y, row_fills)
+                row_changed
             })
-            .filter(|(_, row_fills)| !row_fills.is_empty())
-            .collect();
+            .reduce(|| false, |a, b| a || b);
 
-        if fills.is_empty() {
+        if !any_changed {
             break;
         }
-
-        for (y, row_fills) in fills {
-            for (x, val) in row_fills {
-                height_grid[y][x] = val;
-            }
-        }
+        snapshot
+            .par_iter_mut()
+            .zip(height_grid.par_iter())
+            .for_each(|(dst, src)| dst.clone_from(src));
     }
 }
 
@@ -2692,13 +2724,179 @@ pub enum AffinePolicy {
 /// Most headroom `FitWithHeadroom` keeps below the lowest cell.
 const HEADROOM_MAX_BLOCKS: f64 = 96.0;
 
-fn terrain_ceiling(disable_height_limit: bool, extended_max_y: i32) -> i32 {
+pub(crate) fn terrain_ceiling(disable_height_limit: bool, extended_max_y: i32) -> i32 {
     let effective_max_y = if disable_height_limit {
         extended_max_y
     } else {
         MAX_Y
     };
     effective_max_y - TERRAIN_HEIGHT_BUFFER
+}
+
+/// The fit `derive_affine` makes under `ceiling`: the base level, sunk towards
+/// `min_ground_level` when the relief needs it, and the relief in blocks.
+fn fit_geometry(
+    height_range: f64,
+    scale: f64,
+    ceiling: i32,
+    ground_level: i32,
+    min_ground_level: i32,
+    disable_height_limit: bool,
+) -> (i32, f64) {
+    let ideal_scaled_range: f64 = height_range * scale;
+    // Sink the terrain base to reach the extended floor, but only as far as the relief
+    // actually needs. Blindly sinking would drop a low-relief bbox thousands of blocks down
+    // with an empty sky above it; not sinking at all would waste the pack's lower half.
+    // Only ever fires with the extended floor: callers pass min_ground_level == ground_level
+    // otherwise, so an explicit --ground-level is never silently overridden.
+    let ground_level = if disable_height_limit
+        && min_ground_level < ground_level
+        && ideal_scaled_range.is_finite()
+    {
+        let needed = ideal_scaled_range.ceil() as i32;
+        (ceiling.saturating_sub(needed)).clamp(min_ground_level, ground_level)
+    } else {
+        ground_level
+    };
+    let available_y_range: f64 = (ceiling - ground_level) as f64;
+    let scaled_range = if ideal_scaled_range <= available_y_range {
+        ideal_scaled_range
+    } else {
+        let compression_factor: f64 = available_y_range / height_range;
+        height_range * compression_factor
+    };
+    (ground_level, scaled_range)
+}
+
+/// Blocks `FitWithHeadroom` lifts the terrain by, leaving room below for lower neighbours.
+fn headroom_margin(ceiling: i32, ground_level: i32, scaled_range: f64) -> f64 {
+    let free = (ceiling - ground_level) as f64 - scaled_range;
+    (free * 0.5).min(HEADROOM_MAX_BLOCKS).floor().max(0.0)
+}
+
+/// Blocks to take off the top of the height fit so each model, `height_m` tall at
+/// `model_scale` blocks per metre on terrain of `ground_m`, ends under the build
+/// limit; the terrain buffer counts as room. Zero when no model needs it. Solved
+/// against the fit itself: a lower ceiling lowers a model by less than the
+/// reserve unless it stands on the highest terrain.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn top_reserve_for(
+    heights: &[Vec<f64>],
+    models: &[(f64, f64)],
+    scale: f64,
+    model_scale: f64,
+    ground_level: i32,
+    min_ground_level: i32,
+    disable_height_limit: bool,
+    extended_max_y: i32,
+    headroom: bool,
+) -> i32 {
+    if models.is_empty() {
+        return 0;
+    }
+    let (lo, hi) = heights
+        .iter()
+        .flatten()
+        .filter(|h| h.is_finite())
+        .fold((f64::MAX, f64::MIN), |(a, b), &h| (a.min(h), b.max(h)));
+    if lo > hi {
+        return 0;
+    }
+    let range = hi - lo;
+    let ceiling = terrain_ceiling(disable_height_limit, extended_max_y);
+    let limit = (ceiling + TERRAIN_HEIGHT_BUFFER - 2) as f64;
+    let model_top = |reserve: i32| {
+        let top = ceiling - reserve;
+        let (base, scaled) = fit_geometry(
+            range,
+            scale,
+            top,
+            ground_level,
+            min_ground_level,
+            disable_height_limit,
+        );
+        let bpm = if range > 0.0 { scaled / range } else { 0.0 };
+        let lift = if headroom {
+            headroom_margin(top, base, scaled)
+        } else {
+            0.0
+        };
+        models
+            .iter()
+            .map(|&(ground_m, height_m)| {
+                base as f64 + lift + (ground_m - lo) * bpm + height_m * model_scale
+            })
+            .fold(f64::MIN, f64::max)
+    };
+    if model_top(0) <= limit {
+        return 0;
+    }
+    // Never more than half the column, or the terrain would flatten to nothing.
+    let cap = (ceiling - ground_level).max(0) / 2;
+    // Model tops only fall as the reserve grows, so the smallest that fits is a bisection.
+    let (mut fits, mut short) = (cap, 0);
+    if model_top(cap) > limit {
+        return cap;
+    }
+    while fits - short > 1 {
+        let mid = (fits + short) / 2;
+        if model_top(mid) <= limit {
+            fits = mid;
+        } else {
+            short = mid;
+        }
+    }
+    fits
+}
+
+/// Why the vanilla build height cannot hold this area at full height, or None when it can:
+/// the relief fits without compression and every model or structure in `tops` (ground
+/// metres, height metres) stays under the ceiling. The fit on `ground_level` then needs
+/// neither compression nor a top reserve. `scale` is the terrain's blocks per metre,
+/// `model_scale` the structures'.
+pub(crate) fn vanilla_overflow(
+    heights: &[Vec<f64>],
+    tops: &[(f64, f64)],
+    scale: f64,
+    model_scale: f64,
+    ground_level: i32,
+) -> Option<String> {
+    let ceiling = terrain_ceiling(false, 0);
+    let room = ceiling - ground_level;
+    let (lo, hi) = heights
+        .iter()
+        .flatten()
+        .filter(|h| h.is_finite())
+        .fold((f64::MAX, f64::MIN), |(a, b), &h| (a.min(h), b.max(h)));
+    let range = if lo < hi { hi - lo } else { 0.0 };
+    let relief = range * scale;
+    if room < 0 || relief > room as f64 {
+        return Some(format!(
+            "the terrain needs {:.0} blocks, vanilla Minecraft holds {} above the base",
+            relief.ceil(),
+            room.max(0)
+        ));
+    }
+    // Uncompressed, the fit puts every cell at the base plus its height above the lowest.
+    let limit = (MAX_Y - 2) as f64;
+    let top = tops
+        .iter()
+        .map(|&(ground_m, height_m)| {
+            let lift = if range > 0.0 {
+                (ground_m - lo) * scale
+            } else {
+                0.0
+            };
+            ground_level as f64 + lift + height_m * model_scale
+        })
+        .fold(f64::MIN, f64::max);
+    (top > limit).then(|| {
+        format!(
+            "a building or landmark reaches Y {:.0}, vanilla Minecraft has room up to Y {}",
+            top.ceil(),
+            MAX_Y - 2
+        )
+    })
 }
 
 fn derive_affine(
@@ -2708,6 +2906,7 @@ fn derive_affine(
     min_ground_level: i32,
     disable_height_limit: bool,
     extended_max_y: i32,
+    top_reserve: i32,
 ) -> (ElevationAffine, FitRange) {
     // Derive min/max
     let (min_height, max_height) = blurred_heights
@@ -2745,43 +2944,30 @@ fn derive_affine(
         };
 
     let ideal_scaled_range: f64 = height_range * scale;
-    let ceiling = terrain_ceiling(disable_height_limit, extended_max_y);
-
-    // Sink the terrain base to reach the extended floor, but only as far as the relief
-    // actually needs. Blindly sinking would drop a low-relief bbox thousands of blocks down
-    // with an empty sky above it; not sinking at all would waste the pack's lower half.
-    // Only ever fires with the extended floor: callers pass min_ground_level == ground_level
-    // otherwise, so an explicit --ground-level is never silently overridden.
-    let ground_level = if disable_height_limit
-        && min_ground_level < ground_level
-        && ideal_scaled_range.is_finite()
-    {
-        let needed = ideal_scaled_range.ceil() as i32;
-        (ceiling.saturating_sub(needed)).clamp(min_ground_level, ground_level)
-    } else {
-        ground_level
-    };
-
+    let ceiling = terrain_ceiling(disable_height_limit, extended_max_y) - top_reserve;
+    let (ground_level, scaled_range) = fit_geometry(
+        height_range,
+        scale,
+        ceiling,
+        ground_level,
+        min_ground_level,
+        disable_height_limit,
+    );
     let available_y_range: f64 = (ceiling - ground_level) as f64;
-
-    let scaled_range: f64 = if ideal_scaled_range <= available_y_range {
+    if ideal_scaled_range <= available_y_range {
         eprintln!(
             "Realistic elevation: {:.1}m range fits in {} available blocks",
             height_range, available_y_range as i32
         );
-        ideal_scaled_range
     } else {
-        let compression_factor: f64 = available_y_range / height_range;
-        let compressed_range: f64 = height_range * compression_factor;
         eprintln!(
             "Elevation compressed: {:.1}m range -> {:.0} blocks ({:.2}:1 ratio, 1 block = {:.2}m)",
             height_range,
-            compressed_range,
-            height_range / compressed_range,
-            compressed_range / height_range
+            scaled_range,
+            height_range / scaled_range,
+            scaled_range / height_range
         );
-        compressed_range
-    };
+    }
 
     let blocks_per_meter = if height_range > 0.0 {
         scaled_range / height_range
@@ -2809,47 +2995,80 @@ struct FitRange {
 }
 
 /// Kept in its original arithmetic so default worlds round exactly as before.
-fn apply_fit_in_place(
-    heights: &mut [Vec<f64>],
+fn apply_fit(
+    blurred_heights: &[Vec<f64>],
     affine: &ElevationAffine,
     fit: FitRange,
     upper_clamp: f64,
-) {
+) -> Vec<Vec<f64>> {
     let base = affine.ground_level as f64;
-    heights.par_iter_mut().for_each(|row| {
-        for h in row.iter_mut() {
-            let relative_height: f64 = if fit.height_range > 0.0 {
-                (*h - affine.min_height_m) / fit.height_range
-            } else {
-                0.0
-            };
-            *h = (base + relative_height * fit.scaled_range).clamp(base, upper_clamp);
-        }
-    });
+    blurred_heights
+        .par_iter()
+        .map(|row| {
+            row.iter()
+                .map(|&h| {
+                    let relative_height: f64 = if fit.height_range > 0.0 {
+                        (h - affine.min_height_m) / fit.height_range
+                    } else {
+                        0.0
+                    };
+                    (base + relative_height * fit.scaled_range).clamp(base, upper_clamp)
+                })
+                .collect()
+        })
+        .collect()
 }
 
-fn apply_affine_in_place(
-    heights: &mut [Vec<f64>],
+fn apply_affine(
+    blurred_heights: &[Vec<f64>],
     affine: &ElevationAffine,
     upper_clamp: f64,
-) {
+) -> Vec<Vec<f64>> {
     let base = affine.ground_level as f64;
-    heights.par_iter_mut().for_each(|row| {
-        for h in row.iter_mut() {
-            *h = affine.y_for_metres(*h).clamp(base, upper_clamp);
-        }
-    });
+    blurred_heights
+        .par_iter()
+        .map(|row| {
+            row.iter()
+                .map(|&h| affine.y_for_metres(h).clamp(base, upper_clamp))
+                .collect()
+        })
+        .collect()
 }
 
-pub fn scale_to_minecraft_in_place(
-    heights: &mut [Vec<f64>],
+#[cfg(test)]
+pub fn scale_to_minecraft_with(
+    blurred_heights: &[Vec<f64>],
     scale: f64,
     ground_level: i32,
     min_ground_level: i32,
     disable_height_limit: bool,
     extended_max_y: i32,
     policy: AffinePolicy,
-) -> ElevationAffine {
+) -> (Vec<Vec<f64>>, ElevationAffine) {
+    scale_to_minecraft_reserving(
+        blurred_heights,
+        scale,
+        ground_level,
+        min_ground_level,
+        disable_height_limit,
+        extended_max_y,
+        policy,
+        0,
+    )
+}
+
+/// `scale_to_minecraft_with`, fitting the relief `top_reserve` blocks lower.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_to_minecraft_reserving(
+    blurred_heights: &[Vec<f64>],
+    scale: f64,
+    ground_level: i32,
+    min_ground_level: i32,
+    disable_height_limit: bool,
+    extended_max_y: i32,
+    policy: AffinePolicy,
+    top_reserve: i32,
+) -> (Vec<Vec<f64>>, ElevationAffine) {
     let ceiling = terrain_ceiling(disable_height_limit, extended_max_y);
     let upper_clamp = ceiling as f64;
 
@@ -2857,31 +3076,37 @@ pub fn scale_to_minecraft_in_place(
     let affine = match policy {
         AffinePolicy::Fit => {
             let (affine, range) = derive_affine(
-                heights,
+                blurred_heights,
                 scale,
                 ground_level,
                 min_ground_level,
                 disable_height_limit,
                 extended_max_y,
+                top_reserve,
             );
             fit = Some(range);
             affine
         }
         AffinePolicy::FitWithHeadroom => {
             let (mut affine, range) = derive_affine(
-                heights,
+                blurred_heights,
                 scale,
                 ground_level,
                 min_ground_level,
                 disable_height_limit,
                 extended_max_y,
+                top_reserve,
             );
             // A flat first area chose no slope; later areas need one.
             if affine.blocks_per_meter <= 0.0 {
                 affine.blocks_per_meter = scale;
             }
-            let free = (ceiling - affine.ground_level) as f64 - range.scaled_range;
-            let margin_blocks = (free * 0.5).min(HEADROOM_MAX_BLOCKS).floor().max(0.0);
+            // Measured under the reserved ceiling, or the lift would fill the models' room.
+            let margin_blocks = headroom_margin(
+                ceiling - top_reserve,
+                affine.ground_level,
+                range.scaled_range,
+            );
             if margin_blocks > 0.0 {
                 affine.min_height_m -= margin_blocks / affine.blocks_per_meter;
                 eprintln!(
@@ -2910,9 +3135,14 @@ pub fn scale_to_minecraft_in_place(
         }
     };
 
+    let mc_heights = match fit {
+        Some(range) => apply_fit(blurred_heights, &affine, range, upper_clamp),
+        None => apply_affine(blurred_heights, &affine, upper_clamp),
+    };
+
     if let AffinePolicy::Fixed(_) = policy {
         let base = affine.ground_level as f64;
-        let (clamped, total) = heights
+        let (clamped, total) = blurred_heights
             .par_iter()
             .map(|row| {
                 let mut c = 0usize;
@@ -2949,15 +3179,10 @@ pub fn scale_to_minecraft_in_place(
         }
     }
 
-    match fit {
-        Some(range) => apply_fit_in_place(heights, &affine, range, upper_clamp),
-        None => apply_affine_in_place(heights, &affine, upper_clamp),
-    }
-
     // The map preview shades over the band the terrain fills, so publish where it ended up.
     let top = match fit {
         Some(range) => affine.ground_level as f64 + range.scaled_range,
-        None => heights
+        None => mc_heights
             .par_iter()
             .map(|row| row.iter().cloned().fold(f64::MIN, f64::max))
             .reduce(|| f64::MIN, f64::max),
@@ -2969,29 +3194,7 @@ pub fn scale_to_minecraft_in_place(
     };
     crate::world_editor::common::set_terrain_top_y(top.min(upper_clamp).round() as i32);
 
-    affine
-}
-
-pub fn scale_to_minecraft_with(
-    blurred_heights: &[Vec<f64>],
-    scale: f64,
-    ground_level: i32,
-    min_ground_level: i32,
-    disable_height_limit: bool,
-    extended_max_y: i32,
-    policy: AffinePolicy,
-) -> (Vec<Vec<f64>>, ElevationAffine) {
-    let mut heights = blurred_heights.to_vec();
-    let affine = scale_to_minecraft_in_place(
-        &mut heights,
-        scale,
-        ground_level,
-        min_ground_level,
-        disable_height_limit,
-        extended_max_y,
-        policy,
-    );
-    (heights, affine)
+    (mc_heights, affine)
 }
 
 #[cfg(test)]
@@ -3082,6 +3285,46 @@ mod mask_blur_tests {
         // Everything one class, and nothing of it.
         check(&vec![vec![1u8; 40]; 30], 40, 30, 3.0);
         check(&vec![vec![0u8; 40]; 30], 40, 30, 3.0);
+    }
+
+    #[test]
+    fn blur_line_matches_one_cell_at_a_time() {
+        let mut s = 11u64;
+        let vals: Vec<f64> = (0..700)
+            .map(|i| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let gap = (230..234).contains(&i) || i == 401 || i == 650;
+                if gap {
+                    f64::NAN
+                } else {
+                    (s >> 11) as f64 / (1u64 << 53) as f64 * 80.0 - 20.0
+                }
+            })
+            .collect();
+        for sigma in [1.5, 4.0, 30.0] {
+            let size = (sigma * 3.0f64).ceil() as usize * 2 + 1;
+            let kernel = create_gaussian_kernel(size, sigma);
+            let half = size as i32 / 2;
+            for len in [5, 9, size + 7, 700] {
+                let got = blur_line(len, &kernel, half, |i| vals[i]);
+                for (i, &g) in got.iter().enumerate() {
+                    let (mut sum, mut wsum) = (0.0, 0.0);
+                    for (j, &k) in kernel.iter().enumerate() {
+                        let idx = i as i32 + j as i32 - half;
+                        if idx >= 0 && (idx as usize) < len && vals[idx as usize].is_finite() {
+                            sum += vals[idx as usize] * k;
+                            wsum += k;
+                        }
+                    }
+                    let want = if wsum > 0.0 { sum / wsum } else { f64::NAN };
+                    assert_eq!(
+                        g.to_bits(),
+                        want.to_bits(),
+                        "sigma {sigma} len {len} cell {i}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3883,6 +4126,32 @@ mod tests {
     }
 
     #[test]
+    fn later_passes_judging_only_repaired_neighbourhoods_match_full_passes() {
+        // Towers erode from the outside in over several passes.
+        for width in 3..=9 {
+            let mut got = plateau_with_tower(width);
+            let mut want = got.clone();
+            repair_terrain_anomalies(&mut got, 1.0);
+            repair_by_medians(&mut want, 1.0);
+            assert_bits_eq(&got, &want);
+        }
+        // Towers astride the bitmap's 64-cell words, and one on the grid's last word.
+        let mut got = vec![vec![100.0f64; 150]; 41];
+        for (i, cx) in [63usize, 128, 145].into_iter().enumerate() {
+            for row in got.iter_mut().skip(10 + 8 * i).take(7) {
+                for c in row.iter_mut().skip(cx - 3).take(7) {
+                    *c = 180.0;
+                }
+            }
+        }
+        let mut want = got.clone();
+        repair_terrain_anomalies(&mut got, 1.0);
+        repair_by_medians(&mut want, 1.0);
+        assert_bits_eq(&got, &want);
+        assert_eq!(got[13][63], 100.0, "the towers erode");
+    }
+
+    #[test]
     fn anomaly_repair_stops_eroding_landforms_when_a_cell_is_tens_of_metres() {
         let mut fine = plateau_with_tower(9);
         repair_terrain_anomalies(&mut fine, 1.0);
@@ -4058,5 +4327,144 @@ mod affine_policy_tests {
         assert_eq!(mc[0][1], -1594.0);
         assert_eq!(mc[0][2], -1064.0);
         assert!(mc[1][0] < mc[1][1] && mc[1][1] < mc[1][2] && mc[1][2] <= 2016.0);
+    }
+}
+
+#[cfg(test)]
+mod vanilla_fit_tests {
+    use super::*;
+
+    /// 8 x 8 cells rising evenly from `lo` to `hi` metres.
+    fn ramp(lo: f64, hi: f64) -> Vec<Vec<f64>> {
+        (0..8)
+            .map(|z| {
+                (0..8)
+                    .map(|x| lo + (hi - lo) * f64::from(x + z * 8) / 63.0)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn relief_within_the_vanilla_column_needs_no_pack() {
+        // 366 blocks of room above Y -62.
+        assert!(vanilla_overflow(&ramp(500.0, 866.0), &[], 1.0, 1.0, -62).is_none());
+        assert!(vanilla_overflow(&ramp(500.0, 867.0), &[], 1.0, 1.0, -62).is_some());
+        assert!(vanilla_overflow(&ramp(0.0, 700.0), &[], 0.5, 0.5, -62).is_none());
+        assert!(vanilla_overflow(&ramp(0.0, 200.0), &[], 2.0, 1.0, -62).is_some());
+        // A raised base leaves less room.
+        assert!(vanilla_overflow(&ramp(0.0, 300.0), &[], 1.0, 1.0, 10).is_some());
+        assert!(vanilla_overflow(&[], &[], 1.0, 1.0, 304).is_none());
+        assert!(vanilla_overflow(&[], &[], 1.0, 1.0, 305).is_some());
+    }
+
+    #[test]
+    fn a_tower_past_the_ceiling_needs_the_pack() {
+        let grid = ramp(10.0, 20.0);
+        // On the lowest ground, a 379 m tower ends at Y 317.
+        assert!(vanilla_overflow(&grid, &[(10.0, 379.0)], 1.0, 1.0, -62).is_none());
+        assert!(vanilla_overflow(&grid, &[(10.0, 380.0)], 1.0, 1.0, -62).is_some());
+        assert!(vanilla_overflow(&grid, &[(20.0, 370.0)], 1.0, 1.0, -62).is_some());
+        // The multiplier lifts the ground it stands on, not the tower.
+        assert!(vanilla_overflow(&grid, &[(20.0, 300.0)], 3.0, 1.0, -62).is_none());
+        assert!(vanilla_overflow(&grid, &[(20.0, 300.0)], 1.0, 1.5, -62).is_some());
+        // Flat ground puts every structure on the base.
+        assert!(vanilla_overflow(&[], &[(500.0, 379.0)], 1.0, 1.0, -62).is_none());
+        assert!(vanilla_overflow(&[], &[(500.0, 380.0)], 1.0, 1.0, -62).is_some());
+    }
+
+    /// No overflow exactly when the vanilla fit keeps every metre: no reserve, no compression.
+    #[test]
+    fn agrees_with_the_vanilla_fit() {
+        for hi in [100.0, 365.0, 366.0, 367.0, 800.0] {
+            for model in [
+                None,
+                Some((0.0, 50.0)),
+                Some((hi, 20.0)),
+                Some((hi * 0.5, 300.0)),
+            ] {
+                let grid = ramp(0.0, hi);
+                let models: Vec<(f64, f64)> = model.into_iter().collect();
+                let reserve = top_reserve_for(&grid, &models, 1.0, 1.0, -62, -62, false, 0, false);
+                let (_, affine) = scale_to_minecraft_reserving(
+                    &grid,
+                    1.0,
+                    -62,
+                    -62,
+                    false,
+                    0,
+                    AffinePolicy::Fit,
+                    reserve,
+                );
+                let exact = reserve == 0 && (affine.blocks_per_meter - 1.0).abs() < 1e-12;
+                assert_eq!(
+                    vanilla_overflow(&grid, &models, 1.0, 1.0, -62).is_none(),
+                    exact,
+                    "relief {hi} m, model {model:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod top_reserve_tests {
+    use super::*;
+
+    const LIMIT: f64 = (MAX_Y - 2) as f64;
+
+    /// Model top after fitting `grid` with the reserve the solver picks.
+    fn fitted_top(grid: &[Vec<f64>], model: (f64, f64), policy: AffinePolicy) -> (i32, f64) {
+        let headroom = matches!(policy, AffinePolicy::FitWithHeadroom);
+        let reserve = top_reserve_for(grid, &[model], 1.0, 1.0, -62, -62, false, 0, headroom);
+        let (_, affine) =
+            scale_to_minecraft_reserving(grid, 1.0, -62, -62, false, 0, policy, reserve);
+        (reserve, affine.y_for_metres(model.0) + model.1)
+    }
+
+    fn relief_0_to_1000() -> Vec<Vec<f64>> {
+        vec![vec![0.0, 500.0, 1000.0]]
+    }
+
+    #[test]
+    fn no_model_or_a_model_that_fits_reserves_nothing() {
+        let grid = relief_0_to_1000();
+        assert_eq!(
+            top_reserve_for(&grid, &[], 1.0, 1.0, -62, -62, false, 0, false),
+            0
+        );
+        let low = top_reserve_for(&grid, &[(0.0, 30.0)], 1.0, 1.0, -62, -62, false, 0, false);
+        assert_eq!(low, 0);
+    }
+
+    #[test]
+    fn a_model_halfway_up_the_relief_ends_under_the_limit() {
+        let (reserve, top) = fitted_top(&relief_0_to_1000(), (500.0, 250.0), AffinePolicy::Fit);
+        assert!(reserve > 0);
+        assert!(top <= LIMIT, "top {top} with reserve {reserve}");
+        // The smallest such reserve: one block less overflows.
+        let grid = relief_0_to_1000();
+        let (_, affine) = scale_to_minecraft_reserving(
+            &grid,
+            1.0,
+            -62,
+            -62,
+            false,
+            0,
+            AffinePolicy::Fit,
+            reserve - 1,
+        );
+        assert!(affine.y_for_metres(500.0) + 250.0 > LIMIT);
+    }
+
+    #[test]
+    fn one_world_headroom_stays_out_of_the_reserve() {
+        let (reserve, top) = fitted_top(
+            &relief_0_to_1000(),
+            (1000.0, 110.0),
+            AffinePolicy::FitWithHeadroom,
+        );
+        assert!(reserve > 0);
+        assert!(top <= LIMIT, "top {top} with reserve {reserve}");
     }
 }

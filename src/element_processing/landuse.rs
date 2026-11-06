@@ -5,8 +5,12 @@ use crate::deterministic_rng::element_rng;
 use crate::element_processing::bridges::BridgeSurfaceMap;
 use crate::element_processing::bush::{place_bush, BushKind};
 use crate::element_processing::construction_site;
+use crate::element_processing::field_texture::{place_cover, FieldLayout, Plot};
 use crate::element_processing::tree::{Tree, TreeType};
-use crate::floodfill_cache::{BuildingFootprintBitmap, FloodFillCache, RoadMaskBitmap};
+use crate::floodfill_cache::{
+    in_hole, without_holes, BuildingFootprintBitmap, FloodFillCache, Holes, InnerRings,
+    RoadMaskBitmap,
+};
 use crate::osm_parser::{ProcessedMemberRole, ProcessedRelation, ProcessedWay};
 use crate::world_editor::WorldEditor;
 use rand::prelude::IndexedRandom;
@@ -21,6 +25,34 @@ pub fn generate_landuse(
     road_mask: &RoadMaskBitmap,
     bridge_surface: &BridgeSurfaceMap,
 ) {
+    landuse_area(
+        editor,
+        element,
+        args,
+        flood_fill_cache,
+        building_footprints,
+        road_mask,
+        bridge_surface,
+        None,
+    );
+}
+
+/// A landuse area less the cells of `holes`.
+#[allow(clippy::too_many_arguments)]
+fn landuse_area(
+    editor: &mut WorldEditor,
+    element: &ProcessedWay,
+    args: &Args,
+    flood_fill_cache: &FloodFillCache,
+    building_footprints: &BuildingFootprintBitmap,
+    road_mask: &RoadMaskBitmap,
+    bridge_surface: &BridgeSurfaceMap,
+    holes: Option<&Holes>,
+) {
+    if !super::landuse_paints_ground(&element.tags) {
+        return;
+    }
+
     // Determine block type based on landuse tag
     let binding: String = "".to_string();
     let landuse_tag: &String = element.tags.get("landuse").unwrap_or(&binding);
@@ -34,12 +66,6 @@ pub fn generate_landuse(
         "cemetery" => PODZOL,
         "construction" => COARSE_DIRT,
         "traffic_island" => STONE_BLOCK_SLAB,
-        // residential and commercial are too broad, they cover entire zones including
-        // gardens, parks, and green spaces. ESA WorldCover handles built-up classification
-        // at 10m satellite resolution, which is far more precise.
-        "residential" | "commercial" => return,
-        "education" => POLISHED_ANDESITE,
-        "religious" => POLISHED_ANDESITE,
         "industrial" => STONE,     // Randomized per-block below
         "military" => GRASS_BLOCK, // Chosen per block by military_ground below
         "railway" => GRAVEL,
@@ -60,7 +86,8 @@ pub fn generate_landuse(
         _ => GRASS_BLOCK,
     };
 
-    // Get the area of the landuse element using cache
+    // Get the area of the landuse element using cache; hole cells are skipped where read,
+    // so the shared fill is not copied.
     let floor_area = flood_fill_cache.get_or_compute(element, args.timeout.as_ref());
 
     let leaf_type_tagged = matches!(
@@ -117,9 +144,30 @@ pub fn generate_landuse(
     let climate = editor.climate();
     let site_arid = construction_site::is_arid(climate);
 
+    let field_layout = (landuse_tag == "farmland")
+        .then(|| FieldLayout::new(args.fields, args.scale, element.id, &element.nodes))
+        .flatten();
+
+    let draws_per_cell = matches!(landuse_tag.as_str(), "industrial" | "quarry");
     for &(x, z) in floor_area.iter() {
+        if in_hole(holes, x, z) {
+            continue;
+        }
+        // A tile reads the whole area, but nothing lands outside its editor; only the
+        // per-cell draw has to happen there, so the cells it owns see the same sequence.
+        // The main editor owns One World's clip margin, and every draw there still counts.
+        if !editor.in_bounds(x, z) && !editor.owns(x, z) {
+            if draws_per_cell {
+                rng.random_range(0..100);
+            }
+            continue;
+        }
+        let plot = field_layout.as_ref().map(|l| l.plot_at(x, z));
+
         // Apply per-block randomness for certain landuse types
-        let actual_block = if landuse_tag == "industrial" {
+        let actual_block = if let Some(p) = &plot {
+            p.surface(x, z)
+        } else if landuse_tag == "industrial" {
             // Industrial: primarily stone, with some stone bricks and smooth stone
             let random_value = rng.random_range(0..100);
             if random_value < 70 {
@@ -181,7 +229,10 @@ pub fn generate_landuse(
                 editor.set_block(ground, x, 0, z, None, Some(&[SPONGE]));
             }
         } else if landuse_tag == "railway" {
-            editor.set_block(actual_block, x, 0, z, None, Some(&[SPONGE]));
+            // Ballast over whatever ground is there, but not over roads or water.
+            if !is_protected {
+                editor.set_block(actual_block, x, 0, z, None, Some(&[SPONGE]));
+            }
         } else if !is_protected {
             editor.set_block(actual_block, x, 0, z, None, None);
         }
@@ -260,11 +311,13 @@ pub fn generate_landuse(
                     }
                 }
             }
+            "farmland" if field_layout.is_some() => {
+                if let Some(p) = plot.filter(|_| !is_protected) {
+                    plant_plot(editor, &p, actual_block, x, z);
+                }
+            }
             "farmland" if !editor.check_for_block(x, 0, z, Some(&[WATER])) => {
-                // Irrigation dots, but only where boxed in so they can't flow downhill and wash out crops.
-                if x % 9 == 0 && z % 9 == 0 && editor.water_source_is_enclosed(x, z) {
-                    editor.set_block(WATER, x, 0, z, Some(&[FARMLAND]), None);
-                } else if rng.random_range(0..76) == 0 {
+                if rng.random_range(0..76) == 0 {
                     let special_choice: i32 = rng.random_range(1..=10);
                     if special_choice <= 4 {
                         editor.set_block(HAY_BALE, x, 1, z, None, Some(&[SPONGE]));
@@ -399,14 +452,31 @@ pub fn generate_landuse(
     // Large construction sites get a centre crane plus scattered excavators, and
     // every site its fence and props, which keep clear of both.
     if landuse_tag == "construction" {
-        crate::structures::crane::maybe_place_crane(editor, floor_area.as_slice());
+        let floor_area = without_holes(&floor_area, holes);
+        crate::structures::crane::maybe_place_crane(
+            editor,
+            floor_area.as_slice(),
+            building_footprints,
+        );
         crate::structures::excavator::scatter_excavators(editor, floor_area.as_slice());
         construction_site::furnish(editor, element, floor_area.as_slice(), building_footprints);
     }
 
     // Farmland fields rarely get a tractor.
     if landuse_tag == "farmland" {
+        let floor_area = without_holes(&floor_area, holes);
         crate::structures::tractor::maybe_place_tractor(editor, floor_area.as_slice());
+    }
+}
+
+/// Grows a field plot's cell, which holds `surface` if nothing else claimed it first.
+fn plant_plot(editor: &mut WorldEditor, plot: &Plot, surface: Block, x: i32, z: i32) {
+    if !editor.check_for_block(x, 0, z, Some(&[surface])) {
+        return;
+    }
+    if let Some(cover) = plot.cover(surface, x, z) {
+        let ground_y = editor.get_absolute_y(x, 0, z);
+        place_cover(editor, cover, x, ground_y, z);
     }
 }
 
@@ -448,7 +518,10 @@ fn military_ground(
         }
         _ => {
             // Arid and polar bases sit on the region's own ground.
-            if let Some((surface, _)) = climate.surface_palette(cover, x, z) {
+            let red =
+                crate::terrain_surface::Rock::at(climate, x, z, |sx, sz| editor.ecoregion(sx, sz))
+                    == crate::terrain_surface::Rock::Red;
+            if let Some((surface, _)) = climate.surface_palette(cover, x, z, red) {
                 return Some(surface);
             }
             // Vehicle tracks and training ground as organic patches in the grass: about a
@@ -496,20 +569,22 @@ pub fn generate_landuse_from_relation(
     road_mask: &RoadMaskBitmap,
     bridge_surface: &BridgeSurfaceMap,
 ) {
-    if rel.tags.contains_key("landuse") {
+    if rel.tags.contains_key("landuse") && super::landuse_paints_ground(&rel.tags) {
         // Process each outer member way individually using cached flood fill.
         // We intentionally do not combine all outer nodes into one mega-way,
         // because that creates a nonsensical polygon spanning the whole relation
         // extent, misses the flood fill cache, and can cause multi-GB allocations.
+        let inners = InnerRings::of(rel);
         for member in &rel.members {
             if member.role == ProcessedMemberRole::Outer {
+                let holes = flood_fill_cache.holes_in(&member.way, &inners, args.timeout.as_ref());
                 // Use relation tags so the member inherits the relation's landuse=* type
                 let way_with_rel_tags = ProcessedWay {
                     id: member.way.id,
                     nodes: member.way.nodes.clone(),
                     tags: rel.tags.clone(),
                 };
-                generate_landuse(
+                landuse_area(
                     editor,
                     &way_with_rel_tags,
                     args,
@@ -517,6 +592,7 @@ pub fn generate_landuse_from_relation(
                     building_footprints,
                     road_mask,
                     bridge_surface,
+                    holes.as_ref(),
                 );
             }
         }
@@ -558,9 +634,72 @@ mod sealed_surface_tests {
     use crate::element_processing::bridge_styles::BridgeOutlineIndex;
     use crate::element_processing::bridges::{BridgeStructureMap, BridgeSurfaceMap};
     use crate::element_processing::building_test_support::{rect_way, test_editor};
+    use crate::element_processing::highways::HighwayConnectivityMap;
     use crate::floodfill_cache::SealedSurfaceBitmap;
     use clap::Parser as _;
     use std::sync::Arc;
+
+    #[test]
+    fn a_landuse_relation_leaves_its_holes_alone() {
+        use crate::osm_parser::{ProcessedElement, ProcessedMember};
+        let xzbbox = XZBBox::rect_from_xz_lengths(60.0, 60.0).unwrap();
+        let mut editor = test_editor(&xzbbox);
+        let outlines = BridgeOutlineIndex::build(&[]);
+        let structures =
+            BridgeStructureMap::build(&[], &editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
+        let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
+        let args = Args::parse_from([
+            "arnis",
+            "--bbox",
+            "1,2,3,4",
+            "--mode",
+            "geo-only",
+            "--ground-level",
+            "0",
+        ]);
+        // A railway corridor round a park, like the one round Disneyland Paris, with an
+        // island of railway land in the middle of the park.
+        let member = |role, way| ProcessedMember {
+            role,
+            way: Arc::new(way),
+        };
+        let rel = ProcessedRelation {
+            id: 7,
+            tags: [("landuse".to_string(), "railway".to_string())].into(),
+            members: vec![
+                member(ProcessedMemberRole::Outer, rect_way(1, 5, 5, 54, 54, &[])),
+                member(ProcessedMemberRole::Inner, rect_way(2, 15, 15, 44, 44, &[])),
+                member(ProcessedMemberRole::Outer, rect_way(3, 27, 27, 33, 33, &[])),
+            ],
+        };
+        let cache = FloodFillCache::precompute(&[ProcessedElement::Relation(rel.clone())], None);
+        editor.set_block(WATER, 8, 0, 8, None, None);
+        generate_landuse_from_relation(
+            &mut editor,
+            &rel,
+            &args,
+            &cache,
+            &BuildingFootprintBitmap::new_empty(),
+            &RoadMaskBitmap::new_empty(),
+            &surface,
+        );
+        assert!(
+            editor.check_for_block(10, 0, 10, Some(&[GRAVEL])),
+            "the corridor"
+        );
+        assert!(
+            !editor.check_for_block(20, 0, 20, Some(&[GRAVEL])),
+            "the park"
+        );
+        assert!(
+            editor.check_for_block(30, 0, 30, Some(&[GRAVEL])),
+            "the island"
+        );
+        assert!(
+            editor.check_for_block(8, 0, 8, Some(&[WATER])),
+            "a stream under the line"
+        );
+    }
 
     #[test]
     fn a_forest_leaves_a_dirt_track_alone() {
@@ -576,7 +715,8 @@ mod sealed_surface_tests {
         editor.set_sealed_surface(Arc::new(mask));
 
         let outlines = BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], &editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], &editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
 
         let args = Args::parse_from([
@@ -615,11 +755,52 @@ mod sealed_surface_tests {
     }
 
     #[test]
+    fn church_and_school_grounds_are_left_to_the_land_cover() {
+        let xzbbox = XZBBox::rect_from_xz_lengths(40.0, 40.0).unwrap();
+        let outlines = BridgeOutlineIndex::build(&[]);
+        let args = Args::parse_from([
+            "arnis",
+            "--bbox",
+            "1,2,3,4",
+            "--mode",
+            "geo-only",
+            "--ground-level",
+            "0",
+        ]);
+        for landuse in ["religious", "education"] {
+            let mut editor = test_editor(&xzbbox);
+            let structures = BridgeStructureMap::build(
+                &[],
+                &editor,
+                &HighwayConnectivityMap::new(),
+                &outlines,
+                1.0,
+            );
+            let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
+            let way = rect_way(1, 5, 5, 34, 34, &[("landuse", landuse)]);
+            generate_landuse(
+                &mut editor,
+                &way,
+                &args,
+                &FloodFillCache::new(),
+                &BuildingFootprintBitmap::new_empty(),
+                &RoadMaskBitmap::new_empty(),
+                &surface,
+            );
+            assert!(
+                !editor.check_for_block(20, 0, 20, Some(&[POLISHED_ANDESITE])),
+                "landuse={landuse} paves its lawns"
+            );
+        }
+    }
+
+    #[test]
     fn a_flowerbed_is_planted_soil() {
         let xzbbox = XZBBox::rect_from_xz_lengths(40.0, 40.0).unwrap();
         let mut editor = test_editor(&xzbbox);
         let outlines = BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], &editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], &editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
         let args = Args::parse_from([
             "arnis",
@@ -664,7 +845,8 @@ mod sealed_surface_tests {
         tags: &[(&str, &str)],
     ) -> (usize, usize, usize, usize) {
         let outlines = BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
         let args = Args::parse_from([
             "arnis",
@@ -744,7 +926,9 @@ mod sealed_surface_tests {
         let lc = LandCoverData {
             grid: vec![vec![LC_BUILT_UP, LC_WATER]; 2],
             water_distance: vec![vec![0, 1]; 2],
-            water_blend_cache: once_cell::sync::OnceCell::with_value(vec![vec![0.0, 1.0]; 2]),
+            water_blend_cache: once_cell::sync::OnceCell::new(),
+            beach_tiles: once_cell::sync::OnceCell::new(),
+            inland_water: Default::default(),
             width: 2,
             height: 2,
             cells_per_meter: 1.0,
@@ -784,7 +968,8 @@ mod sealed_surface_tests {
         editor.set_ground(Arc::new(crate::ground::Ground::new_flat(-250)));
 
         let outlines = BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], &editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], &editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
 
         let args = Args::parse_from(["arnis", "--bbox", "1,2,3,4", "--mode", "geo-only"]);

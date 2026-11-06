@@ -10,6 +10,7 @@
 //! downloading the full ~500MB tiles.
 
 pub mod bridge_repair;
+pub mod naturalize;
 pub mod osm_land_override;
 pub mod osm_water_override;
 mod shoreline;
@@ -93,6 +94,7 @@ pub fn mark_beaches(lc: &mut LandCoverData) {
     let reach = (BEACH_REACH_M * lc.cells_per_meter)
         .round()
         .clamp(1.0, 255.0) as u32;
+    lc.beach_tiles = OnceCell::new();
     let grid = &mut lc.grid;
 
     let mut frontier: Vec<(u32, u32)> = Vec::new();
@@ -141,6 +143,47 @@ pub fn mark_beaches(lc: &mut LandCoverData) {
 
 // ─── Data structures ──────────────────────────────────────────────────────
 
+/// One bit per grid cell, allocated on the first mark; empty reads as all false.
+#[derive(Clone, Default)]
+pub struct InlandWater {
+    bits: Vec<u64>,
+    width: usize,
+    height: usize,
+}
+
+impl InlandWater {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            bits: Vec::new(),
+            width,
+            height,
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, x: usize, z: usize) {
+        if x >= self.width || z >= self.height {
+            return;
+        }
+        if self.bits.is_empty() {
+            self.bits = vec![0; (self.width * self.height).div_ceil(64)];
+        }
+        let i = z * self.width + x;
+        self.bits[i / 64] |= 1 << (i % 64);
+    }
+
+    #[inline]
+    pub fn get(&self, x: usize, z: usize) -> bool {
+        if x >= self.width || z >= self.height {
+            return false;
+        }
+        let i = z * self.width + x;
+        self.bits
+            .get(i / 64)
+            .is_some_and(|w| (w >> (i % 64)) & 1 == 1)
+    }
+}
+
 /// Land cover classification grid aligned with the elevation grid.
 #[derive(Clone)]
 pub struct LandCoverData {
@@ -150,7 +193,11 @@ pub struct LandCoverData {
     /// 0 = non-water, 1 = shore water, 2+ = progressively deeper water.
     pub water_distance: Vec<Vec<u8>>,
     /// Lazily computed smoothed water mask, so the blur runs once instead of after every mutation.
-    pub water_blend_cache: OnceCell<Vec<Vec<f32>>>,
+    pub water_blend_cache: OnceCell<WaterBlendMask>,
+    /// Lazily computed tiles holding beach, so most beach lookups end in one bit.
+    pub beach_tiles: OnceCell<BeachTiles>,
+    /// Cells OSM maps as a lake, river or canal; set on the final grid by the OSM water pass.
+    pub inland_water: InlandWater,
     /// Grid width (matches elevation grid width)
     pub width: usize,
     /// Grid height (matches elevation grid height)
@@ -178,17 +225,172 @@ impl LandCoverData {
         self.invalidate_water_blend_grid();
     }
 
-    /// Smoothed water mask, computed on first use after the last grid mutation.
-    pub(crate) fn water_blend_grid(&self) -> &[Vec<f32>] {
+    /// Smoothed water mask thresholded per world block, computed on first use after the
+    /// last grid mutation.
+    pub(crate) fn water_blend_mask(&self, world_w: usize, world_h: usize) -> &WaterBlendMask {
         self.water_blend_cache.get_or_init(|| {
-            compute_water_blend_smooth(&self.grid, self.width, self.height, self.cells_per_meter)
+            let smooth = compute_water_blend_smooth(
+                &self.grid,
+                self.width,
+                self.height,
+                self.cells_per_meter,
+            );
+            WaterBlendMask::build(&smooth, self.width, self.height, world_w, world_h)
         })
     }
 
-    /// Call after any mutation to `grid` so the mask is recomputed on next use.
+    /// Call after any mutation to `grid` so the masks are recomputed on next use.
     pub(crate) fn invalidate_water_blend_grid(&mut self) {
         self.water_blend_cache = OnceCell::new();
+        self.beach_tiles = OnceCell::new();
     }
+
+    /// Whether any beach cell lies within `reach` cells (a square) of cell (x, z).
+    pub(crate) fn beach_within(&self, x: usize, z: usize, reach: usize) -> bool {
+        let (w, h) = (self.width, self.height);
+        if w == 0 || h == 0 {
+            return false;
+        }
+        let tiles = self
+            .beach_tiles
+            .get_or_init(|| BeachTiles::build(&self.grid, w));
+        if !tiles.any {
+            return false;
+        }
+        let (x0, x1) = (x.saturating_sub(reach), (x + reach).min(w - 1));
+        let (z0, z1) = (z.saturating_sub(reach), (z + reach).min(h - 1));
+        let tiled = (z0 >> BEACH_TILE_SHIFT..=z1 >> BEACH_TILE_SHIFT).any(|tz| {
+            (x0 >> BEACH_TILE_SHIFT..=x1 >> BEACH_TILE_SHIFT).any(|tx| tiles.get(tx, tz))
+        });
+        tiled && (z0..=z1).any(|z| self.grid[z][x0..=x1].contains(&LC_BEACH))
+    }
+}
+
+const BEACH_TILE_SHIFT: usize = 4;
+
+/// One bit per 16x16 cells, set where any of them is beach.
+#[derive(Clone)]
+pub struct BeachTiles {
+    bits: Vec<u64>,
+    tiles_w: usize,
+    any: bool,
+}
+
+impl BeachTiles {
+    fn build(grid: &[Vec<u8>], width: usize) -> Self {
+        let tiles_w = width.div_ceil(1 << BEACH_TILE_SHIFT);
+        let tiles_h = grid.len().div_ceil(1 << BEACH_TILE_SHIFT);
+        let mut tiles = BeachTiles {
+            bits: vec![0; (tiles_w * tiles_h).div_ceil(64)],
+            tiles_w,
+            any: false,
+        };
+        for (z, row) in grid.iter().enumerate() {
+            if !row.contains(&LC_BEACH) {
+                continue;
+            }
+            for (tx, chunk) in row.chunks(1 << BEACH_TILE_SHIFT).enumerate() {
+                if chunk.contains(&LC_BEACH) {
+                    let i = (z >> BEACH_TILE_SHIFT) * tiles_w + tx;
+                    tiles.bits[i / 64] |= 1 << (i % 64);
+                    tiles.any = true;
+                }
+            }
+        }
+        tiles
+    }
+
+    fn get(&self, tx: usize, tz: usize) -> bool {
+        let i = tz * self.tiles_w + tx;
+        self.bits[i / 64] >> (i % 64) & 1 == 1
+    }
+}
+
+/// World blocks where the bilinear smoothed water mask is above one half. Readers only ever
+/// compared it to that threshold, so one bit per block replaces a float per grid cell.
+#[derive(Clone)]
+pub struct WaterBlendMask {
+    width: usize,
+    height: usize,
+    words_per_row: usize,
+    bits: Vec<u64>,
+}
+
+impl WaterBlendMask {
+    fn build(
+        smooth: &[Vec<f32>],
+        lc_w: usize,
+        lc_h: usize,
+        world_w: usize,
+        world_h: usize,
+    ) -> Self {
+        use rayon::prelude::*;
+        let words_per_row = world_w.div_ceil(64);
+        let mut bits = vec![0u64; words_per_row * world_h];
+        if lc_w > 0 && lc_h > 0 && smooth.len() >= lc_h {
+            bits.par_chunks_mut(words_per_row.max(1))
+                .enumerate()
+                .for_each(|(z, row)| {
+                    for x in 0..world_w {
+                        let blend = sample_water_blend(smooth, lc_w, lc_h, world_w, world_h, x, z);
+                        if blend > 0.5 {
+                            row[x >> 6] |= 1 << (x & 63);
+                        }
+                    }
+                });
+        }
+        Self {
+            width: world_w,
+            height: world_h,
+            words_per_row,
+            bits,
+        }
+    }
+
+    /// Coordinates outside the world clamp to its edge, as the bilinear lookup did.
+    #[inline]
+    pub fn contains(&self, x: i32, z: i32) -> bool {
+        if self.width == 0 || self.height == 0 {
+            return false;
+        }
+        let x = x.clamp(0, self.width as i32 - 1) as usize;
+        let z = z.clamp(0, self.height as i32 - 1) as usize;
+        self.bits[z * self.words_per_row + (x >> 6)] >> (x & 63) & 1 != 0
+    }
+}
+
+/// Bilinear sample of the smoothed water mask at a world block. Continuous grid
+/// coordinates (no rounding, unlike `cover_class`) so the hard `> 0.5` threshold traces a
+/// curved shoreline instead of the ESA 10 m grid edge.
+fn sample_water_blend(
+    wb: &[Vec<f32>],
+    lc_w: usize,
+    lc_h: usize,
+    world_w: usize,
+    world_h: usize,
+    x: usize,
+    z: usize,
+) -> f64 {
+    let fx = (x as f64 / (world_w - 1).max(1) as f64).clamp(0.0, 1.0) * (lc_w - 1) as f64;
+    let fz = (z as f64 / (world_h - 1).max(1) as f64).clamp(0.0, 1.0) * (lc_h - 1) as f64;
+
+    let x0 = (fx.floor() as usize).min(lc_w - 1);
+    let x1 = (x0 + 1).min(lc_w - 1);
+    let z0 = (fz.floor() as usize).min(lc_h - 1);
+    let z1 = (z0 + 1).min(lc_h - 1);
+
+    let tx = fx - fx.floor();
+    let tz = fz - fz.floor();
+
+    // Widened to f64 so the four multiply-adds don't add rounding on top of storage.
+    let w00 = wb[z0][x0] as f64;
+    let w10 = wb[z0][x1] as f64;
+    let w01 = wb[z1][x0] as f64;
+    let w11 = wb[z1][x1] as f64;
+
+    let top = w00 * (1.0 - tx) + w10 * tx;
+    let bottom = w01 * (1.0 - tx) + w11 * tx;
+    top * (1.0 - tz) + bottom * tz
 }
 
 /// Build a smooth `[0, 1]` water-ness field from the binary `LC_WATER` mask
@@ -321,13 +523,15 @@ pub fn fetch_land_cover_data(
     smooth_class_boundaries(&mut grid, grid_width, grid_height, cells_per_meter);
 
     // Compute distance from each water cell to nearest shore via multi-source BFS.
-    // Used for shoreline blending (land cells adjacent to water get sand surface).
+    // Read as the water mask and for water depth.
     let water_distance = compute_water_distance(&grid, grid_width, grid_height);
 
     Some(LandCoverData {
         grid,
         water_distance,
         water_blend_cache: OnceCell::new(),
+        beach_tiles: OnceCell::new(),
+        inland_water: Default::default(),
         width: grid_width,
         height: grid_height,
         cells_per_meter,
@@ -1587,6 +1791,8 @@ mod smoothing_scale_tests {
             water_distance: compute_water_distance(&grid, width, height),
             grid,
             water_blend_cache: OnceCell::new(),
+            beach_tiles: OnceCell::new(),
+            inland_water: Default::default(),
             width,
             height,
             cells_per_meter,
@@ -1625,5 +1831,21 @@ mod smoothing_scale_tests {
         let mut lc = lc_from_rows(&["bbbb", "gggg"], 1.0);
         mark_beaches(&mut lc);
         assert!(lc.grid[0].iter().all(|&c| c == LC_BARE));
+    }
+}
+
+#[cfg(test)]
+mod inland_water_tests {
+    use super::*;
+
+    #[test]
+    fn reads_outside_the_grid_are_unmarked() {
+        let mut m = InlandWater::new(4, 3);
+        assert!(!m.get(1, 1));
+        m.set(1, 1);
+        m.set(9, 9);
+        assert!(m.get(1, 1));
+        assert!(!m.get(1, 3) && !m.get(4, 0));
+        assert!(!m.get(usize::MAX, 0) && !m.get(0, usize::MAX));
     }
 }

@@ -1,11 +1,13 @@
 //! Force LC_WATER inside OSM water polygons and waterways so OSM defines
 //! the shoreline, overriding ESA's noisy 10 m classification.
+use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
 
 use crate::bresenham::bresenham_line;
 use crate::clipping::clip_water_ring_to_bbox;
 use crate::coordinate_system::cartesian::XZBBox;
-use crate::land_cover::{compute_water_distance, LandCoverData, LC_WATER};
+use crate::floodfill_cache::hole_groups;
+use crate::land_cover::{compute_water_distance, InlandWater, LandCoverData, LC_WATER};
 use crate::osm_parser::{
     ProcessedElement, ProcessedMemberRole, ProcessedNode, ProcessedRelation, ProcessedWay,
 };
@@ -14,11 +16,10 @@ const ELEVATION_TOLERANCE_BLOCKS: f32 = 1.5;
 const PROTECTED_LAND_AREA_M2: f64 = 4000.0;
 const MIN_PROTECTED_LAND_CELLS: usize = 100;
 const LINEAR_ASPECT_RATIO: f64 = 3.0;
-// Above this grid size the nearest-water f32 grid is dropped to cap memory.
-const MAX_CELLS_FOR_ELEV_GUARD: usize = 100 * 1024 * 1024;
 
 struct WaterContext {
-    nearest_y: Option<Vec<Vec<f32>>>,
+    /// Row-major, `width` per row.
+    nearest_y: Vec<f32>,
     protected_mask: Vec<u64>,
     width: usize,
 }
@@ -41,11 +42,6 @@ pub fn apply_osm_water_override(
     }
     let scale_to_grid_x = (width as f64 - 1.0) / (world_width as f64 - 1.0);
     let scale_to_grid_z = (height as f64 - 1.0) / (world_height as f64 - 1.0);
-    let min_x = xzbbox.min_x();
-    let min_z = xzbbox.min_z();
-    let max_x = xzbbox.max_x();
-    let max_z = xzbbox.max_z();
-
     let context = build_water_context(
         &land_cover.grid,
         heights,
@@ -54,8 +50,156 @@ pub fn apply_osm_water_override(
         scale_to_grid_x,
         scale_to_grid_z,
     );
-    let heights: &mut [Vec<f32>] = heights;
+    let reach = inland_reach(land_cover);
+    let (changed, inland) = rasterize_osm_water(
+        &mut land_cover.grid,
+        heights,
+        context.as_ref(),
+        (scale_to_grid_x, scale_to_grid_z),
+        reach,
+        true,
+        elements,
+        xzbbox,
+    );
+    land_cover.inland_water = inland;
 
+    if changed > 0 {
+        eprintln!(
+            "OSM water override: reclassified {} cells to LC_WATER inside OSM water polygons/lines",
+            changed
+        );
+        land_cover.water_distance = compute_water_distance(&land_cover.grid, width, height);
+        land_cover.invalidate_water_blend_grid();
+        // The grid was leveled before this ran, so cells added here sit at their own
+        // terrain height and render as a rim above the body. Sink them onto the water
+        // they were judged against. ESA water is its own seed and stays put.
+        if let Some(nearest_y) = context.as_ref().map(|c| c.nearest_y.as_slice()) {
+            let mut sunk = 0usize;
+            for gz in 0..height {
+                for gx in 0..width {
+                    if land_cover.grid[gz][gx] != LC_WATER {
+                        continue;
+                    }
+                    let cell_y = heights[gz][gx];
+                    let water_y = nearest_y[gz * width + gx];
+                    if cell_y.is_finite()
+                        && water_y.is_finite()
+                        && cell_y > water_y
+                        && cell_y <= water_y + ELEVATION_TOLERANCE_BLOCKS
+                    {
+                        heights[gz][gx] = water_y;
+                        sunk += 1;
+                    }
+                }
+            }
+            if sunk > 0 {
+                eprintln!(
+                    "OSM water override: sank {} overridden cells onto the adjacent water surface",
+                    sunk
+                );
+            }
+        }
+    }
+}
+
+/// Flat worlds keep ESA's water; this only records which of it OSM maps as inland.
+pub fn mark_inland_water(
+    land_cover: &mut LandCoverData,
+    world_width: usize,
+    world_height: usize,
+    elements: &[ProcessedElement],
+    xzbbox: &XZBBox,
+) {
+    let (width, height) = (land_cover.width, land_cover.height);
+    if width < 2 || height < 2 || world_width < 2 || world_height < 2 {
+        return;
+    }
+    let scale = (
+        (width as f64 - 1.0) / (world_width as f64 - 1.0),
+        (height as f64 - 1.0) / (world_height as f64 - 1.0),
+    );
+    let reach = inland_reach(land_cover);
+    let grid = &mut land_cover.grid;
+    land_cover.inland_water =
+        rasterize_osm_water(grid, &[], None, scale, reach, false, elements, xzbbox).1;
+}
+
+/// How far the inland mark spreads from mapped water, in grid cells.
+fn inland_reach(land_cover: &LandCoverData) -> usize {
+    const INLAND_REACH_M: f64 = 600.0;
+    (INLAND_REACH_M * land_cover.cells_per_meter)
+        .round()
+        .max(1.0) as usize
+}
+
+/// Spreads the inland mark through connected water, short of mapped sea; tidal rivers
+/// arrive only as centrelines.
+fn spread_inland(grid: &[Vec<u8>], inland: &mut InlandWater, sea: &InlandWater, reach: usize) {
+    let height = grid.len();
+    let width = grid.first().map_or(0, |r| r.len());
+    let open = |inland: &InlandWater, x: usize, z: usize| {
+        x < width && z < height && grid[z][x] == LC_WATER && !inland.get(x, z) && !sea.get(x, z)
+    };
+    let around = |x: usize, z: usize| {
+        [
+            (x.wrapping_sub(1), z),
+            (x + 1, z),
+            (x, z.wrapping_sub(1)),
+            (x, z + 1),
+        ]
+    };
+    // Only marked water on the edge of unmarked water seeds, kept as flat u32 indices.
+    let mut frontier: Vec<u32> = Vec::new();
+    for (z, row) in grid.iter().enumerate() {
+        for (x, &c) in row.iter().enumerate() {
+            if c == LC_WATER
+                && inland.get(x, z)
+                && around(x, z).iter().any(|&(nx, nz)| open(inland, nx, nz))
+            {
+                frontier.push((z * width + x) as u32);
+            }
+        }
+    }
+    let mut next = Vec::new();
+    for _ in 0..reach {
+        if frontier.is_empty() {
+            break;
+        }
+        for &i in &frontier {
+            let (x, z) = (i as usize % width, i as usize / width);
+            for (nx, nz) in around(x, z) {
+                if open(inland, nx, nz) {
+                    inland.set(nx, nz);
+                    next.push((nz * width + nx) as u32);
+                }
+            }
+        }
+        std::mem::swap(&mut frontier, &mut next);
+        next.clear();
+    }
+}
+
+/// Burns OSM water into `grid` when `write`, returning the cells changed and the inland mask.
+#[allow(clippy::too_many_arguments)]
+fn rasterize_osm_water(
+    grid: &mut [Vec<u8>],
+    heights: &[Vec<f32>],
+    context: Option<&WaterContext>,
+    (scale_to_grid_x, scale_to_grid_z): (f64, f64),
+    reach: usize,
+    write: bool,
+    elements: &[ProcessedElement],
+    xzbbox: &XZBBox,
+) -> (usize, InlandWater) {
+    let height = grid.len();
+    let width = grid.first().map_or(0, |r| r.len());
+    let min_x = xzbbox.min_x();
+    let min_z = xzbbox.min_z();
+    let max_x = xzbbox.max_x();
+    let max_z = xzbbox.max_z();
+    let mut inland = InlandWater::new(width, height);
+    // Bays and harbours, so the spread stops at them; only allocated where they are mapped.
+    let mut sea = InlandWater::new(width, height);
     let mut changed: usize = 0;
     for elem in elements {
         match elem {
@@ -71,11 +215,11 @@ pub fn apply_osm_water_override(
                     };
                     let outer: Vec<(i32, i32)> = clipped.iter().map(|n| (n.x, n.z)).collect();
                     changed += fill_polygon_scanline(
-                        &mut land_cover.grid,
+                        grid,
                         &[outer.as_slice()],
                         &[],
                         heights,
-                        context.as_ref(),
+                        context,
                         min_x,
                         min_z,
                         max_x,
@@ -84,6 +228,12 @@ pub fn apply_osm_water_override(
                         height,
                         scale_to_grid_x,
                         scale_to_grid_z,
+                        write,
+                        Some(if is_inland_water(&way.tags) {
+                            &mut inland
+                        } else {
+                            &mut sea
+                        }),
                     );
                 } else if let Some(waterway_type) = way.tags.get("waterway") {
                     if !crate::element_processing::waterways::is_channel_waterway(waterway_type)
@@ -97,11 +247,11 @@ pub fn apply_osm_water_override(
                     );
                     let half_width = waterway_width / 2;
                     changed += rasterize_line(
-                        &mut land_cover.grid,
+                        grid,
                         &way.nodes,
                         half_width,
                         heights,
-                        context.as_ref(),
+                        context,
                         min_x,
                         min_z,
                         max_x,
@@ -110,6 +260,8 @@ pub fn apply_osm_water_override(
                         height,
                         scale_to_grid_x,
                         scale_to_grid_z,
+                        write,
+                        Some(&mut inland),
                     );
                 }
             }
@@ -154,65 +306,37 @@ pub fn apply_osm_water_override(
                     .iter()
                     .map(|ring| ring.iter().map(|n| (n.x, n.z)).collect())
                     .collect();
-                let outers_refs: Vec<&[(i32, i32)]> = outers.iter().map(|v| v.as_slice()).collect();
-                let inners_refs: Vec<&[(i32, i32)]> = inners.iter().map(|v| v.as_slice()).collect();
-                changed += fill_polygon_scanline(
-                    &mut land_cover.grid,
-                    &outers_refs,
-                    &inners_refs,
-                    heights,
-                    context.as_ref(),
-                    min_x,
-                    min_z,
-                    max_x,
-                    max_z,
-                    width,
-                    height,
-                    scale_to_grid_x,
-                    scale_to_grid_z,
-                );
+                let rel_inland = is_inland_water(&rel.tags);
+                // Each group on its own, so a pond on an island in a hole stays water.
+                for (members, cutting) in hole_groups(&outers, &inners, |&p| p) {
+                    let outers_refs: Vec<&[(i32, i32)]> =
+                        members.iter().map(|&o| outers[o].as_slice()).collect();
+                    let inners_refs: Vec<&[(i32, i32)]> =
+                        cutting.iter().map(|&i| inners[i].as_slice()).collect();
+                    changed += fill_polygon_scanline(
+                        grid,
+                        &outers_refs,
+                        &inners_refs,
+                        heights,
+                        context,
+                        min_x,
+                        min_z,
+                        max_x,
+                        max_z,
+                        width,
+                        height,
+                        scale_to_grid_x,
+                        scale_to_grid_z,
+                        write,
+                        Some(if rel_inland { &mut inland } else { &mut sea }),
+                    );
+                }
             }
             _ => {}
         }
     }
-
-    if changed > 0 {
-        eprintln!(
-            "OSM water override: reclassified {} cells to LC_WATER inside OSM water polygons/lines",
-            changed
-        );
-        land_cover.water_distance = compute_water_distance(&land_cover.grid, width, height);
-        land_cover.invalidate_water_blend_grid();
-        // The grid was leveled before this ran, so cells added here sit at their own
-        // terrain height and render as a rim above the body. Sink them onto the water
-        // they were judged against. ESA water is its own seed and stays put.
-        if let Some(nearest_y) = context.as_ref().and_then(|c| c.nearest_y.as_deref()) {
-            let mut sunk = 0usize;
-            for gz in 0..height {
-                for gx in 0..width {
-                    if land_cover.grid[gz][gx] != LC_WATER {
-                        continue;
-                    }
-                    let cell_y = heights[gz][gx];
-                    let water_y = nearest_y[gz][gx];
-                    if cell_y.is_finite()
-                        && water_y.is_finite()
-                        && cell_y > water_y
-                        && cell_y <= water_y + ELEVATION_TOLERANCE_BLOCKS
-                    {
-                        heights[gz][gx] = water_y;
-                        sunk += 1;
-                    }
-                }
-            }
-            if sunk > 0 {
-                eprintln!(
-                    "OSM water override: sank {} overridden cells onto the adjacent water surface",
-                    sunk
-                );
-            }
-        }
-    }
+    spread_inland(grid, &mut inland, &sea, reach);
+    (changed, inland)
 }
 
 fn is_water_polygon_way(way: &ProcessedWay) -> bool {
@@ -237,6 +361,16 @@ fn has_water_polygon_tags(tags: &HashMap<String, String>) -> bool {
         || matches!(
             tags.get("waterway").map(|s| s.as_str()),
             Some("dock" | "riverbank")
+        )
+}
+
+// Bays, lagoons, harbours, docks and fjords open onto the sea, so they keep its biome.
+fn is_inland_water(tags: &HashMap<String, String>) -> bool {
+    !matches!(tags.get("natural").map(|s| s.as_str()), Some("bay"))
+        && !matches!(tags.get("waterway").map(|s| s.as_str()), Some("dock"))
+        && !matches!(
+            tags.get("water").map(|s| s.as_str()),
+            Some("lagoon" | "bay" | "sea" | "harbour" | "fjord")
         )
 }
 
@@ -275,6 +409,8 @@ fn fill_polygon_scanline(
     height: usize,
     scale_to_grid_x: f64,
     scale_to_grid_z: f64,
+    write: bool,
+    mut inland: Option<&mut InlandWater>,
 ) -> usize {
     if outers.is_empty() || width < 2 || height < 2 {
         return 0;
@@ -348,6 +484,8 @@ fn fill_polygon_scanline(
             width,
             scale_to_grid_x,
             scale_inv_x,
+            write,
+            inland.as_deref_mut(),
         );
     }
     count
@@ -366,6 +504,8 @@ fn fill_row_spans(
     width: usize,
     scale_to_grid_x: f64,
     scale_inv_x: f64,
+    write: bool,
+    mut inland: Option<&mut InlandWater>,
 ) -> usize {
     // Cyclic rings always yield an even crossing count; pairing ignores any trailing odd one.
     let mut count = 0;
@@ -396,7 +536,10 @@ fn fill_row_spans(
                     continue;
                 }
             }
-            if !passes_water_guard(heights, context, gx, gz) {
+            if let Some(m) = inland.as_deref_mut() {
+                m.set(gx, gz);
+            }
+            if !write || !passes_water_guard(heights, context, gx, gz) {
                 continue;
             }
             if row[gx] != LC_WATER {
@@ -453,6 +596,8 @@ fn rasterize_line(
     height: usize,
     scale_to_grid_x: f64,
     scale_to_grid_z: f64,
+    write: bool,
+    mut inland: Option<&mut InlandWater>,
 ) -> usize {
     if nodes.len() < 2 || half_width < 0 {
         return 0;
@@ -493,7 +638,10 @@ fn rasterize_line(
                     }
                     let gx_u = gx as usize;
                     let gz_u = gz as usize;
-                    if !passes_water_guard(heights, context, gx_u, gz_u) {
+                    if let Some(m) = inland.as_deref_mut() {
+                        m.set(gx_u, gz_u);
+                    }
+                    if !write || !passes_water_guard(heights, context, gx_u, gz_u) {
                         continue;
                     }
                     if grid[gz_u][gx_u] != LC_WATER {
@@ -544,11 +692,7 @@ fn build_water_context(
         small_threshold_cells,
         LINEAR_ASPECT_RATIO,
     );
-    let nearest_y = if width.saturating_mul(height) <= MAX_CELLS_FOR_ELEV_GUARD {
-        Some(compute_nearest_water_y(grid, heights, width, height))
-    } else {
-        None
-    };
+    let nearest_y = compute_nearest_water_y(grid, heights, width, height);
 
     Some(WaterContext {
         nearest_y,
@@ -557,7 +701,10 @@ fn build_water_context(
     })
 }
 
-// Two-pass: classify components without storing cells, then re-walk protected seeds.
+/// Bits on every cell of a 4-connected land component at least `small_threshold_cells`
+/// large and no more elongated than `linear_aspect_ratio`. Components are joined from the
+/// land runs of each row where runs on neighbouring rows share a column, so only the runs
+/// are walked, not every cell.
 fn build_protected_land_bitset(
     grid: &[Vec<u8>],
     width: usize,
@@ -565,121 +712,88 @@ fn build_protected_land_bitset(
     small_threshold_cells: usize,
     linear_aspect_ratio: f64,
 ) -> Vec<u64> {
-    let n = width * height;
-    let mut mask: Vec<u64> = vec![0; n.div_ceil(64)];
-    let mut stack: Vec<u32> = Vec::new();
-    let mut protected_seeds: Vec<u32> = Vec::new();
-    let width_i32 = width as i32;
-    let height_i32 = height as i32;
-
-    // Pass 1: classify each component, remember protected seeds.
-    for start_z in 0..height {
-        for start_x in 0..width {
-            if grid[start_z][start_x] == LC_WATER {
-                continue;
+    let mut mask: Vec<u64> = vec![0; (width * height).div_ceil(64)];
+    // [start, end) of each land run, per row.
+    let rows: Vec<Vec<(u32, u32)>> = grid[..height]
+        .par_iter()
+        .map(|row| {
+            let mut runs = Vec::new();
+            let mut x = 0;
+            while x < width {
+                if row[x] == LC_WATER {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < width && row[x] != LC_WATER {
+                    x += 1;
+                }
+                runs.push((start as u32, x as u32));
             }
-            let start_idx = start_z * width + start_x;
-            if get_bit(&mask, start_idx) {
-                continue;
+            runs
+        })
+        .collect();
+    let mut first_run = Vec::with_capacity(height + 1);
+    first_run.push(0usize);
+    for runs in &rows {
+        first_run.push(first_run.last().unwrap() + runs.len());
+    }
+
+    fn root(parent: &mut [u32], mut i: u32) -> u32 {
+        while parent[i as usize] != i {
+            parent[i as usize] = parent[parent[i as usize] as usize];
+            i = parent[i as usize];
+        }
+        i
+    }
+    let mut parent: Vec<u32> = (0..first_run[height] as u32).collect();
+    for z in 1..height {
+        let (above, here) = (&rows[z - 1], &rows[z]);
+        let (mut a, mut b) = (0, 0);
+        while a < above.len() && b < here.len() {
+            let ((a0, a1), (b0, b1)) = (above[a], here[b]);
+            if a0 < b1 && b0 < a1 {
+                let ra = root(&mut parent, (first_run[z - 1] + a) as u32);
+                let rb = root(&mut parent, (first_run[z] + b) as u32);
+                parent[ra.max(rb) as usize] = ra.min(rb);
             }
-
-            stack.clear();
-            stack.push(start_idx as u32);
-            set_bit(&mut mask, start_idx);
-
-            let mut min_x = start_x;
-            let mut max_x = start_x;
-            let mut min_z = start_z;
-            let mut max_z = start_z;
-            let mut size: usize = 0;
-
-            while let Some(curr) = stack.pop() {
-                let curr_u = curr as usize;
-                let cx = (curr_u % width) as i32;
-                let cz = (curr_u / width) as i32;
-                size += 1;
-                let cxu = cx as usize;
-                let czu = cz as usize;
-                if cxu < min_x {
-                    min_x = cxu;
-                }
-                if cxu > max_x {
-                    max_x = cxu;
-                }
-                if czu < min_z {
-                    min_z = czu;
-                }
-                if czu > max_z {
-                    max_z = czu;
-                }
-                for (dx, dz) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-                    let nx = cx + dx;
-                    let nz = cz + dz;
-                    if nx < 0 || nz < 0 || nx >= width_i32 || nz >= height_i32 {
-                        continue;
-                    }
-                    let nxu = nx as usize;
-                    let nzu = nz as usize;
-                    if grid[nzu][nxu] == LC_WATER {
-                        continue;
-                    }
-                    let n_idx = nzu * width + nxu;
-                    if get_bit(&mask, n_idx) {
-                        continue;
-                    }
-                    set_bit(&mut mask, n_idx);
-                    stack.push(n_idx as u32);
-                }
-            }
-
-            let bbox_w = max_x - min_x + 1;
-            let bbox_h = max_z - min_z + 1;
-            let long_axis = bbox_w.max(bbox_h);
-            let short_axis = bbox_w.min(bbox_h).max(1);
-            let aspect = long_axis as f64 / short_axis as f64;
-            let is_compact = aspect <= linear_aspect_ratio;
-            let is_large = size >= small_threshold_cells;
-            if is_large && is_compact {
-                protected_seeds.push(start_idx as u32);
+            if a1 < b1 {
+                a += 1;
+            } else {
+                b += 1;
             }
         }
     }
 
-    // Pass 2: reuse the bitset to mark cells reachable from protected seeds.
-    mask.fill(0);
-    for seed in protected_seeds {
-        let seed_u = seed as usize;
-        if get_bit(&mask, seed_u) {
-            continue;
+    // Size and bounding box (min_x, max_x, min_z, max_z) per component root.
+    let mut size = vec![0usize; parent.len()];
+    let mut bounds = vec![(u32::MAX, 0u32, u32::MAX, 0u32); parent.len()];
+    for (z, runs) in rows.iter().enumerate() {
+        for (i, &(x0, x1)) in runs.iter().enumerate() {
+            let r = root(&mut parent, (first_run[z] + i) as u32) as usize;
+            size[r] += (x1 - x0) as usize;
+            let b = &mut bounds[r];
+            *b = (
+                b.0.min(x0),
+                b.1.max(x1 - 1),
+                b.2.min(z as u32),
+                b.3.max(z as u32),
+            );
         }
-        stack.clear();
-        stack.push(seed);
-        set_bit(&mut mask, seed_u);
-        while let Some(curr) = stack.pop() {
-            let curr_u = curr as usize;
-            let cx = (curr_u % width) as i32;
-            let cz = (curr_u / width) as i32;
-            for (dx, dz) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-                let nx = cx + dx;
-                let nz = cz + dz;
-                if nx < 0 || nz < 0 || nx >= width_i32 || nz >= height_i32 {
-                    continue;
+    }
+    for (z, runs) in rows.iter().enumerate() {
+        for (i, &(x0, x1)) in runs.iter().enumerate() {
+            let r = root(&mut parent, (first_run[z] + i) as u32) as usize;
+            let (min_x, max_x, min_z, max_z) = bounds[r];
+            let (bbox_w, bbox_h) = ((max_x - min_x + 1) as usize, (max_z - min_z + 1) as usize);
+            let aspect = bbox_w.max(bbox_h) as f64 / bbox_w.min(bbox_h).max(1) as f64;
+            if size[r] >= small_threshold_cells && aspect <= linear_aspect_ratio {
+                for idx in z * width + x0 as usize..z * width + x1 as usize {
+                    set_bit(&mut mask, idx);
                 }
-                let nxu = nx as usize;
-                let nzu = nz as usize;
-                if grid[nzu][nxu] == LC_WATER {
-                    continue;
-                }
-                let n_idx = nzu * width + nxu;
-                if get_bit(&mask, n_idx) {
-                    continue;
-                }
-                set_bit(&mut mask, n_idx);
-                stack.push(n_idx as u32);
             }
         }
     }
-
     mask
 }
 
@@ -689,40 +803,32 @@ fn compute_nearest_water_y(
     heights: &[Vec<f32>],
     width: usize,
     height: usize,
-) -> Vec<Vec<f32>> {
-    let mut result: Vec<Vec<f32>> = vec![vec![f32::NAN; width]; height];
-    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+) -> Vec<f32> {
+    let mut result: Vec<f32> = vec![f32::NAN; width * height];
+    let mut queue: VecDeque<u32> = VecDeque::new();
     for z in 0..height {
-        let row = &grid[z];
-        let h_row = &heights[z];
+        let (row, h_row) = (&grid[z], &heights[z]);
         for x in 0..width {
-            if row[x] == LC_WATER {
-                let h = h_row[x];
-                if h.is_finite() {
-                    result[z][x] = h;
-                    queue.push_back((x as u32, z as u32));
-                }
+            if row[x] == LC_WATER && h_row[x].is_finite() {
+                result[z * width + x] = h_row[x];
+                queue.push_back((z * width + x) as u32);
             }
         }
     }
-    if queue.is_empty() {
-        return result;
-    }
-    let width_i32 = width as i32;
-    let height_i32 = height as i32;
-    while let Some((x, z)) = queue.pop_front() {
-        let cell_y = result[z as usize][x as usize];
-        for (dx, dz) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
-            let nx = x as i32 + dx;
-            let nz = z as i32 + dz;
-            if nx < 0 || nz < 0 || nx >= width_i32 || nz >= height_i32 {
-                continue;
-            }
-            let nxu = nx as usize;
-            let nzu = nz as usize;
-            if result[nzu][nxu].is_nan() {
-                result[nzu][nxu] = cell_y;
-                queue.push_back((nx as u32, nz as u32));
+    while let Some(i) = queue.pop_front() {
+        let i = i as usize;
+        let (x, cell_y) = (i % width, result[i]);
+        // Same neighbour order as before: -x, +x, -z, +z.
+        let neighbours = [
+            (x > 0).then(|| i - 1),
+            (x + 1 < width).then(|| i + 1),
+            i.checked_sub(width),
+            (i + width < width * height).then(|| i + width),
+        ];
+        for n in neighbours.into_iter().flatten() {
+            if result[n].is_nan() {
+                result[n] = cell_y;
+                queue.push_back(n as u32);
             }
         }
     }
@@ -743,11 +849,8 @@ fn passes_water_guard(
     if get_bit(&c.protected_mask, idx) {
         return false;
     }
-    let Some(nearest_y) = c.nearest_y.as_deref() else {
-        return true;
-    };
     let cell_y = heights[gz][gx];
-    let water_y = nearest_y[gz][gx];
+    let water_y = c.nearest_y[idx];
     if !cell_y.is_finite() || !water_y.is_finite() {
         return true;
     }
@@ -775,6 +878,109 @@ mod tests {
             x,
             z,
         }
+    }
+
+    fn water_way(id: u64, tags: &[(&str, &str)], nodes: Vec<ProcessedNode>) -> ProcessedElement {
+        ProcessedElement::Way(ProcessedWay {
+            id,
+            nodes,
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        })
+    }
+
+    fn square(x0: i32, z0: i32, x1: i32, z1: i32) -> Vec<ProcessedNode> {
+        vec![
+            node(1, x0, z0),
+            node(2, x1, z0),
+            node(3, x1, z1),
+            node(4, x0, z1),
+            node(1, x0, z0),
+        ]
+    }
+
+    #[test]
+    fn lakes_and_waterways_are_inland_harbours_are_sea() {
+        let bbox = XZBBox::rect_from_min_max(0, 0, 31, 31).unwrap();
+        // Land splits the water into quarters, so the mark can't cross between them.
+        let mut grid = vec![vec![LC_WATER; 32]; 32];
+        for row in grid.iter_mut() {
+            row[15] = 0;
+        }
+        grid[15].fill(0);
+        let mut lc = LandCoverData {
+            water_distance: compute_water_distance(&grid, 32, 32),
+            grid,
+            water_blend_cache: Default::default(),
+            beach_tiles: Default::default(),
+            inland_water: Default::default(),
+            width: 32,
+            height: 32,
+            // A 600 m reach is 3 cells.
+            cells_per_meter: 0.005,
+        };
+        let elements = [
+            water_way(1, &[("natural", "water")], square(2, 2, 10, 10)),
+            water_way(
+                2,
+                &[("natural", "water"), ("water", "harbour")],
+                square(20, 2, 28, 10),
+            ),
+            water_way(
+                3,
+                &[("waterway", "river"), ("width", "2")],
+                vec![node(5, 20, 20), node(6, 28, 20)],
+            ),
+        ];
+        let before = lc.grid.clone();
+        mark_inland_water(&mut lc, 32, 32, &elements, &bbox);
+        assert!(lc.inland_water.get(5, 5));
+        // The lake's mark spreads three steps, the harbour's water stays sea.
+        assert!(lc.inland_water.get(13, 5));
+        assert!(!lc.inland_water.get(14, 14));
+        assert!(!lc.inland_water.get(24, 5));
+        // A river centreline marks the water around it, up to the reach.
+        assert!(lc.inland_water.get(24, 23));
+        assert!(!lc.inland_water.get(24, 28));
+        assert!(!lc.inland_water.get(5, 24));
+        // Flat worlds keep their water as it was.
+        assert!(lc.grid == before);
+    }
+
+    #[test]
+    fn river_mark_stops_at_mapped_sea() {
+        let bbox = XZBBox::rect_from_min_max(0, 0, 31, 7).unwrap();
+        let grid = vec![vec![LC_WATER; 32]; 8];
+        let mut lc = LandCoverData {
+            water_distance: compute_water_distance(&grid, 32, 8),
+            grid,
+            water_blend_cache: Default::default(),
+            beach_tiles: Default::default(),
+            inland_water: Default::default(),
+            width: 32,
+            height: 8,
+            // A 600 m reach is 30 cells, past the harbour's far side.
+            cells_per_meter: 0.05,
+        };
+        let elements = [
+            water_way(
+                1,
+                &[("waterway", "river"), ("width", "2")],
+                vec![node(1, 0, 4), node(2, 8, 4)],
+            ),
+            water_way(
+                2,
+                &[("natural", "water"), ("water", "harbour")],
+                square(16, 0, 23, 7),
+            ),
+            water_way(3, &[("waterway", "dock")], square(24, 0, 31, 7)),
+        ];
+        mark_inland_water(&mut lc, 32, 8, &elements, &bbox);
+        assert!(lc.inland_water.get(12, 4));
+        assert!(!lc.inland_water.get(20, 4));
+        assert!(!lc.inland_water.get(28, 4));
     }
 
     #[test]
@@ -806,6 +1012,8 @@ mod tests {
             16,
             1.0,
             1.0,
+            true,
+            None,
         );
         assert!(n > 0);
         assert_eq!(grid[7][10], LC_WATER);
@@ -834,9 +1042,143 @@ mod tests {
             16,
             1.0,
             1.0,
+            true,
+            None,
         );
         assert!(n > 0);
         assert_eq!(row[3], LC_WATER);
         assert_ne!(row[8], LC_WATER);
+    }
+
+    /// Water blobs and ribbons on land, so land splits into islands, strips and one big body.
+    fn patchy(w: usize, h: usize, seed: u64) -> Vec<Vec<u8>> {
+        let mut s = seed;
+        let mut grid = vec![vec![0u8; w]; h];
+        for _ in 0..(w * h / 40) {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let (x, z, r) = (
+                (s >> 20) as usize % w,
+                (s >> 40) as usize % h,
+                (s >> 62) as usize,
+            );
+            for row in grid.iter_mut().skip(z.saturating_sub(r)).take(2 * r + 1) {
+                for c in row.iter_mut().skip(x.saturating_sub(r)).take(2 * r + 1) {
+                    *c = LC_WATER;
+                }
+            }
+        }
+        for (z, row) in grid.iter_mut().enumerate() {
+            row[(z * 3 / 2) % w] = LC_WATER;
+            if z == h / 3 {
+                row.fill(LC_WATER);
+            }
+        }
+        grid
+    }
+
+    #[test]
+    fn protected_land_matches_a_flood_fill() {
+        let (mut kept, mut open) = (0, 0);
+        for (w, h, seed) in [(70, 50, 1), (33, 90, 2), (128, 64, 3)] {
+            let grid = patchy(w, h, seed);
+            for (small, ratio) in [(1, 100.0), (20, 3.0), (200, 2.0), (2000, 3.0)] {
+                let got = build_protected_land_bitset(&grid, w, h, small, ratio);
+                let mut want = vec![false; w * h];
+                let mut seen = vec![false; w * h];
+                for start in 0..w * h {
+                    if seen[start] || grid[start / w][start % w] == LC_WATER {
+                        continue;
+                    }
+                    let (mut cells, mut stack) = (Vec::new(), vec![start]);
+                    seen[start] = true;
+                    while let Some(i) = stack.pop() {
+                        cells.push(i);
+                        let (x, z) = (i % w, i / w);
+                        let near = [
+                            (x > 0).then(|| i - 1),
+                            (x + 1 < w).then(|| i + 1),
+                            (z > 0).then(|| i - w),
+                            (z + 1 < h).then(|| i + w),
+                        ];
+                        for n in near.into_iter().flatten() {
+                            if !seen[n] && grid[n / w][n % w] != LC_WATER {
+                                seen[n] = true;
+                                stack.push(n);
+                            }
+                        }
+                    }
+                    let xs = cells.iter().map(|i| i % w);
+                    let zs = cells.iter().map(|i| i / w);
+                    let bw = xs.clone().max().unwrap() - xs.min().unwrap() + 1;
+                    let bh = zs.clone().max().unwrap() - zs.min().unwrap() + 1;
+                    if cells.len() >= small && bw.max(bh) as f64 / bw.min(bh) as f64 <= ratio {
+                        for &i in &cells {
+                            want[i] = true;
+                        }
+                    }
+                }
+                for (i, &protected) in want.iter().enumerate() {
+                    assert_eq!(
+                        get_bit(&got, i),
+                        protected,
+                        "cell {i} of {w}x{h}, {small}/{ratio}"
+                    );
+                    let land = grid[i / w][i % w] != LC_WATER;
+                    kept += usize::from(protected);
+                    open += usize::from(land && !protected);
+                }
+            }
+        }
+        assert!(
+            kept > 0 && open > 0,
+            "some land is protected and some is not"
+        );
+    }
+
+    #[test]
+    fn nearest_water_takes_the_first_seed_to_arrive() {
+        let (w, h) = (40, 30);
+        let grid = patchy(w, h, 5);
+        let heights: Vec<Vec<f32>> = (0..h)
+            .map(|z| {
+                (0..w)
+                    .map(|x| {
+                        if (x + z) % 17 == 0 {
+                            f32::NAN
+                        } else {
+                            (x * 3 + z * 7) as f32
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        // The grid-of-rows BFS this replaced.
+        let mut want = vec![vec![f32::NAN; w]; h];
+        let mut queue = VecDeque::new();
+        for z in 0..h {
+            for x in 0..w {
+                if grid[z][x] == LC_WATER && heights[z][x].is_finite() {
+                    want[z][x] = heights[z][x];
+                    queue.push_back((x as i32, z as i32));
+                }
+            }
+        }
+        while let Some((x, z)) = queue.pop_front() {
+            let y = want[z as usize][x as usize];
+            for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                let (nx, nz) = (x + dx, z + dz);
+                let inside = nx >= 0 && nz >= 0 && nx < w as i32 && nz < h as i32;
+                if inside && want[nz as usize][nx as usize].is_nan() {
+                    want[nz as usize][nx as usize] = y;
+                    queue.push_back((nx, nz));
+                }
+            }
+        }
+        let got = compute_nearest_water_y(&grid, &heights, w, h);
+        for (i, v) in want.iter().flatten().enumerate() {
+            assert_eq!(got[i].to_bits(), v.to_bits(), "cell {i}");
+        }
     }
 }

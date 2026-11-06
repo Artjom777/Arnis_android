@@ -28,6 +28,27 @@ fn corner_min_seg_len(scale: f64) -> i32 {
     ((6.0 * scale) as i32).max(6)
 }
 
+/// Where a wall column falls in the window layout of its straight wall run.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BaySlot {
+    /// No layout was planned for this column (setback tiers, tests): the
+    /// building's world-aligned lattice decides.
+    Lattice,
+    /// The solid pier a wall run starts or ends on.
+    End,
+    /// Solid wall between two windows.
+    Pier,
+    /// Column `k` of a window `width` columns wide, the `bay`-th along the run.
+    Window { k: i32, width: i32, bay: i32 },
+}
+
+impl BaySlot {
+    #[inline]
+    pub fn is_window(self) -> bool {
+        matches!(self, BaySlot::Window { .. })
+    }
+}
+
 /// Per-column wall context.
 #[derive(Copy, Clone)]
 pub struct ColumnFacade {
@@ -42,6 +63,10 @@ pub struct ColumnFacade {
     /// box of panes; a real one almost always turns the corner on a pier. The
     /// window patterns use this to put the wall block there instead.
     pub corner: bool,
+    /// Upper-floor window layout at this column.
+    pub slot: BaySlot,
+    /// Shopfront or lobby layout at this column, for the ground floor.
+    pub shop: BaySlot,
 }
 
 impl Default for ColumnFacade {
@@ -51,6 +76,8 @@ impl Default for ColumnFacade {
             party: false,
             street: true,
             corner: false,
+            slot: BaySlot::Lattice,
+            shop: BaySlot::Lattice,
         }
     }
 }
@@ -63,6 +90,8 @@ pub struct BuildingContext<'a> {
     pub building_footprints: &'a CoordinateBitmap,
     /// group_seed -> sorted member way ids; only groups with >= 2 members.
     pub group_members: &'a FnvHashMap<u64, Vec<u64>>,
+    /// building:part relations of a housing block, which take its storey height.
+    pub housing_relation_parts: &'a crate::osm_parser::HousingRelationParts,
     /// Tenants and surrounding areas per building, for interiors.
     pub interior_uses: &'a InteriorUseIndex,
 }
@@ -412,6 +441,7 @@ mod tests {
         cache: FloodFillCache,
         passages: CoordinateBitmap,
         groups: FnvHashMap<u64, Vec<u64>>,
+        housing: crate::osm_parser::HousingRelationParts,
     }
 
     impl Fixtures {
@@ -420,6 +450,7 @@ mod tests {
                 cache: FloodFillCache::new(),
                 passages: CoordinateBitmap::new_empty(),
                 groups: FnvHashMap::default(),
+                housing: Default::default(),
             }
         }
         fn ctx<'a>(
@@ -433,6 +464,7 @@ mod tests {
                 road_mask: road,
                 building_footprints: footprints,
                 group_members: &self.groups,
+                housing_relation_parts: &self.housing,
                 interior_uses: InteriorUseIndex::empty(),
             }
         }

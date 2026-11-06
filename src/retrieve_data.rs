@@ -10,7 +10,7 @@ use reqwest::blocking::ClientBuilder;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::File;
-use std::io::{self, BufReader, Cursor, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Write};
 use std::process::Command;
 use std::time::Duration;
 
@@ -67,6 +67,7 @@ fn download_with_reqwest(
             } else {
                 let status = resp.status();
                 let user_msg = match status.as_u16() {
+                    413 => AREA_TOO_LARGE.to_string(),
                     429 => "Rate limited. Try again later.".to_string(),
                     403 => "Server overloaded. Try again.".to_string(),
                     500 | 502 | 503 | 504 => "Server unavailable. Try again.".to_string(),
@@ -208,9 +209,8 @@ const OSM_XML_EXTENSIONS: &[&str] = &["osm", "xml"];
 
 /// Loads OSM data from a local file. `.osm`/`.xml` files are parsed as raw OSM XML (offline,
 /// avoiding Overpass size limits) and their `<bounds>` element, if present, is returned so the
-/// caller can auto-derive the bounding box. Any other extension keeps the original behavior:
-/// deserializing Arnis's own JSON dump (`{"elements":[...],"remark":...}`), which carries no
-/// bounds (returned as None).
+/// caller can auto-derive the bounding box. Any other extension is read as Overpass JSON
+/// (`{"elements":[...]}`), whose `bounds` are returned when `--save-json-file` wrote them.
 pub fn fetch_data_from_file(
     file: &str,
 ) -> Result<(OsmData, Option<LLBBox>), Box<dyn std::error::Error>> {
@@ -235,14 +235,15 @@ pub fn fetch_data_from_file(
     } else {
         let mut deserializer = serde_json::Deserializer::from_reader(reader);
         let data: OsmData = OsmData::deserialize(&mut deserializer)?;
-        Ok((data, None))
+        let bounds = data.saved_bounds();
+        Ok((data, bounds))
     }
 }
 
-/// Coarse bucket for an archive miss. Only the category is reported: the error text can name a
-/// tile, which locates the user to a few kilometres.
+/// Coarse bucket for an archive miss, plus how the request failed when the error says. Only
+/// these are reported: the error text can name a tile, which locates the user to a few kilometres.
 #[cfg_attr(not(any(feature = "gui", test)), allow(dead_code))]
-fn fallback_reason(e: &str) -> &'static str {
+fn fallback_reason(e: &str) -> String {
     const BUCKETS: [(&str, &str); 12] = [
         ("has no data for this area", "no_data_for_area"),
         ("that area needs", "area_too_large"),
@@ -257,12 +258,37 @@ fn fallback_reason(e: &str) -> &'static str {
         ("truncated tile", "tile_decode"),
         ("implausible", "tile_decode"),
     ];
-    BUCKETS
+    let bucket = BUCKETS
         .iter()
         .find(|(needle, _)| e.contains(needle))
         .map(|(_, bucket)| *bucket)
-        .unwrap_or("other")
+        .unwrap_or("other");
+    match failure_kind(e) {
+        Some(kind) => format!("{bucket}/{kind}"),
+        None => bucket.to_string(),
+    }
 }
+
+/// The `[kind]` tag of a failed request (see `net::failure_kind`), else the status of an
+/// `HTTP <code>` error.
+#[cfg_attr(not(any(feature = "gui", test)), allow(dead_code))]
+fn failure_kind(e: &str) -> Option<String> {
+    let tagged = e
+        .split('[')
+        .skip(1)
+        .filter_map(|rest| rest.split_once(']').map(|(tag, _)| tag))
+        .find(|tag| crate::net::is_failure_kind(tag));
+    if let Some(tag) = tagged {
+        return Some(tag.to_string());
+    }
+    let after = &e[e.find("HTTP ")? + 5..];
+    let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+    let code = &after[..digits];
+    (digits == 3 && (b'1'..=b'5').contains(&code.as_bytes()[0])).then(|| format!("http_{code}"))
+}
+
+/// What a run shows for a box too large to fetch; the GUI's status line holds 35 characters.
+pub const AREA_TOO_LARGE: &str = "Area too large, try a smaller one.";
 
 /// The OSM source for a run: the tile archive, falling back to Overpass.
 ///
@@ -270,6 +296,7 @@ fn fallback_reason(e: &str) -> &'static str {
 /// after the CLI had moved to the archive.
 pub fn fetch_osm_data(
     bbox: LLBBox,
+    scale: f64,
     debug: bool,
     download_method: &str,
     save_file: Option<&str>,
@@ -277,9 +304,19 @@ pub fn fetch_osm_data(
     use_tile_archive: bool,
 ) -> Result<OsmData, Box<dyn std::error::Error>> {
     if use_tile_archive && !tiles_url.is_empty() {
+        // Overpass turns away what the archive does for size, after a long wait.
+        if let Err(e) = crate::osm_tiles::check_size(&bbox, scale) {
+            eprintln!("{}", format!("Error! {e}.").red().bold());
+            return Err(AREA_TOO_LARGE.into());
+        }
         // A miss is a coverage gap or a network problem, and Overpass still has the data.
-        match crate::osm_tiles::fetch_data_from_tiles(bbox, tiles_url) {
-            Ok(data) => return Ok(data),
+        match crate::osm_tiles::fetch_data_from_tiles(bbox, tiles_url, scale) {
+            Ok(mut data) => {
+                if let Some(path) = save_file {
+                    save_osm_json(&mut data, &bbox, path)?;
+                }
+                return Ok(data);
+            }
             Err(e) => {
                 eprintln!(
                     "{}",
@@ -296,6 +333,20 @@ pub fn fetch_osm_data(
         }
     }
     fetch_data_from_overpass(bbox, debug, download_method, save_file)
+}
+
+/// Saves the data as Overpass JSON with the requested area, for `--file` to read back.
+fn save_osm_json(
+    data: &mut OsmData,
+    bbox: &LLBBox,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    data.set_saved_bounds(bbox);
+    let mut writer = BufWriter::new(File::create(path)?);
+    serde_json::to_writer(&mut writer, data)?;
+    writer.flush()?;
+    println!("OSM data saved to: {path}");
+    Ok(())
 }
 
 /// Main function to fetch data
@@ -316,7 +367,7 @@ pub fn fetch_data_from_overpass(
     let api_servers: Vec<&str> = vec![];
     let fallback_api_servers: Vec<&str> = vec![];
 
-    // Generate Overpass API query for bounding box.
+    // Generate Overpass API query for bounding box, selecting what the tile archive carries.
     // Ocean/coastal elements are excluded because ESA WorldCover satellite data
     // handles ocean detection more reliably at 10m resolution (LC_WATER class).
     // Inland water (lakes, rivers, ponds) is still fetched from OSM.
@@ -327,16 +378,19 @@ pub fn fetch_data_from_overpass(
         nwr["building:part"];
         relation["type"="building"];
         nwr["highway"];
-        nwr["landuse"]["landuse"!="salt_pond"];
-        nwr["natural"]["natural"!="coastline"]["natural"!="bay"]["natural"!="strait"];
+        nwr["landuse"];
+        nwr["natural"];
         nwr["leisure"];
-        nwr["water"]["water"!="bay"]["water"!="ocean"]["water"!="sea"]["tidal"!="yes"];
-        nwr["waterway"]["waterway"!="tidal_channel"];
+        nwr["water"];
+        nwr["waterway"];
         nwr["amenity"];
         nwr["tourism"];
         nwr["bridge"];
         nwr["railway"];
+        node["public_transport"~"^(stop_position|station)$"][~"^(train|tram|subway|light_rail)$"~"^yes$"];
         nwr["roller_coaster"];
+        nwr["aerialway"];
+        nwr["attraction"];
         nwr["barrier"];
         nwr["entrance"];
         nwr["door"];
@@ -349,19 +403,28 @@ pub fn fetch_data_from_overpass(
         nwr["3dmr"];
         nwr["shop"];
         nwr["office"];
-        way["place"]["place"!~"^(ocean|sea|bay|strait|sound|fjord)$"];
-        way;
-    )->.relsinbbox;
+        node["place"~"^(city|town|borough|suburb|village|quarter|neighbourhood|hamlet)$"];
+        way[~"."~"."];
+    )->.candidates;
     (
-        way(r.relsinbbox);
-    )->.waysinbbox;
+        nwr.candidates["landuse"="salt_pond"];
+        nwr.candidates["natural"~"^(coastline|bay|strait)$"];
+        nwr.candidates["water"~"^(bay|ocean|sea)$"];
+        nwr.candidates["tidal"="yes"];
+        nwr.candidates["waterway"="tidal_channel"];
+        nwr.candidates["place"~"^(ocean|sea|bay|strait|sound|fjord)$"];
+    )->.excluded;
+    (.candidates; - .excluded;)->.wanted;
     (
-        node(w.waysinbbox);
-        node(w.relsinbbox);
-    )->.nodesinbbox;
-    .relsinbbox out body;
-    .waysinbbox out body;
-    .nodesinbbox out skel qt;"#,
+        way(r.wanted);
+    )->.members;
+    (
+        node(w.members);
+        node(w.wanted);
+    )->.waynodes;
+    .wanted out body;
+    .members out body;
+    .waynodes out skel qt;"#,
         bbox.min().lat(),
         bbox.min().lng(),
         bbox.max().lat(),
@@ -422,7 +485,7 @@ pub fn fetch_data_from_overpass(
         // while a merely overloaded instance deserves one second opinion. Without
         // this the user waits out all six timeouts (~30 min) for a foregone answer.
         const TRUNCATIONS_BEFORE_GIVING_UP: usize = 2;
-        let (response, data): (String, OsmData) = 'server_loop: {
+        let mut data: OsmData = 'server_loop: {
             for (i, (url, kind)) in request_plan.iter().enumerate() {
                 let timeout_secs = if url.contains("private.coffee") {
                     120
@@ -443,7 +506,7 @@ pub fn fetch_data_from_overpass(
                 let result = result.and_then(|body| {
                     answered += 1;
                     match parse_overpass_response(&body) {
-                        Ok(data) => Ok((body, data)),
+                        Ok(data) => Ok(data),
                         Err(e) => {
                             if matches!(e, ResponseError::Truncated(_)) {
                                 truncated += 1;
@@ -534,9 +597,7 @@ pub fn fetch_data_from_overpass(
         };
 
         if let Some(save_file) = save_file {
-            let mut file: File = File::create(save_file)?;
-            file.write_all(response.as_bytes())?;
-            println!("API response saved to: {save_file}");
+            save_osm_json(&mut data, &bbox, save_file)?;
         }
 
         if data.is_empty() {
@@ -606,6 +667,36 @@ pub fn fetch_area_name(lat: f64, lon: f64) -> Result<Option<String>, Box<dyn std
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    #[test]
+    fn saved_osm_data_reads_back_the_same() {
+        let json = r#"{"elements":[
+            {"type":"node","id":1,"lat":54.6,"lon":9.9,"tags":{"amenity":"bench"}},
+            {"type":"node","id":2,"lat":54.61,"lon":9.91},
+            {"type":"way","id":3,"nodes":[1,2],"tags":{"highway":"footway"}},
+            {"type":"relation","id":4,"members":[{"type":"way","ref":3,"role":"outer"}],
+             "tags":{"type":"multipolygon","natural":"wood"}}
+        ]}"#;
+        let mut data: OsmData = serde_json::from_str(json).unwrap();
+        let bbox = LLBBox::new(54.602, 9.902, 54.608, 9.908).unwrap();
+        let path = std::env::temp_dir().join(format!("arnis-save-{}.json", std::process::id()));
+        let path = path.to_str().unwrap();
+        save_osm_json(&mut data, &bbox, path).unwrap();
+        let (back, bounds) = fetch_data_from_file(path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        let saved = serde_json::to_value(&data).unwrap();
+        assert_eq!(serde_json::to_value(&back).unwrap(), saved);
+        assert_eq!(bounds, Some(bbox));
+        assert!(saved["elements"][1].get("tags").is_none());
+        assert!(saved["elements"][0].get("members").is_none());
+        assert!(saved.get("remark").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -787,8 +878,8 @@ mod fetch_from_file_tests {
         );
     }
 
-    // Any non-.osm/.xml extension keeps the original Arnis JSON-dump path, which carries no
-    // <bounds> (None). Paired with the .osm case above, this proves routing keys off the extension.
+    // Any non-.osm/.xml extension is read as JSON, which has no bounds unless saved with them.
+    // Paired with the .osm case above, this proves routing keys off the extension.
     #[test]
     fn json_extension_keeps_json_path_and_has_no_bounds() {
         let dir = tempfile::tempdir().unwrap();
@@ -822,6 +913,10 @@ mod tests {
                 "area_too_large",
             ),
             (
+                "that area needs 31000 km², past the 25000 km² the archive serves at this world scale",
+                "area_too_large",
+            ),
+            (
                 "tile archive index unreachable: connection refused",
                 "index_unreachable",
             ),
@@ -831,8 +926,24 @@ mod tests {
                 "zoom_mismatch",
             ),
             (
-                "HTTP 403 fetching range from https://x/y (expected 206)",
-                "range_http",
+                "HTTP 403 Forbidden fetching range from https://x/y (expected 206)",
+                "range_http/http_403",
+            ),
+            (
+                "tile archive index unreachable [http_403]: HTTP status client error (403 Forbidden) for url (https://x/archives.json)",
+                "index_unreachable/http_403",
+            ),
+            (
+                "tile archive index unreachable [timeout]: error sending request for url (https://x/archives.json)",
+                "index_unreachable/timeout",
+            ),
+            (
+                "range request to https://x/europe.pmtiles failed [reset]: error sending request",
+                "network/reset",
+            ),
+            (
+                "range body from https://x/europe.pmtiles could not be read [body]: error decoding response body",
+                "network/body",
             ),
             ("tile 13/1/2 is not readable: truncated tile", "tile_decode"),
             ("something nobody predicted", "other"),
@@ -846,5 +957,7 @@ mod tests {
     fn fallback_reasons_are_coordinate_free() {
         let e = "tile 13/4359/2842 expands past the size cap";
         assert!(!fallback_reason(e).contains("4359"));
+        let bracketed = "tile [13/4359/2842] could not be read: HTTP 4359 or so";
+        assert_eq!(fallback_reason(bracketed), "network");
     }
 }

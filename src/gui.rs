@@ -111,11 +111,13 @@ pub fn run_gui() -> Result<(), String> {
 
         // Force software rendering for better compatibility.
         // Only set if not already configured by the user, allowing manual override
-        // for systems where software rendering causes EGL_BAD_PARAMETER (see #1247).
-        if env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
+        // for systems where software rendering causes EGL_BAD_PARAMETER (see #1247),
+        // and left out where the launcher found that only the GPU driver starts.
+        let gpu = crate::linux_gui::current() == Some(crate::linux_gui::Renderer::Gpu);
+        if !gpu && env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
             env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
         }
-        if env::var("GALLIUM_DRIVER").is_err() {
+        if !gpu && env::var("GALLIUM_DRIVER").is_err() {
             env::set_var("GALLIUM_DRIVER", "softpipe");
         }
 
@@ -242,10 +244,11 @@ fn gui_get_default_save_path() -> String {
     detect_minecraft_saves_directory().display().to_string()
 }
 
-/// Returns the default directory for Bedrock .mcworld files (the Desktop).
+/// Returns the default directory for Bedrock .mcworld files (the Desktop). Checked for
+/// write access only when a world is generated, so a launch writes nothing there.
 #[tauri::command]
 fn gui_get_default_bedrock_save_path() -> String {
-    crate::world_utils::get_bedrock_output_directory()
+    crate::world_utils::default_bedrock_output_directory()
         .display()
         .to_string()
 }
@@ -258,11 +261,11 @@ fn resolve_bedrock_output_dir(configured: &str) -> PathBuf {
     let trimmed = configured.trim();
     if !trimmed.is_empty() {
         let configured_dir = PathBuf::from(trimmed);
-        if configured_dir.is_dir() {
+        if crate::world_utils::is_writable_dir(&configured_dir) {
             return configured_dir;
         }
         eprintln!(
-            "Warning: Bedrock save path '{trimmed}' is not a directory, using the default instead."
+            "Warning: Bedrock save path '{trimmed}' is not a writable directory, using the default instead."
         );
     }
     crate::world_utils::get_bedrock_output_directory()
@@ -572,6 +575,13 @@ fn calculate_default_spawn(xzbbox: &XZBBox) -> (i32, i32) {
         z = 2;
     }
     (x, z)
+}
+
+/// The map marker, unless it lies outside the area: the map keeps it when the area moves.
+fn spawn_marker(spawn_point: Option<(f64, f64)>, bbox: &LLBBox) -> Option<LLPoint> {
+    spawn_point
+        .and_then(|(lat, lng)| LLPoint::new(lat, lng).ok())
+        .filter(|p| bbox.contains(p))
 }
 
 /// Sets the player spawn point in level.dat using Minecraft XZ coordinates.
@@ -1122,11 +1132,19 @@ struct OneWorldInfo {
     area_count: usize,
     scale: Option<f64>,
     height_multiplier: Option<f64>,
+    ground_level: Option<i32>,
     terrain: Option<bool>,
     disable_height_limit: Option<bool>,
     aws_only_elevation: Option<bool>,
     /// Changes whenever an area is recorded.
     revision: u32,
+}
+
+fn one_world_request(one_world: bool, world_format: &str, body: &str) -> Result<(), String> {
+    if one_world && (world_format != "java" || body != "earth") {
+        return Err("One World needs a Java world on Earth".to_string());
+    }
+    Ok(())
 }
 
 fn one_world_dir(save_path: &str, world_name: &str) -> PathBuf {
@@ -1152,6 +1170,7 @@ fn gui_one_world_info(save_path: String, world_name: String) -> Result<OneWorldI
         area_count: manifest.as_ref().map(|m| m.areas.len()).unwrap_or(0),
         scale: manifest.as_ref().map(|m| m.scale),
         height_multiplier: manifest.as_ref().map(|m| m.height_multiplier),
+        ground_level: manifest.as_ref().map(|m| m.ground_level),
         terrain: manifest.as_ref().map(|m| m.terrain),
         disable_height_limit: manifest.as_ref().map(|m| m.disable_height_limit),
         aws_only_elevation: manifest.as_ref().map(|m| m.aws_only_elevation),
@@ -1449,8 +1468,8 @@ impl Drop for BusySlot {
     }
 }
 
-// Everything before the `spawn` below - the spawn point written into level.dat,
-// the tall-world datapack install - runs synchronously in this call, and a plain
+// Everything before the `spawn` below - the spawn point written into level.dat -
+// runs synchronously in this call, and a plain
 // `#[tauri::command]` would run all of it on the main thread with the window
 // stalled behind it. `(async)` puts it on the async runtime instead, so the GUI
 #[tauri::command]
@@ -1478,13 +1497,15 @@ fn gui_start_generation(
     world_scale: f64,
     height_multiplier: f64,
     ground_level: i32,
-    terrain_enabled: bool,
-    skip_osm_objects: bool,
+    generation_mode: String,
+    winter_enabled: bool,
+    post_apocalyptic_enabled: bool,
     interior_enabled: bool,
     fillground_enabled: bool,
     caves_enabled: bool,
     legacy_trees_enabled: bool,
     max_tree_size: String,
+    field_preset: String,
     canopy_height_enabled: bool,
     overture_enabled: bool,
     use_3d_enabled: bool,
@@ -1492,6 +1513,7 @@ fn gui_start_generation(
     aws_only_elevation: bool,
     bake_lighting_enabled: bool,
     voxy_lod_enabled: bool,
+    dh_lod_enabled: bool,
     is_new_world: bool,
     spawn_point: Option<(f64, f64)>,
     telemetry_consent: bool,
@@ -1500,6 +1522,7 @@ fn gui_start_generation(
     gamemode: String,
     world_time: i64,
     world_type: String,
+    mob_spawning: String,
     map_item: bool,
     signage: String,
     mapillary_token: String,
@@ -1508,6 +1531,13 @@ fn gui_start_generation(
     building_facades_enabled: bool,
     facade_detail: String,
     celestial_body_name: String,
+    pause_menu: bool,
+    discoveries: bool,
+    traffic_lights: bool,
+    zombie_outbreak: bool,
+    disasters: bool,
+    moving_vehicles: bool,
+    body_gravity: bool,
     one_world: bool,
     one_world_name: String,
     tiled_generation: Option<bool>,
@@ -1520,16 +1550,12 @@ fn gui_start_generation(
     use progress::emit_gui_error;
     use LLBBox;
 
-    if let (Some(max_f), Some(wb), Some(c)) = (
-        leveldb_max_file_size_mb,
-        leveldb_write_buffer_size_mb,
-        leveldb_cache_size_mb,
-    ) {
-        crate::world_editor::bedrock::set_bedrock_db_options(max_f, wb, c);
+    // A One World is resolved inside the worker, once `Args` exist. Refused rather than
+    // dropped: `selected_world` is then the saves folder, which a new-world cleanup deletes.
+    if let Err(e) = one_world_request(one_world, &world_format, &celestial_body_name) {
+        emit_gui_error(&e);
+        return Err(e);
     }
-
-    // A One World is resolved inside the worker, once `Args` exist.
-    let one_world = one_world && world_format == "java" && celestial_body_name == "earth";
     let is_new_world = is_new_world && !one_world;
 
     // Claim the process before touching any shared state. The frontend disables its button
@@ -1556,10 +1582,6 @@ fn gui_start_generation(
     } else {
         celestial_body.world_scale()
     };
-    // apply_body_defaults clears this off Earth, but it runs after the datapack install below
-    // and after the Args literal is built, so both would still see the raw frontend value.
-    let disable_height_limit = disable_height_limit && celestial_body.is_earth();
-
     // The GUI builds Args directly and never runs validate_args, so guard the scale here
     // rather than letting it panic deep in the coordinate transform after the fetch.
     if celestial_body.is_earth() {
@@ -1626,11 +1648,6 @@ fn gui_start_generation(
             set_player_spawn_in_level_dat(&selected_world, spawn_x, spawn_z)
                 .map_err(|e| format!("Failed to set spawn point: {e}"))?;
 
-            if disable_height_limit {
-                crate::world_utils::install_tall_datapack(std::path::Path::new(&selected_world))
-                    .map_err(|e| format!("Failed to install tall-world datapack: {e}"))?;
-            }
-
             Ok(())
         })();
 
@@ -1689,46 +1706,12 @@ fn gui_start_generation(
                 _ => PathBuf::new(),
             };
 
-            // Check available disk space before starting generation (minimum 3GB required)
-            const MIN_DISK_SPACE_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GB
-            let check_path = match world_format {
+            // Where the world goes, for the disk space check once the run's options are final.
+            let disk_dir = match world_format {
                 WorldFormat::JavaAnvil => world_path.clone(),
                 WorldFormat::BedrockMcWorld => bedrock_output_dir.clone(),
                 WorldFormat::LuantiWorld => luanti_output_dir.clone(),
             };
-            // Probe the nearest existing ancestor: a missing or space-containing
-            // path otherwise confuses the Windows volume lookup, which then reports
-            // 0 bytes free. Only block on a confident positive reading; treat an
-            // error or a 0/undeterminable result as "can't tell" and proceed (#824).
-            let probe_path = {
-                let mut p = check_path.as_path();
-                loop {
-                    if p.exists() {
-                        break p.to_path_buf();
-                    }
-                    match p.parent() {
-                        Some(parent) => p = parent,
-                        // No existing ancestor (e.g. a bare relative path): probe
-                        // the current dir so the query always hits a real path.
-                        None => {
-                            break std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                        }
-                    }
-                }
-            };
-            match fs2::available_space(&probe_path) {
-                Ok(available) if available > 0 && available < MIN_DISK_SPACE_BYTES => {
-                    let error_msg = "Not enough disk space available.".to_string();
-                    eprintln!("{error_msg}");
-                    emit_gui_error(&error_msg);
-                    return Err(error_msg);
-                }
-                Ok(_) => {} // Sufficient, or 0/undeterminable: don't false-block
-                Err(e) => {
-                    // Log warning but don't block generation if we can't check space
-                    eprintln!("Warning: Could not check disk space: {e}");
-                }
-            }
 
             // Acquire session lock for Java worlds only
             // Session lock prevents Minecraft from having the world open during generation
@@ -1779,8 +1762,12 @@ fn gui_start_generation(
                     } else {
                         None
                     };
-                    let (output_path, lvl_name) =
-                        crate::world_utils::build_bedrock_output_with_name(&bbox, bedrock_output_dir, custom_name);
+                    let (output_path, lvl_name) = crate::world_utils::build_bedrock_output_with_name(
+                        &bbox,
+                        bedrock_output_dir,
+                        celestial_body,
+                        custom_name,
+                    );
                     progress::emit_world_name_update(&lvl_name);
                     (output_path, Some(lvl_name))
                 }
@@ -1804,16 +1791,12 @@ fn gui_start_generation(
                 }
             };
 
-            // Create generation options. Spawn point and facade job are set below.
-            let mut generation_options = GenerationOptions {
-                path: generation_path.clone(),
-                format: world_format,
-                level_name,
-                spawn_point: None,
-                luanti_game,
-                ground_level,
-                facades: crate::mapillary::FacadeJob::default(),
-            };
+            // The toggle lets the terrain fit extend the build height where the area needs it,
+            // in a world this run creates. A world that already exists keeps the height it
+            // has, and a One World is sent the height it keeps.
+            let existing_java =
+                world_format == WorldFormat::JavaAnvil && !is_new_world && !one_world;
+            let existing_tall = existing_java && crate::world_utils::has_tall_datapack(&world_path);
 
             // Create an Args instance with the chosen bounding box
             // Note: path is used for Java-specific features like spawn point update
@@ -1821,11 +1804,8 @@ fn gui_start_generation(
                 bbox: Some(bbox),
                 file: None,
                 save_json_file: None,
-                path: Some(if world_format == WorldFormat::JavaAnvil {
-                    generation_path.clone()
-                } else {
-                    world_path.clone()
-                }),
+                // The localized name only goes into level.dat; the folder stays.
+                path: Some(world_path.clone()),
                 bedrock: world_format == WorldFormat::BedrockMcWorld,
                 luanti: world_format == WorldFormat::LuantiWorld,
                 downloader: "requests".to_string(),
@@ -1838,14 +1818,13 @@ fn gui_start_generation(
                 ram_limit_mb: ram_limit_mb.unwrap_or(0),
                 world_name: None,
                 one_world_run: None,
+                tall_range: existing_tall
+                    .then(|| crate::world_utils::tall_datapack_range(&world_path))
+                    .flatten(),
                 ground_level,
-                mode: if skip_osm_objects {
-                    crate::args::GenerationMode::TerrainOnly
-                } else if terrain_enabled {
-                    crate::args::GenerationMode::GeoTerrain
-                } else {
-                    crate::args::GenerationMode::GeoOnly
-                },
+                mode: crate::args::GenerationMode::from_name(&generation_mode),
+                post_apocalyptic: post_apocalyptic_enabled,
+                winter: winter_enabled,
                 legacy_terrain: false,
                 interior: interior_enabled,
                 fillground: fillground_enabled,
@@ -1858,6 +1837,9 @@ fn gui_start_generation(
                 cave_zone_map_step: None,
                 legacy_trees: legacy_trees_enabled,
                 max_tree_size: crate::trees::tree_library::TreeSize::from_str_lossy(&max_tree_size),
+                fields: crate::element_processing::field_texture::FieldPreset::from_str_lossy(
+                    &field_preset,
+                ),
                 canopy_height: canopy_height_enabled,
                 overture: overture_enabled,
                 // Auto picks whichever transport is cheaper for the area. The
@@ -1874,14 +1856,20 @@ fn gui_start_generation(
                 spawn_lat: None,
                 spawn_lng: None,
                 rotation: rotation_angle.clamp(-90.0, 90.0),
-                disable_height_limit,
+                vanilla_height: !existing_tall && (!disable_height_limit || existing_java),
+                disable_height_limit: existing_tall || (one_world && disable_height_limit),
                 aws_only_elevation,
                 benchmark: false,
                 bake_lighting: bake_lighting_enabled,
                 voxy_lod: voxy_lod_enabled,
+                dh_lod: dh_lod_enabled,
                 gamemode: crate::args::GameMode::from_str_lossy(&gamemode),
                 world_time: world_time.clamp(0, 23999),
                 world_type: crate::args::WorldType::from_str_lossy(&world_type),
+                // The frontend sends off wherever the row is greyed, and `apply_body_defaults`
+                // and `apply_feature_needs` turn it off again off Earth and beside the
+                // Zombie Outbreak and Disasters. Luanti never reads it.
+                mob_spawning: crate::args::MobSpawning::from_str_lossy(&mob_spawning),
                 map_item,
                 // Frontend refuses previews for rotated worlds, skip the work there.
                 map_preview: world_format != WorldFormat::LuantiWorld
@@ -1920,14 +1908,18 @@ fn gui_start_generation(
                 // aid.
                 building_facades_dir: None,
                 body: celestial_body,
+                body_gravity,
+                traffic_lights,
+                discoveries,
+                pause_menu,
+                zombie_outbreak,
+                disasters,
+                moving_vehicles,
             };
             // Same helper the CLI uses. Anything read before this point (the world prep
             // above) has to apply the body rules on its own.
             crate::args::apply_body_defaults(&mut args);
-            // Same as run_cli: caves carve into the filled ground, so they bring it with them.
-            if args.caves {
-                args.fillground = true;
-            }
+            crate::args::apply_feature_needs(&mut args);
 
             let mut one_world_extending = false;
             if one_world {
@@ -1947,7 +1939,10 @@ fn gui_start_generation(
                 }
                 _session_lock = Some(session.lock);
                 if args.disable_height_limit && session.created {
-                    if let Err(e) = crate::world_utils::install_tall_datapack(&world_path) {
+                    let (min_y, max_y) = crate::world_utils::TALL_DATAPACK_FULL_RANGE;
+                    if let Err(e) =
+                        crate::world_utils::install_tall_datapack(&world_path, min_y, max_y)
+                    {
                         let error_msg = format!("Failed to install tall-world datapack: {e}");
                         eprintln!("{error_msg}");
                         emit_gui_error(&error_msg);
@@ -1963,17 +1958,85 @@ fn gui_start_generation(
             }
             let args = args;
 
+            // Same as run_cli: checked with the run's final scale and options, and a One
+            // World's own frame. A world this run made goes again with the cleanup guard.
+            if let Err(e) =
+                crate::world_utils::check_run_size(&args, &bbox, world_format, &disk_dir)
+            {
+                eprintln!("{}", e.detail);
+                if e.area {
+                    send_log(
+                        LogLevel::Warning,
+                        &format!(
+                            "area_too_large: {:.0} km² at scale {:.2}",
+                            bbox.area_km2(),
+                            args.scale
+                        ),
+                    );
+                }
+                emit_gui_error(e.short());
+                return Err(e.detail);
+            }
+
+            // Determine output path and level name based on format
+            let (generation_path, level_name) = match world_format {
+                WorldFormat::JavaAnvil => {
+                    // Java: use the selected world path, add localized name if new
+                    let updated_path = if is_new_world {
+                        add_localized_world_name(world_path.clone(), &bbox, celestial_body)
+                    } else {
+                        world_path.clone()
+                    };
+                    (updated_path, None)
+                }
+                WorldFormat::BedrockMcWorld => {
+                    // Bedrock: generate .mcworld in the configured directory
+                    let (output_path, lvl_name) = crate::world_utils::build_bedrock_output(
+                        &bbox,
+                        bedrock_output_dir,
+                        celestial_body,
+                    );
+                    progress::emit_world_name_update(&lvl_name);
+                    (output_path, Some(lvl_name))
+                }
+                WorldFormat::LuantiWorld => {
+                    let worlds_dir = luanti_output_dir.clone();
+                    let _ = std::fs::create_dir_all(&worlds_dir);
+                    let mut counter = 1;
+                    let world_name = loop {
+                        let candidate = format!("Arnis Luanti World {counter}");
+                        if !worlds_dir.join(&candidate).exists() {
+                            break candidate;
+                        }
+                        counter += 1;
+                    };
+                    let luanti_path = worlds_dir.join(&world_name);
+                    println!(
+                        "Creating Luanti world at: {}",
+                        luanti_path.display().to_string().bright_white().bold()
+                    );
+                    (luanti_path, Some(world_name))
+                }
+            };
+
+            // Create generation options. Spawn point and facade job are set below.
+            let mut generation_options = GenerationOptions {
+                path: generation_path.clone(),
+                format: world_format,
+                level_name,
+                spawn_point: None,
+                luanti_game,
+                ground_level,
+                facades: crate::mapillary::FacadeJob::default(),
+            };
+
             // Calculate MC spawn coordinates from lat/lng if spawn point was provided
             // An extended One World keeps its spawn unless a marker was placed.
             let (mc_spawn_point, pre_rot_bbox): (Option<(i32, i32)>, Option<XZBBox>) =
                 if let Ok((transformer, pre_rot_bbox)) =
                     crate::projection::ProjectionSpec::from_args(&args).transformer(&bbox)
                 {
-                    let marker = spawn_point.and_then(|(lat, lng)| {
-                        let clamped_lat = lat.clamp(bbox.min().lat(), bbox.max().lat());
-                        let clamped_lng = lng.clamp(bbox.min().lng(), bbox.max().lng());
-                        LLPoint::new(clamped_lat, clamped_lng).ok()
-                    });
+                    let marker = spawn_marker(spawn_point, &bbox);
                     let point = match (marker, one_world_extending) {
                         (None, true) => None,
                         (Some(llpoint), _) => {
@@ -1985,7 +2048,19 @@ fn gui_start_generation(
                                 &pre_rot_bbox,
                             ))
                         }
-                        (None, false) => None,
+                        (None, false) => {
+                            if world_format == WorldFormat::BedrockMcWorld {
+                                None
+                            } else {
+                                let (sx, sz) = calculate_default_spawn(&pre_rot_bbox);
+                                Some(map_transformation::rotate::rotate_xz_point(
+                                    sx,
+                                    sz,
+                                    args.rotation,
+                                    &pre_rot_bbox,
+                                ))
+                            }
+                        }
                     };
                     (point, Some(pre_rot_bbox))
                 } else {
@@ -2038,15 +2113,41 @@ fn gui_start_generation(
                 ground::world_top_y_for(&args),
             );
 
-            // Ask Args, not the frontend flag: below OBJECT_SKIP_SCALE objects are skipped
-            // regardless of the selected generation mode.
-            if args.skip_objects() {
-                // Generate ground data (terrain) for terrain-only mode
-                let mut ground = ground::generate_ground_data(&args, bbox);
-                // Matches run_cli.
-                ground.mark_beaches();
+            // Same as run_cli, once the terrain fit has settled the build height.
+            let new_java_world = (world_format == WorldFormat::JavaAnvil && is_new_world)
+                .then_some(generation_path.as_path());
+            let settle = |args: &mut Args, ground: &ground::Ground| {
+                ground::settle_build_height(
+                    args,
+                    ground,
+                    &bbox,
+                    world_format,
+                    &disk_dir,
+                    new_java_world,
+                )
+                .map_err(|e| {
+                    eprintln!("{e}");
+                    emit_gui_error(&e);
+                    e
+                })
+            };
 
-                // Create empty parsed_elements and xzbbox for terrain-only mode
+            // Ask Args, not the frontend mode: below OBJECT_SKIP_SCALE, or off Earth, no OSM
+            // is loaded whatever mode was picked.
+            if args.skip_osm() {
+                // Ground data (terrain) only
+                let mut ground = ground::generate_ground_data(
+                    &args,
+                    bbox,
+                    &crate::elevation::PeakSource::none(),
+                );
+                let mut args = args;
+                settle(&mut args, &ground)?;
+                let args = args;
+                // Matches run_cli.
+                ground.finish_land_cover(args.mode);
+
+                // Empty parsed_elements and xzbbox, as no OSM is loaded
                 let mut parsed_elements = Vec::new();
                 let (_coord_transformer, mut xzbbox) =
                     crate::projection::ProjectionSpec::from_args(&args)
@@ -2076,6 +2177,7 @@ fn gui_start_generation(
                     generation_options.clone(),
                     osm_parser::OutlineSuppression::new(),
                     osm_parser::PartGroups::new(),
+                    osm_parser::HousingRelationParts::new(),
                 ) {
                     emit_gui_error(&e);
                     return Err(e);
@@ -2093,9 +2195,10 @@ fn gui_start_generation(
             }
 
             // OSM, Overture and elevation/land-cover fetches only need the bbox, run them in parallel
+            let (peak_tx, peaks) = crate::elevation::PeakSource::channel();
             let (fetch_result, overture_data, ground) = std::thread::scope(|s| {
                 let overture_handle = s.spawn(|| {
-                    if args.overture {
+                    if args.overture && !args.skip_objects() {
                         overture::fetch_overture_buildings(
                             &bbox,
                             &crate::projection::ProjectionSpec::from_args(&args),
@@ -2106,15 +2209,29 @@ fn gui_start_generation(
                         overture::OvertureData::default()
                     }
                 });
-                let ground_handle = s.spawn(|| ground::generate_ground_data(&args, bbox));
+                let ground_handle = s.spawn(|| ground::generate_ground_data(&args, bbox, &peaks));
                 let fetch_result = retrieve_data::fetch_osm_data(
                     bbox,
+                    args.scale,
                     args.debug,
                     "requests",
                     None,
                     &args.osm_tiles_url,
                     !args.no_tile_archive,
                 );
+                // The terrain thread waits on this before fitting its height range. Overture's
+                // building heights follow once it is in, for the thread to wait on only if
+                // needed. Without OSM there is nothing to follow, so the sender goes now.
+                let peak_tx = match fetch_result.as_ref() {
+                    Ok(raw) => {
+                        let _ = peak_tx.send(crate::elevation::TerrainHints::from_osm(raw, &args));
+                        Some(peak_tx)
+                    }
+                    Err(_) => {
+                        drop(peak_tx);
+                        None
+                    }
+                };
                 // A panicked worker already reported itself through the panic hook.
                 // Overture is supplementary, so drop it and keep going; terrain is
                 // not, so hand the failure back instead of taking the app down.
@@ -2122,6 +2239,16 @@ fn gui_start_generation(
                     eprintln!("Overture fetch failed, continuing without Overture buildings.");
                     overture::OvertureData::default()
                 });
+                if let (Some(tx), Ok(raw)) = (&peak_tx, fetch_result.as_ref()) {
+                    if crate::elevation::TerrainHints::wants_overture(&args) {
+                        let _ = tx.send(crate::elevation::TerrainHints::from_overture(
+                            raw,
+                            &args,
+                            &overture_data,
+                        ));
+                    }
+                }
+                drop(peak_tx);
                 (fetch_result, overture_data, ground_handle.join().ok())
             });
 
@@ -2131,21 +2258,33 @@ fn gui_start_generation(
                 emit_gui_error(&error_msg);
                 return Err(error_msg);
             };
+            // Nothing to settle when the fetch failed: the run ends below.
+            let mut args = args;
+            if fetch_result.is_ok() {
+                settle(&mut args, &ground)?;
+            }
+            let args = args;
 
             // Run world generation
             match fetch_result {
                 Ok(raw_data) => {
-                    let (mut parsed_elements, mut xzbbox, outline_suppression, part_groups) =
-                        osm_parser::parse_osm_data(
-                            raw_data,
-                            bbox,
-                            args.debug,
-                            &crate::projection::ProjectionSpec::from_args(&args),
-                        );
+                    let (
+                        mut parsed_elements,
+                        mut xzbbox,
+                        outline_suppression,
+                        part_groups,
+                        housing_parts,
+                    ) = osm_parser::parse_osm_data(
+                        raw_data,
+                        bbox,
+                        args.debug,
+                        &crate::projection::ProjectionSpec::from_args(&args),
+                    );
 
                     let overture::OvertureData {
                         elements: overture_elements,
                         hints: overture_hints,
+                        ..
                     } = overture_data;
 
                     // Fill height/levels on OSM buildings that have neither
@@ -2158,18 +2297,7 @@ fn gui_start_generation(
                         parsed_elements.extend(unique_overture);
                     }
 
-                    parsed_elements.sort_by(|el1, el2| {
-                        let (el1_priority, el2_priority) =
-                            (osm_parser::get_priority(el1), osm_parser::get_priority(el2));
-                        match (
-                            el1.tags().contains_key("landuse"),
-                            el2.tags().contains_key("landuse"),
-                        ) {
-                            (true, false) => std::cmp::Ordering::Greater,
-                            (false, true) => std::cmp::Ordering::Less,
-                            _ => el1_priority.cmp(&el2_priority),
-                        }
-                    });
+                    osm_parser::sort_by_priority(&mut parsed_elements);
 
                     let mut ground = ground;
 
@@ -2177,7 +2305,14 @@ fn gui_start_generation(
                     ground.apply_osm_water_override(&parsed_elements, &xzbbox);
                     ground.apply_osm_land_override(&parsed_elements, &xzbbox, args.scale);
                     ground.apply_bridge_land_cover_repair(&parsed_elements, &xzbbox, args.scale);
-                    ground.mark_beaches();
+                    ground.finish_land_cover(args.mode);
+
+                    // Matches run_cli: the overrides read roads as land, then the mode drops them.
+                    crate::mode_filter::retain_for_mode(&mut parsed_elements, args.mode);
+                    let outline_suppression = crate::mode_filter::outline_suppression_for_mode(
+                        outline_suppression,
+                        args.mode,
+                    );
 
                     // Transform map (parsed_elements). Operations are defined in a json file
                     map_transformation::transform_map(
@@ -2206,6 +2341,7 @@ fn gui_start_generation(
                         generation_options.clone(),
                         outline_suppression,
                         part_groups,
+                        housing_parts,
                     ) {
                         eprintln!("World generation failed: {e}");
                         send_log(LogLevel::Error, &format!("World generation failed: {e}"));
@@ -2399,6 +2535,7 @@ mod locale_tests {
         ("lv", include_str!("gui/locales/lv.json")),
         ("pl", include_str!("gui/locales/pl.json")),
         ("pt-BR", include_str!("gui/locales/pt-BR.json")),
+        ("ro", include_str!("gui/locales/ro.json")),
         ("ru", include_str!("gui/locales/ru.json")),
         ("sl", include_str!("gui/locales/sl.json")),
         ("sv", include_str!("gui/locales/sv.json")),
@@ -2449,6 +2586,23 @@ mod locale_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_world_off_java_or_off_earth_is_refused() {
+        assert!(one_world_request(true, "java", "earth").is_ok());
+        assert!(one_world_request(false, "bedrock", "moon").is_ok());
+        assert!(one_world_request(true, "bedrock", "earth").is_err());
+        assert!(one_world_request(true, "luanti_mineclonia", "earth").is_err());
+        assert!(one_world_request(true, "java", "moon").is_err());
+    }
+
+    #[test]
+    fn a_spawn_marker_outside_the_area_is_ignored() {
+        let bbox = LLBBox::from_str("52.50,13.37,52.53,13.42").unwrap();
+        assert!(spawn_marker(Some((52.51, 13.40)), &bbox).is_some());
+        assert!(spawn_marker(Some((48.14, 11.58)), &bbox).is_none());
+        assert!(spawn_marker(None, &bbox).is_none());
+    }
 
     fn read_level_dat(world: &Path) -> Value {
         let raw = fs::read(world.join("level.dat")).unwrap();

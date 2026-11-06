@@ -1,3 +1,4 @@
+use crate::celestial::CelestialBody;
 use crate::coordinate_system::geographic::LLBBox;
 use crate::retrieve_data;
 use fastnbt::Value;
@@ -139,15 +140,59 @@ pub fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> 
     })
 }
 
-/// Returns the Desktop directory for Bedrock .mcworld file output.
-/// Falls back to home directory, then current directory.
-pub fn get_bedrock_output_directory() -> PathBuf {
+/// The Desktop, else home, for .mcworld output. Only names it, so it asks no permission.
+pub fn default_bedrock_output_directory() -> PathBuf {
     if cfg!(target_os = "android") {
         return resolve_android_download_dir();
     }
     dirs::desktop_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The first writable of Desktop, Documents, Downloads and home for .mcworld output.
+pub fn get_bedrock_output_directory() -> PathBuf {
+    if cfg!(target_os = "android") {
+        return resolve_android_download_dir();
+    }
+    [
+        dirs::desktop_dir(),
+        dirs::document_dir(),
+        dirs::download_dir(),
+        dirs::home_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|dir| is_writable_dir(dir))
+    .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Whether a file can be created in `dir`, found by creating one since ACLs decide it.
+pub fn is_writable_dir(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let probe = dir.join(format!(".arnis-write-test-{}", unique_suffix()));
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    if created {
+        let _ = fs::remove_file(&probe);
+    }
+    created
+}
+
+/// Process id, clock and a counter, for names no other run or call picks at once.
+pub fn unique_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos:x}-{n}", std::process::id())
 }
 
 /// Returns Luanti's worlds directory for the current OS.
@@ -278,8 +323,12 @@ pub fn sanitize_for_filename(name: &str) -> String {
 
 /// Builds the Bedrock output path and level name for a given bounding box.
 /// Combines area name lookup, sanitization, and path construction.
-pub fn build_bedrock_output(bbox: &LLBBox, output_dir: PathBuf) -> (PathBuf, String) {
-    build_bedrock_output_with_name(bbox, output_dir, None)
+pub fn build_bedrock_output(
+    bbox: &LLBBox,
+    output_dir: PathBuf,
+    body: CelestialBody,
+) -> (PathBuf, String) {
+    build_bedrock_output_with_name(bbox, output_dir, body, None)
 }
 
 /// Builds the Bedrock output path and level name for a given bounding box with optional custom name.
@@ -287,6 +336,7 @@ pub fn build_bedrock_output(bbox: &LLBBox, output_dir: PathBuf) -> (PathBuf, Str
 pub fn build_bedrock_output_with_name(
     bbox: &LLBBox,
     output_dir: PathBuf,
+    body: CelestialBody,
     custom_name: Option<&str>,
 ) -> (PathBuf, String) {
     let output_dir = if cfg!(target_os = "android") {
@@ -311,7 +361,11 @@ pub fn build_bedrock_output_with_name(
             (name.clone(), name)
         }
         None => {
-            let area_name = get_area_name_for_bedrock(bbox);
+            let area_name = if body.is_earth() {
+                get_area_name_for_bedrock(bbox)
+            } else {
+                body.display_name().to_string()
+            };
             let safe_name = sanitize_for_filename(&area_name);
             (format!("Arnis {safe_name}"), format!("Arnis World: {safe_name}"))
         }
@@ -331,6 +385,7 @@ pub fn build_bedrock_output_with_name(
         }
         counter += 1;
     }
+}
 }
 
 /// Creates a new Java Edition world in the given base directory.
@@ -486,6 +541,201 @@ pub fn write_world_skeleton(
         .map_err(|e| format!("Failed to create icon.png file: {e}"))?;
 
     Ok(())
+}
+
+/// What grows a world on disk beyond its block area.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorldSizeOptions {
+    pub interior: bool,
+    pub bake_lighting: bool,
+    pub voxy_lod: bool,
+    pub dh_lod: bool,
+    pub caves: bool,
+    pub fillground: bool,
+    /// The extended build height, where filled ground and caves reach 2000 blocks down.
+    pub tall: bool,
+}
+
+impl WorldSizeOptions {
+    pub fn of(args: &crate::args::Args) -> Self {
+        Self {
+            interior: args.interior,
+            bake_lighting: args.bake_lighting,
+            voxy_lod: args.voxy_lod,
+            dh_lod: args.dh_lod,
+            caves: args.caves,
+            fillground: args.fillground,
+            tall: args.disable_height_limit,
+        }
+    }
+}
+
+/// Free space a run leaves beside the world it writes, and the whole check for a small one.
+pub const DISK_HEADROOM_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Most disk a world of `blocks_km2` (ground times scale², in km² of blocks) takes while it is
+/// written. Measured on 9 km² boxes in Oct 2026: a Java chunk nearly always fits one 4 KiB
+/// region sector, so city, farmland, forest, sea and the Alps all took 15.4-16.7 MiB per km²
+/// whatever stood on them. The options add their worst measured cost, rounded up.
+pub fn estimated_world_bytes(
+    blocks_km2: f64,
+    format: crate::world_editor::WorldFormat,
+    o: WorldSizeOptions,
+) -> u64 {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let mut per_km2 = 17.0;
+    if o.interior {
+        per_km2 += 10.0; // Manhattan +9.4
+    }
+    if o.bake_lighting {
+        per_km2 += 10.0; // Munich +9.0
+    }
+    if o.voxy_lod {
+        per_km2 += 20.0; // Munich +19.0
+    }
+    if o.dh_lod {
+        per_km2 += 19.0; // Munich +17.9
+    }
+    // Caves bring the filled ground with them.
+    per_km2 += match (o.caves, o.fillground, o.tall) {
+        (true, _, true) => 35.0,     // Zermatt +34.3
+        (true, _, false) => 12.0,    // Zermatt +11.4
+        (false, true, true) => 15.0, // Zermatt +14.0
+        (false, true, false) => 2.0, // Zermatt +0.8
+        (false, false, _) => 0.0,
+    };
+    // Bedrock holds its staging folder and the .mcworld at once (0.67-0.77x Java at the
+    // peak); Luanti's map.sqlite came to 0.60-0.75x.
+    if format != crate::world_editor::WorldFormat::JavaAnvil {
+        per_km2 *= 0.8;
+    }
+    // Plus level.dat, map items, signage, datapacks and region headers (about 4 MiB).
+    ((blocks_km2.max(0.0) * per_km2 + 8.0) * MIB) as u64
+}
+
+/// km² of blocks the run writes for `bbox`, from the projection it builds with: scale²,
+/// and in a One World the Mercator stretch away from the world's origin.
+pub fn blocks_km2(args: &crate::args::Args, bbox: &LLBBox) -> f64 {
+    match crate::projection::ProjectionSpec::from_args(args).transformer(bbox) {
+        Ok((_, r)) => (r.max_x() - r.min_x() + 1) as f64 * (r.max_z() - r.min_z() + 1) as f64 / 1e6,
+        Err(_) => bbox.area_km2() * args.scale * args.scale,
+    }
+}
+
+/// Why a run is refused before it fetches anything.
+#[derive(Debug)]
+pub struct RunSizeError {
+    /// Refused for its area rather than for the disk.
+    #[cfg_attr(not(any(feature = "gui", test)), allow(dead_code))]
+    pub area: bool,
+    pub detail: String,
+}
+
+impl RunSizeError {
+    /// Fits the GUI's status line.
+    #[cfg_attr(not(any(feature = "gui", test)), allow(dead_code))]
+    pub fn short(&self) -> &'static str {
+        if self.area {
+            retrieve_data::AREA_TOO_LARGE
+        } else {
+            "Not enough disk space available."
+        }
+    }
+}
+
+/// Refuses a run the tile archive or the disk cannot take. Wants the run's final `args` and
+/// `bbox`, so a One World's own scale and frame and every option override are counted.
+pub fn check_run_size(
+    args: &crate::args::Args,
+    bbox: &LLBBox,
+    format: crate::world_editor::WorldFormat,
+    dir: &Path,
+) -> Result<(), RunSizeError> {
+    if args.mapillary_probe {
+        return Ok(());
+    }
+    let from_archive = !args.skip_osm()
+        && args.file.is_none()
+        && !args.no_tile_archive
+        && !args.osm_tiles_url.is_empty();
+    if from_archive {
+        if let Err(e) = crate::osm_tiles::check_size(bbox, args.scale) {
+            return Err(RunSizeError {
+                area: true,
+                detail: format!("The area is too large: {e}. Select a smaller area."),
+            });
+        }
+    }
+    let needed = estimated_world_bytes(blocks_km2(args, bbox), format, WorldSizeOptions::of(args));
+    check_disk_space(dir, needed).map_err(|detail| RunSizeError {
+        area: false,
+        detail,
+    })
+}
+
+/// `check_run_size`'s disk check again, for a run whose terrain fit just extended the build
+/// height. Only caves and filled ground grow with it, so otherwise there is nothing to redo.
+pub fn check_disk_for_extended_height(
+    args: &crate::args::Args,
+    bbox: &LLBBox,
+    format: crate::world_editor::WorldFormat,
+    dir: &Path,
+) -> Result<(), String> {
+    let km2 = blocks_km2(args, bbox);
+    let options = WorldSizeOptions::of(args);
+    let needed = estimated_world_bytes(
+        km2,
+        format,
+        WorldSizeOptions {
+            tall: true,
+            ..options
+        },
+    );
+    let before = estimated_world_bytes(
+        km2,
+        format,
+        WorldSizeOptions {
+            tall: false,
+            ..options
+        },
+    );
+    if needed <= before {
+        return Ok(());
+    }
+    check_disk_space(dir, needed)
+}
+
+/// Fails when the disk that will hold `dir` has less than `needed` plus the headroom free.
+/// Reads the nearest folder that exists, since a missing one confuses the Windows volume
+/// lookup; a reading of 0 or an error is "can't tell" and lets the run go ahead (#824).
+pub fn check_disk_space(dir: &Path, needed: u64) -> Result<(), String> {
+    let mut probe = dir;
+    let probe = loop {
+        if probe.exists() {
+            break probe.to_path_buf();
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent,
+            None => break std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    };
+    let required = needed.saturating_add(DISK_HEADROOM_BYTES);
+    match fs2::available_space(&probe) {
+        Ok(free) if free > 0 && free < required => {
+            const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+            Err(format!(
+                "Not enough disk space: this world needs about {:.1} GB and {:.0} GB should stay free, but only {:.1} GB are free.",
+                needed as f64 / GIB,
+                DISK_HEADROOM_BYTES as f64 / GIB,
+                free as f64 / GIB
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("Warning: Could not check disk space: {e}");
+            Ok(())
+        }
+    }
 }
 
 /// Holds Minecraft's `session.lock` while Arnis writes a world.
@@ -712,6 +962,16 @@ fn generate_unique_custom_world_name(base_path: &Path, raw_name: &str) -> String
 /// Name of the bundled Java datapack that extends the Overworld build height.
 pub const TALL_DATAPACK_NAME: &str = "arnis_tall";
 
+/// Whether a Java world already carries the tall-world datapack.
+#[cfg_attr(not(any(feature = "gui", test)), allow(dead_code))]
+pub fn has_tall_datapack(world_path: &Path) -> bool {
+    world_path
+        .join("datapacks")
+        .join(TALL_DATAPACK_NAME)
+        .join("pack.mcmeta")
+        .is_file()
+}
+
 /// Install the bundled tall-world datapack into a Java world and register it
 /// in `level.dat`'s `Data.DataPacks.Enabled` so it auto-activates on first
 /// load. The base `data/` tree uses the legacy flat dimension_type schema
@@ -721,7 +981,10 @@ pub const TALL_DATAPACK_NAME: &str = "arnis_tall";
 /// Overlays must declare their range only via
 /// `min_format`/`max_format`; the deprecated `formats` key makes 1.21.9+ drop
 /// the whole overlays section and fall back to the legacy tree.
-pub fn install_tall_datapack(world_path: &Path) -> Result<(), String> {
+///
+/// Every copy declares `min_y..=max_y`, which must be the bounds the world's chunks are
+/// written for: `TALL_DATAPACK_FULL_RANGE`, or the part of it an area needs.
+pub fn install_tall_datapack(world_path: &Path, min_y: i32, max_y: i32) -> Result<(), String> {
     const PACK_MCMETA: &[u8] = include_bytes!("../assets/minecraft/datapack_tall/pack.mcmeta");
     const OVERWORLD_JSON: &[u8] = include_bytes!(
         "../assets/minecraft/datapack_tall/data/minecraft/dimension_type/overworld.json"
@@ -752,8 +1015,11 @@ pub fn install_tall_datapack(world_path: &Path) -> Result<(), String> {
             .join("dimension_type");
         fs::create_dir_all(&dim_dir)
             .map_err(|e| format!("Failed to create datapack directories: {e}"))?;
-        fs::write(dim_dir.join("overworld.json"), bytes)
-            .map_err(|e| format!("Failed to write overworld.json: {e}"))?;
+        fs::write(
+            dim_dir.join("overworld.json"),
+            dimension_with_range(bytes, min_y, max_y)?,
+        )
+        .map_err(|e| format!("Failed to write overworld.json: {e}"))?;
     }
 
     fs::write(dp_root.join("pack.mcmeta"), PACK_MCMETA)
@@ -762,6 +1028,52 @@ pub fn install_tall_datapack(world_path: &Path) -> Result<(), String> {
     enable_datapack_in_level_dat(world_path, TALL_DATAPACK_NAME)?;
 
     Ok(())
+}
+
+/// The range an installed tall-world datapack declares, as `(min_y, max_y)`. A run into the
+/// world has to keep it: its chunks were written for it, and a heightmap that happens to have
+/// the length another range expects is read against the wrong floor.
+pub fn tall_datapack_range(world_path: &Path) -> Option<(i32, i32)> {
+    let json = fs::read(
+        world_path
+            .join("datapacks")
+            .join(TALL_DATAPACK_NAME)
+            .join("data/minecraft/dimension_type/overworld.json"),
+    )
+    .ok()?;
+    let dimension: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    let min_y = dimension["min_y"].as_i64()?;
+    let max_y = min_y.checked_add(dimension["height"].as_i64()?)? - 1;
+    // Only a range Arnis could have written: on section bounds, within the pack's and
+    // holding vanilla's, which the terrain base and its bedrock assume.
+    let (full_min, full_max) = TALL_DATAPACK_FULL_RANGE;
+    let vanilla = i64::from(crate::world_editor::DEFAULT_MIN_Y)
+        ..=i64::from(crate::world_editor::DEFAULT_MAX_Y);
+    let fits = min_y.rem_euclid(16) == 0
+        && max_y.rem_euclid(16) == 15
+        && (i64::from(full_min)..=*vanilla.start()).contains(&min_y)
+        && (*vanilla.end()..=i64::from(full_max)).contains(&max_y);
+    fits.then_some((min_y as i32, max_y as i32))
+}
+
+/// The whole range the tall-world datapack can declare, which a One World always takes.
+pub const TALL_DATAPACK_FULL_RANGE: (i32, i32) = (-2032, 2031);
+
+/// A bundled dimension type, its height range set to `min_y..=max_y`.
+fn dimension_with_range(bundled: &[u8], min_y: i32, max_y: i32) -> Result<Vec<u8>, String> {
+    let mut dimension: serde_json::Value = serde_json::from_slice(bundled)
+        .map_err(|e| format!("Failed to read the bundled overworld.json: {e}"))?;
+    let fields = dimension
+        .as_object_mut()
+        .ok_or("The bundled overworld.json is not an object")?;
+    let height = max_y + 1 - min_y;
+    fields.insert("min_y".to_string(), min_y.into());
+    fields.insert("height".to_string(), height.into());
+    fields.insert("logical_height".to_string(), height.into());
+    let mut json = serde_json::to_vec_pretty(&dimension)
+        .map_err(|e| format!("Failed to write overworld.json: {e}"))?;
+    json.push(b'\n');
+    Ok(json)
 }
 
 /// Appends `file/<pack_dir_name>` to `Data.DataPacks.Enabled` if missing, so the
@@ -1035,6 +1347,40 @@ fn write_gzip_nbt(path: &Path, value: &Value) -> Result<(), String> {
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
+/// Survival on Normal, for the Zombie Outbreak: the template is Creative on Peaceful, where
+/// zombies despawn. The outbreak's start function sets both again for worlds Minecraft has
+/// already upgraded past these keys.
+pub fn start_in_survival(world: &Path) -> Result<(), String> {
+    let path = world.join("level.dat");
+    let mut root = read_gzip_nbt(&path)?;
+    let Value::Compound(ref mut r) = root else {
+        return Err("level.dat root is not a compound".to_string());
+    };
+    let Some(Value::Compound(data)) = r.get_mut("Data") else {
+        return Err("level.dat missing Data compound".to_string());
+    };
+    data.insert("GameType".to_string(), Value::Int(0));
+    data.insert("Difficulty".to_string(), Value::Byte(2));
+    if let Some(Value::Compound(player)) = data.get_mut("Player") {
+        player.insert("playerGameType".to_string(), Value::Int(0));
+    }
+    write_gzip_nbt(&path, &root)
+}
+
+/// `Data.LevelName` of a world's `level.dat`.
+pub(crate) fn level_name(world: &Path) -> Option<String> {
+    let Ok(Value::Compound(root)) = read_gzip_nbt(&world.join("level.dat")) else {
+        return None;
+    };
+    match root.get("Data") {
+        Some(Value::Compound(data)) => match data.get("LevelName") {
+            Some(Value::String(name)) => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `Data.DataVersion` of a world's `level.dat`.
 pub(crate) fn level_data_version(world: &Path) -> Option<i32> {
     let Ok(Value::Compound(root)) = read_gzip_nbt(&world.join("level.dat")) else {
@@ -1072,13 +1418,37 @@ fn singleplayer_file(
     Some(world.join("players").join("data").join(name))
 }
 
-// Writes GameType, DayTime, the player's game mode and what the game generates around the
-// area into an existing level.dat.
+/// Natural spawning, in the template's 1.21.4 game rule names: 1.21.11 renames them to
+/// `spawn_mobs` and `mob_griefing` when it upgrades the world. Monsters need a difficulty
+/// above the template's Peaceful, and mob griefing off keeps creepers and endermen from
+/// taking the city apart. All three are written whatever the choice, so a level.dat written
+/// before with another one does not keep its difficulty or griefing.
+fn apply_mob_spawning(
+    data: &mut std::collections::HashMap<String, Value>,
+    mobs: crate::args::MobSpawning,
+) {
+    let flag = |on: bool| Value::String(on.to_string());
+    if let Value::Compound(rules) = data
+        .entry("GameRules".to_string())
+        .or_insert_with(|| Value::Compound(Default::default()))
+    {
+        rules.insert("doMobSpawning".to_string(), flag(mobs.spawns()));
+        rules.insert("mobGriefing".to_string(), flag(!mobs.monsters()));
+    }
+    data.insert(
+        "Difficulty".to_string(),
+        Value::Byte(mobs.java_difficulty()),
+    );
+}
+
+// Writes GameType, DayTime, the player's game mode, what spawns and what the game generates
+// around the area into an existing level.dat.
 pub fn apply_java_world_settings(
     world_path: &Path,
     game_mode: crate::args::GameMode,
     world_time: i64,
     world_type: crate::args::WorldType,
+    mob_spawning: crate::args::MobSpawning,
 ) -> Result<(), String> {
     let level_path = world_path.join("level.dat");
     if !level_path.exists() {
@@ -1110,6 +1480,7 @@ pub fn apply_java_world_settings(
         if let Some(Value::Compound(ref mut player)) = data.get_mut("Player") {
             player.insert("playerGameType".to_string(), Value::Int(game_type));
         }
+        apply_mob_spawning(data, mob_spawning);
     }
 
     // Folded into this rewrite rather than a second read/write: both need the post-generation
@@ -1263,6 +1634,131 @@ fn move_player(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Disk at the peak of real runs, Oct 2026: 9 km² boxes at scale 1 unless the area says.
+    #[test]
+    fn the_disk_estimate_covers_every_measured_world() {
+        use crate::world_editor::WorldFormat::{BedrockMcWorld, JavaAnvil, LuantiWorld};
+        let o = WorldSizeOptions::default();
+        let caves = WorldSizeOptions {
+            caves: true,
+            fillground: true,
+            ..o
+        };
+        let fill = WorldSizeOptions {
+            fillground: true,
+            ..o
+        };
+        let tall = |w: WorldSizeOptions| WorldSizeOptions { tall: true, ..w };
+        let cases = [
+            ("Munich", 9.0, JavaAnvil, o, 141.0),
+            ("Munich 85 km²", 85.0, JavaAnvil, o, 1307.0),
+            ("Munich 150 km²", 150.0, JavaAnvil, o, 2302.0),
+            ("Munich scale 0.5", 2.25, JavaAnvil, o, 38.2),
+            ("Munich scale 2", 36.0, JavaAnvil, o, 563.7),
+            ("Manhattan", 9.0, JavaAnvil, o, 150.1),
+            ("farmland", 9.0, JavaAnvil, o, 138.5),
+            ("Zermatt tall", 9.0, JavaAnvil, tall(o), 138.5),
+            (
+                "Munich interior",
+                9.0,
+                JavaAnvil,
+                WorldSizeOptions {
+                    interior: true,
+                    ..o
+                },
+                168.7,
+            ),
+            (
+                "Manhattan interior",
+                9.0,
+                JavaAnvil,
+                WorldSizeOptions {
+                    interior: true,
+                    ..o
+                },
+                235.1,
+            ),
+            ("Munich caves", 9.0, JavaAnvil, caves, 164.5),
+            ("Zermatt caves", 9.0, JavaAnvil, caves, 241.1),
+            ("Zermatt tall caves", 9.0, JavaAnvil, tall(caves), 447.3),
+            ("Zermatt fillground", 9.0, JavaAnvil, fill, 145.5),
+            ("Zermatt tall fillground", 9.0, JavaAnvil, tall(fill), 264.4),
+            (
+                "Munich bake lighting",
+                9.0,
+                JavaAnvil,
+                WorldSizeOptions {
+                    bake_lighting: true,
+                    ..o
+                },
+                221.9,
+            ),
+            (
+                "Munich Voxy",
+                9.0,
+                JavaAnvil,
+                WorldSizeOptions {
+                    voxy_lod: true,
+                    ..o
+                },
+                312.7,
+            ),
+            (
+                "Munich Distant Horizons",
+                9.0,
+                JavaAnvil,
+                WorldSizeOptions { dh_lod: true, ..o },
+                303.6,
+            ),
+            ("Munich Bedrock", 9.0, BedrockMcWorld, o, 94.7),
+            ("Manhattan Bedrock", 9.0, BedrockMcWorld, o, 116.0),
+            ("Munich Luanti", 9.0, LuantiWorld, o, 84.5),
+            ("Manhattan Luanti", 9.0, LuantiWorld, o, 112.5),
+        ];
+        for (name, km2, format, opts, measured_mib) in cases {
+            let est = estimated_world_bytes(km2, format, opts) as f64 / (1024.0 * 1024.0);
+            assert!(
+                est >= measured_mib,
+                "{name}: {est:.0} MiB is under the {measured_mib} measured"
+            );
+            assert!(
+                est <= 2.0 * measured_mib,
+                "{name}: {est:.0} MiB is over twice the {measured_mib} measured"
+            );
+        }
+    }
+
+    #[test]
+    fn off_earth_blocks_follow_the_body_scale() {
+        use clap::Parser;
+        let cmd = [
+            "arnis",
+            "--output-dir",
+            ".",
+            "--bbox",
+            "-10,-10,10,10",
+            "--body",
+            "moon",
+        ];
+        let mut args = crate::args::Args::parse_from(cmd);
+        crate::args::apply_body_defaults(&mut args);
+        let bbox = args.bbox.unwrap();
+        let got = blocks_km2(&args, &bbox);
+        let want = bbox.area_km2() * args.scale * args.scale;
+        assert!((got / want - 1.0).abs() < 0.02, "{got} vs {want}");
+    }
+
+    #[test]
+    fn a_world_larger_than_the_disk_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // A volume that reports nothing to compare against lets every run go, by design.
+        if !fs2::available_space(dir.path()).is_ok_and(|free| free > 0) {
+            return;
+        }
+        let e = check_disk_space(&dir.path().join("not yet made"), u64::MAX / 2).unwrap_err();
+        assert!(e.starts_with("Not enough disk space"), "{e}");
+    }
     use std::collections::HashMap;
 
     #[test]
@@ -1433,6 +1929,14 @@ mod tests {
     }
 
     #[test]
+    fn a_bedrock_world_off_earth_is_named_after_the_body() {
+        let bbox = LLBBox::new(10.0, 10.0, 12.0, 12.0).unwrap();
+        let (path, level) = build_bedrock_output(&bbox, PathBuf::from("out"), CelestialBody::Moon);
+        assert_eq!(path, PathBuf::from("out").join("Arnis Moon.mcworld"));
+        assert_eq!(level, "Arnis World: Moon");
+    }
+
+    #[test]
     fn sanitize_for_filename_strips_trailing_dots() {
         // Windows silently drops trailing dots/spaces from directory names,
         // so a sanitized name must not end in one or the created directory
@@ -1521,6 +2025,7 @@ mod tests {
             crate::args::GameMode::Survival,
             13000,
             crate::args::WorldType::Void,
+            crate::args::MobSpawning::Off,
         )
         .unwrap();
 
@@ -1541,6 +2046,64 @@ mod tests {
         if let Some(Value::Compound(player)) = data.get("Player") {
             assert_eq!(player.get("playerGameType"), Some(&Value::Int(0)));
         }
+    }
+
+    #[test]
+    fn mob_spawning_sets_the_game_rules_and_the_difficulty_monsters_need() {
+        use crate::args::MobSpawning;
+        let tmp = tempfile::tempdir().unwrap();
+        // Each choice applied in turn to one new world.
+        let written = |choices: &[MobSpawning]| {
+            let world = PathBuf::from(create_new_world(tmp.path()).unwrap());
+            for &mobs in choices {
+                apply_java_world_settings(
+                    &world,
+                    crate::args::GameMode::Survival,
+                    6000,
+                    crate::args::WorldType::Void,
+                    mobs,
+                )
+                .unwrap();
+            }
+            let Value::Compound(mut root) = level_dat_root(&world) else {
+                panic!("root not a compound");
+            };
+            let Some(Value::Compound(mut data)) = root.remove("Data") else {
+                panic!("missing Data");
+            };
+            let Some(Value::Compound(rules)) = data.remove("GameRules") else {
+                panic!("missing GameRules");
+            };
+            let rule = |name: &str| match rules.get(name) {
+                Some(Value::String(v)) => v.clone(),
+                other => panic!("{name}: {other:?}"),
+            };
+            (
+                rule("doMobSpawning"),
+                rule("mobGriefing"),
+                data.get("Difficulty").cloned(),
+            )
+        };
+        let peaceful = Some(Value::Byte(0));
+        let off = ("false".into(), "true".into(), peaceful.clone());
+        assert_eq!(
+            written(&[MobSpawning::Off]),
+            off,
+            "the template as it always was"
+        );
+        assert_eq!(
+            written(&[MobSpawning::Animals]),
+            ("true".into(), "true".into(), peaceful)
+        );
+        assert_eq!(
+            written(&[MobSpawning::All]),
+            ("true".into(), "false".into(), Some(Value::Byte(2)))
+        );
+        assert_eq!(
+            written(&[MobSpawning::All, MobSpawning::Off]),
+            off,
+            "nothing of an earlier choice is left behind"
+        );
     }
 
     fn flat_layers(root: &Value) -> Vec<(String, i32)> {
@@ -1629,6 +2192,7 @@ mod tests {
             crate::args::GameMode::Creative,
             6000,
             crate::args::WorldType::Flat,
+            crate::args::MobSpawning::Off,
         )
         .unwrap();
         let vanilla_layers = flat_layers(&level_dat_root(&vanilla));
@@ -1641,6 +2205,7 @@ mod tests {
             crate::args::GameMode::Creative,
             6000,
             crate::args::WorldType::Flat,
+            crate::args::MobSpawning::Off,
         )
         .unwrap();
         let tall_layers = flat_layers(&level_dat_root(&tall));
@@ -1665,6 +2230,7 @@ mod tests {
             crate::args::GameMode::Creative,
             6000,
             crate::args::WorldType::Void,
+            crate::args::MobSpawning::Off,
         )
         .unwrap();
         let root = level_dat_root(&world);
@@ -1707,8 +2273,62 @@ mod tests {
 
     fn install_pack_for_test(tmp: &std::path::Path) -> PathBuf {
         let world = PathBuf::from(create_new_world(tmp).unwrap());
-        install_tall_datapack(&world).unwrap();
+        let (min_y, max_y) = TALL_DATAPACK_FULL_RANGE;
+        install_tall_datapack(&world, min_y, max_y).unwrap();
         world.join("datapacks").join(TALL_DATAPACK_NAME)
+    }
+
+    #[test]
+    fn every_copy_of_the_dimension_declares_the_range_it_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let world = PathBuf::from(create_new_world(tmp.path()).unwrap());
+        install_tall_datapack(&world, -128, 399).unwrap();
+        let root = world.join("datapacks").join(TALL_DATAPACK_NAME);
+        for overlay in ["", "overlay_attributes", "overlay_2601"] {
+            let dim = read_json(
+                &root
+                    .join(overlay)
+                    .join("data/minecraft/dimension_type/overworld.json"),
+            );
+            assert_eq!(dim["min_y"], -128, "{overlay}");
+            assert_eq!(dim["height"], 528, "{overlay}");
+            assert_eq!(dim["logical_height"], 528, "{overlay}");
+            // Everything else is the bundled file's.
+            assert_eq!(dim["has_skylight"], true, "{overlay}");
+        }
+        let bundled: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../assets/minecraft/datapack_tall/overlay_2601/data/minecraft/dimension_type/overworld.json"
+        ))
+        .unwrap();
+        let mut written =
+            read_json(&root.join("overlay_2601/data/minecraft/dimension_type/overworld.json"));
+        for key in ["min_y", "height", "logical_height"] {
+            written[key] = bundled[key].clone();
+        }
+        assert_eq!(written, bundled);
+    }
+
+    #[test]
+    fn the_declared_range_reads_back_from_the_installed_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let world = PathBuf::from(create_new_world(tmp.path()).unwrap());
+        assert_eq!(tall_datapack_range(&world), None);
+        install_tall_datapack(&world, -128, 399).unwrap();
+        assert_eq!(tall_datapack_range(&world), Some((-128, 399)));
+        let (min_y, max_y) = TALL_DATAPACK_FULL_RANGE;
+        install_tall_datapack(&world, min_y, max_y).unwrap();
+        assert_eq!(tall_datapack_range(&world), Some(TALL_DATAPACK_FULL_RANGE));
+        // A pack edited by hand past what the world can hold is not taken as its range.
+        for (min_y, max_y) in [(0, 255), (-4096, 2031), (-128, 4095)] {
+            install_tall_datapack(&world, min_y, max_y).unwrap();
+            assert_eq!(tall_datapack_range(&world), None, "{min_y}..{max_y}");
+        }
+        let dim = world
+            .join("datapacks")
+            .join(TALL_DATAPACK_NAME)
+            .join("data/minecraft/dimension_type/overworld.json");
+        fs::write(&dim, r#"{"min_y": 9223372036854775807, "height": 16}"#).unwrap();
+        assert_eq!(tall_datapack_range(&world), None);
     }
 
     fn read_json(path: &Path) -> serde_json::Value {
@@ -1735,6 +2355,15 @@ mod tests {
             path.push(dir);
         }
         read_json(&path.join("data/minecraft/dimension_type/overworld.json"))
+    }
+
+    #[test]
+    fn an_installed_tall_datapack_is_detected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = PathBuf::from(create_new_world(tmp.path()).unwrap());
+        assert!(!has_tall_datapack(&fresh));
+        let tall = install_pack_for_test(tmp.path());
+        assert!(has_tall_datapack(tall.parent().unwrap().parent().unwrap()));
     }
 
     #[test]

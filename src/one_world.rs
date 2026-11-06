@@ -426,6 +426,12 @@ fn resolve(
                 ));
             }
             *owned = true;
+            if args.vanilla_height {
+                return Err(
+                    "A new One World always has the extended build height, so any place on Earth fits. Leave out --vanilla-height."
+                        .to_string(),
+                );
+            }
             // Room for any place on Earth, so the first area does not limit later ones.
             if !args.disable_height_limit {
                 println!(
@@ -498,11 +504,15 @@ fn resolve(
     });
     args.projection = crate::projection::ProjectionKind::WebMercator;
     args.bbox = Some(llbbox);
-    // Voxy rebuilds the LOD database from the regions of one run, and both
-    // facade sources replace the world's resource pack on every run.
+    // Voxy and DH rebuild their LOD databases from the regions of one run, and
+    // both facade sources replace the world's resource pack on every run.
     if args.voxy_lod {
         println!("Note: the Voxy LOD cache is off in One World mode.");
         args.voxy_lod = false;
+    }
+    if args.dh_lod {
+        println!("Note: the Distant Horizons LOD cache is off in One World mode.");
+        args.dh_lod = false;
     }
     if args.mapillary_facade_mode.places_displays() && args.mapillary_facades_wanted() {
         println!("Note: One World builds Mapillary facades as blocks; photo panels are off.");
@@ -511,6 +521,17 @@ fn resolve(
     if args.building_facades {
         println!("Note: the preset building facades are off in One World mode.");
         args.building_facades = false;
+    }
+    // A flat plane sits at the first area's lowest ground, which later areas need not share.
+    if args.world_type == crate::args::WorldType::Flat {
+        println!("Note: One World is always a void world; the flat world type is off.");
+        args.world_type = crate::args::WorldType::Void;
+    }
+    // level.dat and the map item are written by the first area only.
+    if extending {
+        println!(
+            "Note: One World keeps the game mode, time of day, world type, mob spawning and map item of its first area."
+        );
     }
     args.map_preview = true;
 
@@ -702,6 +723,24 @@ mod tests {
     }
 
     #[test]
+    fn an_area_far_from_the_origin_counts_its_stretched_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let world = dir.path().join("w");
+        let singapore = "1.290,103.840,1.300,103.860";
+        let mut args = args_for(singapore, &[]);
+        let first = prepare(&world, &LLBBox::from_str(singapore).unwrap(), &mut args).unwrap();
+        drop(first);
+
+        let oslo = "59.910,10.730,59.920,10.760";
+        let mut args = args_for(oslo, &[]);
+        let s = prepare(&world, &LLBBox::from_str(oslo).unwrap(), &mut args).unwrap();
+        let ground = s.llbbox.area_km2() * args.scale * args.scale;
+        let ratio = crate::world_utils::blocks_km2(&args, &s.llbbox) / ground;
+        let want = (1.295f64.to_radians().cos() / 59.915f64.to_radians().cos()).powi(2);
+        assert!((ratio / want - 1.0).abs() < 0.05, "{ratio} vs {want}");
+    }
+
+    #[test]
     fn recorded_areas_survive_and_a_second_run_extends() {
         let dir = tempfile::tempdir().unwrap();
         let world = dir.path().join("w");
@@ -745,6 +784,17 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.contains("with terrain"), "{err}");
+    }
+
+    #[test]
+    fn a_new_world_refuses_the_vanilla_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let world = dir.path().join("w");
+        let req = LLBBox::from_str(MUNICH).unwrap();
+        let mut args = args_for(MUNICH, &["--vanilla-height"]);
+        let err = prepare(&world, &req, &mut args).err().unwrap();
+        assert!(err.contains("--vanilla-height"), "{err}");
+        assert!(!world.exists(), "the refused world was left behind");
     }
 
     #[test]
@@ -799,6 +849,16 @@ mod tests {
         drop(prepare(&world, &req, &mut args).unwrap());
         assert_eq!(args.height_multiplier, 2.0);
         assert_eq!(args.one_world_run.unwrap().elevation, Some(e));
+    }
+
+    #[test]
+    fn a_one_world_is_always_void() {
+        let dir = tempfile::tempdir().unwrap();
+        let world = dir.path().join("w");
+        let req = LLBBox::from_str(MUNICH).unwrap();
+        let mut args = args_for(MUNICH, &["--world-type", "flat"]);
+        drop(prepare(&world, &req, &mut args).unwrap());
+        assert_eq!(args.world_type, crate::args::WorldType::Void);
     }
 
     #[test]

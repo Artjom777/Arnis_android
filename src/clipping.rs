@@ -27,8 +27,30 @@ pub fn is_invented_node_id(id: u64) -> bool {
     id >= INVENTED_NODE_BASE
 }
 
+/// Gives a clipped open way's ends that moved off `ends` an invented id. The
+/// polyline clip lends a cut end the id of the node up to 50 blocks beyond it.
+pub fn mark_cut_ends(nodes: &mut [ProcessedNode], ends: [(i32, i32); 2], way_id: u64) {
+    let last = nodes.len().saturating_sub(1);
+    for (i, end) in [(0, ends[0]), (last, ends[1])] {
+        if let Some(n) = nodes.get_mut(i).filter(|n| (n.x, n.z) != end) {
+            n.id = invented_node_id(way_id, i as u64);
+        }
+    }
+}
+
 /// Clips a way to the bounding box using Sutherland-Hodgman for polygons or
 /// simple line clipping for polylines. Preserves endpoint IDs for ring assembly.
+/// `clip_way_to_bbox` for an owned way: one lying wholly inside comes back as is, uncopied.
+pub fn clip_way_to_bbox_owned(nodes: Vec<ProcessedNode>, xzbbox: &XZBBox) -> Vec<ProcessedNode> {
+    if nodes
+        .iter()
+        .all(|node| xzbbox.contains(&XZPoint::new(node.x, node.z)))
+    {
+        return nodes;
+    }
+    clip_way_to_bbox(&nodes, xzbbox)
+}
+
 pub fn clip_way_to_bbox(nodes: &[ProcessedNode], xzbbox: &XZBBox) -> Vec<ProcessedNode> {
     if nodes.is_empty() {
         return Vec::new();
@@ -592,28 +614,25 @@ fn assign_node_ids_preserving_endpoints(
         return Vec::new();
     }
 
-    // First ID wins where two original nodes share a block, so the answer does
+    // First node wins where two original nodes share a block, so the answer does
     // not depend on iteration order.
-    let mut by_block: HashMap<(i32, i32), u64> = HashMap::with_capacity(original_nodes.len());
+    let mut by_block: HashMap<(i32, i32), &ProcessedNode> =
+        HashMap::with_capacity(original_nodes.len());
     for n in original_nodes {
-        by_block.entry((n.x, n.z)).or_insert(n.id);
+        by_block.entry((n.x, n.z)).or_insert(n);
     }
 
+    // A kept vertex keeps its tags too, so a gate on a clipped fence still opens.
     let mut out: Vec<ProcessedNode> = clipped_coords
         .into_iter()
         .enumerate()
         .map(|(i, coord)| {
             let (x, z) = (coord.0.round() as i32, coord.1.round() as i32);
-            let id = match by_block.get(&(x, z)) {
-                Some(&id) => id,
-                None => invented_node_id(way_id, i as u64),
+            let (id, tags) = match by_block.get(&(x, z)) {
+                Some(n) => (n.id, n.tags.clone()),
+                None => (invented_node_id(way_id, i as u64), HashMap::new()),
             };
-            ProcessedNode {
-                id,
-                x,
-                z,
-                tags: HashMap::new(),
-            }
+            ProcessedNode { id, x, z, tags }
         })
         .collect();
 
@@ -673,6 +692,39 @@ mod tests {
         assert!(!clipped.iter().any(|n| n.id == 2 || n.id == 3));
         // Still closed by id, which is the signal the ring assembly reads.
         assert_eq!(clipped.first().map(|n| n.id), clipped.last().map(|n| n.id));
+    }
+
+    /// A gate on a fence the world's edge cuts must still be a gate.
+    #[test]
+    fn a_clipped_ring_keeps_the_tags_of_the_nodes_that_survived() {
+        let bbox = XZBBox::rect_from_min_max(0, 0, 30, 30).unwrap();
+        let mut gate = node(4, 10, 25);
+        gate.tags.insert("barrier".to_string(), "gate".to_string());
+        let ring = vec![
+            node(1, 10, 10),
+            node(2, 40, 10),
+            node(3, 40, 25),
+            gate,
+            node(1, 10, 10),
+        ];
+        let clipped = clip_way_to_bbox(&ring, &bbox);
+        let kept = clipped.iter().find(|n| n.id == 4).expect("node 4 survives");
+        assert_eq!(kept.tags.get("barrier").map(String::as_str), Some("gate"));
+        assert!(clipped
+            .iter()
+            .filter(|n| n.id != 4)
+            .all(|n| n.tags.is_empty()));
+    }
+
+    #[test]
+    fn a_cut_end_does_not_answer_to_the_node_beyond_it() {
+        let bbox = XZBBox::rect_from_min_max(0, 0, 30, 30).unwrap();
+        let line = vec![node(1, 10, 10), node(2, 40, 10)];
+        let mut clipped = clip_way_to_bbox(&line, &bbox);
+        assert_eq!(clipped[1].id, 2, "the clip lends the cut end node 2's id");
+        mark_cut_ends(&mut clipped, [(10, 10), (40, 10)], 7);
+        assert_eq!(clipped[0].id, 1);
+        assert!(is_invented_node_id(clipped[1].id));
     }
 
     #[test]

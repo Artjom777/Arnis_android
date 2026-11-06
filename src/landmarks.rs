@@ -14,8 +14,16 @@ use crate::block_definitions::{
 use crate::coordinate_system::cartesian::XZBBox;
 use crate::coordinate_system::geographic::{LLBBox, LLPoint};
 use crate::osm_parser::ProcessedElement;
-use crate::structures::schematic::{load_palettized, rotate_props};
+use crate::structures::schematic::{load_palettized, rotate_props, PalettizedSchematic};
 use crate::world_editor::WorldEditor;
+
+/// Where a landmark's blocks come from.
+enum Source {
+    /// A gzipped Sponge `.schem`.
+    Schem(&'static [u8]),
+    /// Built in code, laid out as a loaded `.schem`.
+    Built(fn() -> PalettizedSchematic),
+}
 
 /// One bundled landmark model.
 struct Landmark {
@@ -25,8 +33,8 @@ struct Landmark {
     qid: &'static str,
     /// Fallback identity if the element lost its `wikidata` tag.
     osm_ids: &'static [(&'static str, u64)],
-    /// Gzipped Sponge `.schem`, north-up at one block per metre.
-    schematic: &'static [u8],
+    /// North-up at one block per metre.
+    model: Source,
     /// Point the anchor is pinned to.
     lat: f64,
     lon: f64,
@@ -46,6 +54,9 @@ struct Landmark {
     suppress_half_z: f64,
     /// Farthest the model reaches from the anchor, in metres.
     reach_m: i32,
+    /// Blocks the model stands above its ground, so the build height can count it without
+    /// decoding it. A test holds it to the model.
+    height: i32,
 }
 
 /// Anchors are measured by matching each model against its real OSM footprint.
@@ -54,7 +65,9 @@ const LANDMARKS: &[Landmark] = &[
         name: "Olympiastadion München",
         qid: "Q131610",
         osm_ids: &[("way", 419_656_920)],
-        schematic: include_bytes!("../assets/structures/landmarks/olympiastadion_munich.schem"),
+        model: Source::Schem(include_bytes!(
+            "../assets/structures/landmarks/olympiastadion_munich.schem"
+        )),
         // Centre of the leisure=stadium footprint; model bowl 230x261 vs 241x260 m.
         lat: 48.173_101_2,
         lon: 11.546_483_3,
@@ -70,12 +83,15 @@ const LANDMARKS: &[Landmark] = &[
         suppress_half_x: 135.0,
         suppress_half_z: 145.0,
         reach_m: 240,
+        height: 76,
     },
     Landmark {
         name: "Olympiahalle",
         qid: "Q48849",
         osm_ids: &[("way", 303_099_272)],
-        schematic: include_bytes!("../assets/structures/landmarks/olympiahalle_munich.schem"),
+        model: Source::Schem(include_bytes!(
+            "../assets/structures/landmarks/olympiahalle_munich.schem"
+        )),
         // Fitted by overlapping the model body with the OSM polygon: 16847/16860 m2.
         lat: 48.174_905_8,
         lon: 11.550_030_8,
@@ -91,14 +107,15 @@ const LANDMARKS: &[Landmark] = &[
         suppress_half_x: 95.0,
         suppress_half_z: 75.0,
         reach_m: 160,
+        height: 70,
     },
     Landmark {
         name: "Olympia-Schwimmhalle",
         qid: "Q3882013",
         osm_ids: &[("way", 227_012_665)],
-        schematic: include_bytes!(
+        model: Source::Schem(include_bytes!(
             "../assets/structures/landmarks/olympia_schwimmhalle_munich.schem"
-        ),
+        )),
         // The glazed facade encloses 83x124 blocks against the real 82x123 m.
         lat: 48.173_572_3,
         lon: 11.551_479_7,
@@ -115,12 +132,15 @@ const LANDMARKS: &[Landmark] = &[
         suppress_half_x: 50.0,
         suppress_half_z: 70.0,
         reach_m: 160,
+        height: 79,
     },
     Landmark {
         name: "Olympiaturm",
         qid: "Q599148",
         osm_ids: &[("way", 164_084_344)],
-        schematic: include_bytes!("../assets/structures/landmarks/olympiaturm_munich.schem"),
+        model: Source::Schem(include_bytes!(
+            "../assets/structures/landmarks/olympiaturm_munich.schem"
+        )),
         // Centre of the tower's OSM footprint.
         lat: 48.174_409_5,
         lon: 11.553_740_1,
@@ -134,6 +154,27 @@ const LANDMARKS: &[Landmark] = &[
         suppress_half_x: 22.0,
         suppress_half_z: 22.0,
         reach_m: 30,
+        height: 288,
+    },
+    Landmark {
+        name: "Elizabeth Tower",
+        qid: "Q41225",
+        osm_ids: &[("way", 123_557_148)],
+        model: Source::Built(crate::structures::elizabeth_tower::build),
+        // Centre of the mapped outline. That turns 6 degrees off north; the model stands square.
+        lat: 51.500_701_2,
+        lon: -0.124_573_0,
+        anchor_x: 8.5,
+        anchor_z: 8.5,
+        ground_y: 0,
+        ground_offset: 0,
+        interior_marker: &[],
+        ground_overlap: 0,
+        // The tower's own parts, not the Palace wings against it.
+        suppress_half_x: 8.0,
+        suppress_half_z: 8.0,
+        reach_m: 13,
+        height: 96,
     },
 ];
 
@@ -156,16 +197,54 @@ impl LandmarkPrescan {
         &self.suppressed
     }
 
-    /// Regions a landmark may write to, so stream-to-disk keeps them resident.
-    pub fn deferred_region_keys(&self, scale: f64) -> Vec<(i32, i32)> {
+    /// Regions each landmark may write to, so stream-to-disk keeps them resident.
+    pub fn placement_regions(&self, scale: f64) -> Vec<Vec<(i32, i32)>> {
         self.placements
             .iter()
-            .flat_map(|p| {
+            .map(|p| {
                 let r = (p.landmark.reach_m as f64 * scale).ceil() as i32;
                 crate::models_3d::region_keys_around(p.world_x, p.world_z, r)
             })
             .collect()
     }
+}
+
+/// The landmarks this world may hold, each a tall model as high as it stands, so the build
+/// height counts them even where their OSM element carries no height: those whose element is
+/// in `data`, and those within reach of `bbox`, which `prescan` places whether or not it is.
+pub fn tall_models_in(
+    data: &crate::osm_parser::OsmData,
+    bbox: Option<&LLBBox>,
+) -> Vec<crate::elevation::TallModel> {
+    let in_data = |landmark: &Landmark| {
+        data.elements().iter().any(|e| {
+            landmark.osm_ids.contains(&(e.r#type.as_str(), e.id))
+                || e.tags
+                    .as_ref()
+                    .and_then(|t| t.get("wikidata"))
+                    .is_some_and(|q| q.trim() == landmark.qid)
+        })
+    };
+    let in_reach = |landmark: &Landmark| {
+        bbox.is_some_and(|b| {
+            let lat_m = 111_320.0;
+            let lon_m = lat_m * landmark.lat.to_radians().cos().max(0.01);
+            let reach = f64::from(landmark.reach_m);
+            landmark.lat + reach / lat_m >= b.min().lat()
+                && landmark.lat - reach / lat_m <= b.max().lat()
+                && landmark.lon + reach / lon_m >= b.min().lng()
+                && landmark.lon - reach / lon_m <= b.max().lng()
+        })
+    };
+    LANDMARKS
+        .iter()
+        .filter(|l| in_data(l) || in_reach(l))
+        .map(|l| crate::elevation::TallModel {
+            lat: l.lat,
+            lon: l.lon,
+            height_m: f64::from(l.height),
+        })
+        .collect()
 }
 
 /// Resolve the landmarks inside this world and collect what they replace.
@@ -349,7 +428,10 @@ struct Model {
 
 impl Model {
     fn load(landmark: &Landmark) -> Result<Self, String> {
-        let parsed = load_palettized(landmark.schematic)?;
+        let parsed = match landmark.model {
+            Source::Schem(bytes) => load_palettized(bytes)?,
+            Source::Built(build) => build(),
+        };
         let mut voxels = parsed.voxels;
         if voxels.is_empty() {
             return Err("no mapped blocks".to_string());
@@ -434,7 +516,7 @@ impl Model {
 
 /// `mask` plus what it encloses, by flooding the outside in from the border.
 /// A tribune ring becomes the whole bowl, so the pitch counts as interior.
-fn fill_enclosed(mask: &[bool], span_x: usize, span_z: usize) -> Vec<bool> {
+pub(crate) fn fill_enclosed(mask: &[bool], span_x: usize, span_z: usize) -> Vec<bool> {
     let mut outside = vec![false; mask.len()];
     let mut stack: Vec<usize> = Vec::new();
     let push = |i: usize, outside: &mut Vec<bool>, stack: &mut Vec<usize>| {
@@ -496,13 +578,17 @@ fn erode(mask: &[bool], span_x: usize, span_z: usize, r: usize) -> Vec<bool> {
 }
 
 impl LandmarkPrescan {
-    /// Stamp the landmarks, after ground generation so terrain Y is final.
-    pub fn place(&self, editor: &mut WorldEditor, args: &Args) {
-        if self.placements.is_empty() || !editor.place_schematics() {
+    pub fn placement_count(&self) -> usize {
+        self.placements.len()
+    }
+
+    /// Stamp `indices` (ascending), after ground generation so terrain Y is final.
+    pub fn place(&self, editor: &mut WorldEditor, args: &Args, indices: &[usize]) {
+        if indices.is_empty() || !editor.place_schematics() {
             return;
         }
-        for placement in &self.placements {
-            place_one(editor, args, placement);
+        for &i in indices {
+            place_one(editor, args, &self.placements[i]);
         }
     }
 }
@@ -680,6 +766,50 @@ mod tests {
     const TOWER: &str = "Q599148";
     const SWIM_HALL: &str = "Q3882013";
     const EVENT_HALL: &str = "Q48849";
+
+    #[test]
+    fn a_landmark_in_the_data_counts_as_tall_as_its_model() {
+        let data: crate::osm_parser::OsmData = serde_json::from_str(
+            r#"{"elements": [
+                {"type": "node", "id": 1, "lat": 48.17, "lon": 11.55},
+                {"type": "way", "id": 164084344, "nodes": [1], "tags": {"building": "tower"}},
+                {"type": "node", "id": 2, "lat": 51.5, "lon": -0.12, "tags": {"wikidata": "Q41225"}}
+            ]}"#,
+        )
+        .unwrap();
+        let found = tall_models_in(&data, None);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let tower = landmark(TOWER);
+        let olympiaturm = found.iter().find(|m| m.lat == tower.lat).unwrap();
+        // The 291 m tower, less the empty layers at the top of its schematic.
+        assert!(olympiaturm.height_m > 280.0, "{olympiaturm:?}");
+        let empty: crate::osm_parser::OsmData =
+            serde_json::from_str(r#"{"elements": []}"#).unwrap();
+        assert!(tall_models_in(&empty, None).is_empty());
+        // Placed from its anchor even when the bbox stops short of its OSM outline.
+        let near = LLBBox::new(48.1740, 11.5530, 48.1743, 11.5536).unwrap();
+        let reached = tall_models_in(&empty, Some(&near));
+        assert!(reached.iter().any(|m| m.lat == tower.lat), "{reached:?}");
+        let far = LLBBox::new(48.0, 11.0, 48.01, 11.01).unwrap();
+        assert!(tall_models_in(&empty, Some(&far)).is_empty());
+    }
+
+    #[test]
+    fn every_landmark_height_is_its_models() {
+        for l in LANDMARKS {
+            let model = match l.model {
+                Source::Schem(bytes) => load_palettized(bytes).unwrap(),
+                Source::Built(build) => build(),
+            };
+            let top = model.voxels.iter().map(|v| i32::from(v.1)).max().unwrap() + 1;
+            assert_eq!(
+                l.height,
+                top - l.ground_y + l.ground_offset.max(0),
+                "{}",
+                l.name
+            );
+        }
+    }
 
     #[test]
     fn every_landmark_asset_parses() {

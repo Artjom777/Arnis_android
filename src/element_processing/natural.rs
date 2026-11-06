@@ -6,8 +6,12 @@ use crate::deterministic_rng::element_rng;
 use crate::element_processing::bridges::BridgeSurfaceMap;
 use crate::element_processing::bush::{self, place_bush, BushKind};
 use crate::element_processing::tree::{Tree, TreeType};
-use crate::floodfill_cache::{is_oversized_ring, BuildingFootprintBitmap, FloodFillCache};
+use crate::floodfill_cache::{
+    edge_in_hole, in_hole, is_oversized_ring, BuildingFootprintBitmap, FloodFillCache, Holes,
+    InnerRings,
+};
 use crate::osm_parser::{ProcessedElement, ProcessedMemberRole, ProcessedRelation, ProcessedWay};
+use crate::terrain_surface::Rock;
 use crate::trees::mapped::{tree_row_positions, MappedTree};
 use crate::world_editor::WorldEditor;
 use rand::{prelude::IndexedRandom, Rng};
@@ -19,6 +23,27 @@ pub fn generate_natural(
     flood_fill_cache: &FloodFillCache,
     building_footprints: &BuildingFootprintBitmap,
     bridge_surface: &BridgeSurfaceMap,
+) {
+    natural_area(
+        editor,
+        element,
+        args,
+        flood_fill_cache,
+        building_footprints,
+        bridge_surface,
+        None,
+    );
+}
+
+/// A natural feature less the cells of `holes`.
+fn natural_area(
+    editor: &mut WorldEditor,
+    element: &ProcessedElement,
+    args: &Args,
+    flood_fill_cache: &FloodFillCache,
+    building_footprints: &BuildingFootprintBitmap,
+    bridge_surface: &BridgeSurfaceMap,
+    holes: Option<&Holes>,
 ) {
     if let Some(natural_type) = element.tags().get("natural") {
         if natural_type == "tree" {
@@ -56,28 +81,20 @@ pub fn generate_natural(
                 "sand" | "dune" => SAND,
                 "beach" | "shoal" => beach_block(element.tags().get("surface")),
                 "water" | "reef" | "bay" => WATER,
-                "bare_rock" => STONE,
+                "bare_rock" | "rock" | "stone" => STONE,
                 "blockfield" => COBBLESTONE,
                 "glacier" => PACKED_ICE,
                 "mud" | "wetland" => MUD,
-                "mountain_range" => COBBLESTONE,
                 "saddle" | "ridge" => STONE,
                 "shrubbery" | "tundra" | "hill" => GRASS_BLOCK,
                 "cliff" => STONE,
                 _ => GRASS_BLOCK,
             };
 
-            // Whether this natural type should have per-block rock variation
-            // via `vary_rock_block`. Note: "bare_rock" is deliberately NOT in
-            // this list — it has its own dedicated 6-class mix in the match
-            // arm below (STONE/ANDESITE/COBBLESTONE/GRAVEL/TUFF/COARSE_DIRT)
-            // which overwrites whatever we put here. Including it in
-            // rock_variation would mean two different mixes race against each
-            // other at the same cell, where the match-arm mix wins but the
-            // first placement is wasted work.
+            // Per-block rock variation; bare rock takes the patchy ground of `Rock::bare`.
             let rock_variation = matches!(
                 natural_type.as_str(),
-                "blockfield" | "cliff" | "saddle" | "ridge" | "mountain_range"
+                "blockfield" | "cliff" | "saddle" | "ridge"
             );
 
             let ProcessedElement::Way(way) = element else {
@@ -87,6 +104,7 @@ pub fn generate_natural(
             // Resolve the fill before painting the edge. It is cached, so this costs nothing
             // extra. A closed ring that comes back empty is one the fill refused for size, and
             // drawing its edge anyway leaves a border around ground nothing ever filled.
+            // Hole cells are skipped where read, so the shared fill is not copied.
             let filled_area = flood_fill_cache.get_or_compute(way, args.timeout.as_ref());
             if filled_area.is_empty() && is_oversized_ring(way) {
                 return;
@@ -102,8 +120,9 @@ pub fn generate_natural(
                     let bresenham_points: Vec<(i32, i32, i32)> =
                         bresenham_line(prev.0, 0, prev.1, x, 0, z);
                     for (bx, _, bz) in bresenham_points {
-                        // Don't overwrite road blocks with natural ground
-                        if !editor.surface_is_sealed(bx, bz)
+                        // Don't overwrite road blocks with natural ground, nor run through a hole
+                        if !edge_in_hole(holes, bx, bz)
+                            && !editor.surface_is_sealed(bx, bz)
                             && !editor.check_for_block(
                                 bx,
                                 0,
@@ -204,13 +223,44 @@ pub fn generate_natural(
                             | Climate::ColdSteppe
                     );
 
+                // Scrub and grassland in dry country keep the region's own ground, not a lawn.
+                let dry_ground = matches!(natural_type.as_str(), "scrub" | "grassland" | "heath")
+                    && editor.climate().is_dry();
+
+                let bare_rock = matches!(natural_type.as_str(), "bare_rock" | "rock" | "stone");
+                let needs_rock = dry_ground || bare_rock || block_type == SAND;
+
                 let mut shrubbery_species: Option<Block> = None;
                 for &(x, z) in filled_area.iter() {
+                    if in_hole(holes, x, z) {
+                        continue;
+                    }
+                    // Nothing lands outside this editor, and no draw happens before the
+                    // ownership check below, so the rest of a large area costs nothing.
+                    // Owned cells, such as One World's clip margin, still take their draws.
+                    if !editor.in_bounds(x, z) && !editor.owns(x, z) {
+                        continue;
+                    }
+                    // Per cell, so an area on the red earth border matches the ground beside it.
+                    let rock = if needs_rock {
+                        Rock::at(editor.climate(), x, z, |sx, sz| editor.ecoregion(sx, sz))
+                    } else {
+                        Rock::Grey
+                    };
+                    let block_type = if block_type == SAND && rock == Rock::Red {
+                        RED_SAND
+                    } else {
+                        block_type
+                    };
                     // Roads, paths and paved areas keep their own surface. Checked
                     // by mask because a gravel or dirt road is not in the block list.
                     let sealed = editor.surface_is_sealed(x, z);
                     if !sealed && !editor.check_for_block(x, 0, z, Some(protected_blocks)) {
-                        let b = if rock_variation {
+                        let b = if dry_ground {
+                            dry_ground_block(editor, x, z, rock).unwrap_or(block_type)
+                        } else if bare_rock {
+                            rock.bare(x, z).0
+                        } else if rock_variation {
                             vary_rock_block(block_type, x, z)
                         } else {
                             block_type
@@ -228,19 +278,6 @@ pub fn generate_natural(
                         "glacier" => {
                             editor.set_block(PACKED_ICE, x, 0, z, None, None);
                             editor.set_block(STONE, x, -1, z, None, None);
-                        }
-                        "bare_rock" => {
-                            // Varied rock surface: stone base with natural variation
-                            let h = crate::land_cover::coord_hash(x, z) % 12;
-                            let rock = match h {
-                                0..=4 => STONE,       // ~42% stone
-                                5..=6 => ANDESITE,    // ~17% andesite
-                                7..=8 => COBBLESTONE, // ~17% cobblestone
-                                9 => GRAVEL,          // ~8% gravel
-                                10 => TUFF,           // ~8% tuff
-                                _ => COARSE_DIRT,     // ~8% coarse dirt
-                            };
-                            editor.set_block(rock, x, 0, z, None, None);
                         }
                         _ => {}
                     }
@@ -264,6 +301,14 @@ pub fn generate_natural(
                         continue;
                     }
                     match natural_type.as_str() {
+                        "scrub" | "grassland" | "heath"
+                            if dry_ground
+                                && !editor.check_for_block(x, 0, z, Some(&[GRASS_BLOCK])) =>
+                        {
+                            if rng.random_range(0..60) == 0 {
+                                editor.set_block(DEAD_BUSH, x, 1, z, None, None);
+                            }
+                        }
                         "grassland" => {
                             if !editor.check_for_block(x, 0, z, Some(&[GRASS_BLOCK])) {
                                 continue;
@@ -352,13 +397,13 @@ pub fn generate_natural(
                         // Dead bushes belong to deserts; coastal dunes elsewhere stay bare.
                         "sand"
                             if arid
-                                && editor.check_for_block(x, 0, z, Some(&[SAND]))
+                                && editor.check_for_block(x, 0, z, Some(&[SAND, RED_SAND]))
                                 && rng.random_range(0..100) == 1 =>
                         {
                             editor.set_block(DEAD_BUSH, x, 1, z, None, None);
                         }
                         "shoal" if rng.random_bool(0.05) => {
-                            editor.set_block(WATER, x, 0, z, Some(&[SAND, GRAVEL]), None);
+                            editor.set_block(WATER, x, 0, z, Some(&[SAND, RED_SAND, GRAVEL]), None);
                         }
                         "wetland" => {
                             let wetland_type = element
@@ -445,84 +490,6 @@ pub fn generate_natural(
                                     }
                                 }
                                 _ => place_grass_or_tall(editor, &mut rng, x, z),
-                            }
-                        }
-                        "mountain_range" => {
-                            // Create block clusters instead of random placement
-                            let cluster_chance = rng.random_range(0..1000);
-
-                            if cluster_chance < 50 {
-                                // 5% chance to start a new cluster
-                                let cluster_block = match rng.random_range(0..7) {
-                                    0 => DIRT,
-                                    1 => STONE,
-                                    2 => GRAVEL,
-                                    3 => GRANITE,
-                                    4 => DIORITE,
-                                    5 => ANDESITE,
-                                    _ => GRASS_BLOCK,
-                                };
-
-                                // Generate cluster size (5-10 blocks radius)
-                                let cluster_size = rng.random_range(5..=10);
-
-                                // Create cluster around current position
-                                for dx in -cluster_size..=cluster_size {
-                                    for dz in -cluster_size..=cluster_size {
-                                        let cluster_x = x + dx;
-                                        let cluster_z = z + dz;
-
-                                        // Use distance to create more natural cluster shape
-                                        let distance = ((dx * dx + dz * dz) as f32).sqrt();
-                                        if distance <= cluster_size as f32 {
-                                            // Probability decreases with distance from center
-                                            let place_prob = 1.0 - (distance / cluster_size as f32);
-                                            if rng.random::<f32>() < place_prob {
-                                                editor.set_block(
-                                                    cluster_block,
-                                                    cluster_x,
-                                                    0,
-                                                    cluster_z,
-                                                    None,
-                                                    None,
-                                                );
-
-                                                // Add vegetation on grass blocks
-                                                if cluster_block == GRASS_BLOCK {
-                                                    let vegetation_chance =
-                                                        rng.random_range(0..100);
-                                                    if vegetation_chance == 0
-                                                        && editor.land_cover_backs_trees(
-                                                            cluster_x, cluster_z,
-                                                        )
-                                                    {
-                                                        // 1% chance for rare trees
-                                                        Tree::create(
-                                                            editor,
-                                                            (cluster_x, 1, cluster_z),
-                                                            Some(building_footprints),
-                                                            Some(bridge_surface),
-                                                        );
-                                                    } else if vegetation_chance < 15 {
-                                                        // 15% chance for grass
-                                                        editor.set_block(
-                                                            GRASS, cluster_x, 1, cluster_z, None,
-                                                            None,
-                                                        );
-                                                    } else if vegetation_chance < 25 {
-                                                        // 10% chance for a low bush
-                                                        place_bush(
-                                                            editor,
-                                                            cluster_x,
-                                                            cluster_z,
-                                                            BushKind::Low,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                             }
                         }
                         "saddle" => {
@@ -675,7 +642,9 @@ pub fn generate_natural(
                     ) {
                         area = crate::floodfill_cache::CoordinateBitmap::new(&rect);
                         for &(x, z) in filled_area.iter() {
-                            area.set(x, z);
+                            if !in_hole(holes, x, z) {
+                                area.set(x, z);
+                            }
                         }
                     }
                     // Puddle rings, order-independent: Chebyshev 1 = moss, 2 = coarse dirt
@@ -765,21 +734,24 @@ pub fn generate_natural_from_relation(
         // We intentionally do not combine all outer nodes into one mega-way,
         // because that creates a nonsensical polygon spanning the whole relation
         // extent, misses the flood fill cache, and can cause multi-GB allocations.
+        let inners = InnerRings::of(rel);
         for member in &rel.members {
             if member.role == ProcessedMemberRole::Outer {
+                let holes = flood_fill_cache.holes_in(&member.way, &inners, args.timeout.as_ref());
                 // Use relation tags so the member inherits the relation's natural=* type
                 let way_with_rel_tags = ProcessedWay {
                     id: member.way.id,
                     nodes: member.way.nodes.clone(),
                     tags: rel.tags.clone(),
                 };
-                generate_natural(
+                natural_area(
                     editor,
                     &ProcessedElement::Way(way_with_rel_tags),
                     args,
                     flood_fill_cache,
                     building_footprints,
                     bridge_surface,
+                    holes.as_ref(),
                 );
             }
         }
@@ -794,6 +766,16 @@ fn beach_block(surface: Option<&String>) -> Block {
         Some("mud") => MUD,
         _ => SAND,
     }
+}
+
+/// Ground of an arid region under its scrub or grassland, from the land cover there.
+fn dry_ground_block(editor: &WorldEditor, x: i32, z: i32, rock: Rock) -> Option<Block> {
+    let climate = editor.climate();
+    let red = rock == Rock::Red;
+    climate
+        .surface_palette(editor.cover_class(x, z), x, z, red)
+        .or_else(|| climate.surface_palette(crate::land_cover::LC_SHRUBLAND, x, z, red))
+        .map(|(surface, _)| surface)
 }
 
 /// Vary a rock block type per-coordinate for natural rock areas.
@@ -865,6 +847,7 @@ mod tests {
     use super::*;
     use crate::coordinate_system::cartesian::XZBBox;
     use crate::coordinate_system::geographic::LLBBox;
+    use crate::element_processing::highways::HighwayConnectivityMap;
 
     #[test]
     fn wetland_mosaic_deterministic_and_nondegenerate() {
@@ -920,7 +903,8 @@ mod tests {
         let xzbbox = Box::leak(Box::new(XZBBox::rect_from_xz_lengths(60.0, 60.0).unwrap()));
         let mut editor = WorldEditor::new(std::env::temp_dir(), xzbbox, llbbox);
         let outlines = BridgeOutlineIndex::build(&[]);
-        let structures = BridgeStructureMap::build(&[], &editor, &outlines, 1.0);
+        let structures =
+            BridgeStructureMap::build(&[], &editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
         let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
         let args = Args::parse_from([
             "arnis",
@@ -943,6 +927,82 @@ mod tests {
         editor
     }
 
+    #[test]
+    fn a_natural_relation_leaves_its_hole_alone() {
+        use crate::element_processing::bridge_styles::BridgeOutlineIndex;
+        use crate::element_processing::bridges::BridgeStructureMap;
+        use crate::element_processing::building_test_support::rect_way;
+        use crate::osm_parser::ProcessedMember;
+        use clap::Parser as _;
+
+        let xzbbox = Box::leak(Box::new(XZBBox::rect_from_xz_lengths(60.0, 60.0).unwrap()));
+        let place = LLBBox::new(54.6, 9.9, 54.61, 9.91).unwrap();
+        let mut editor = WorldEditor::new(std::env::temp_dir(), xzbbox, place);
+        let outlines = BridgeOutlineIndex::build(&[]);
+        let structures =
+            BridgeStructureMap::build(&[], &editor, &HighwayConnectivityMap::new(), &outlines, 1.0);
+        let surface = BridgeSurfaceMap::build(&[], &structures, 1.0);
+        let args = Args::parse_from([
+            "arnis",
+            "--bbox",
+            "1,2,3,4",
+            "--mode",
+            "geo-only",
+            "--ground-level",
+            "0",
+        ]);
+        let member = |role, way| ProcessedMember {
+            role,
+            way: std::sync::Arc::new(way),
+        };
+        let rel = ProcessedRelation {
+            id: 8,
+            tags: [("natural".to_string(), "beach".to_string())].into(),
+            members: vec![
+                member(ProcessedMemberRole::Outer, rect_way(1, 5, 5, 54, 54, &[])),
+                member(ProcessedMemberRole::Inner, rect_way(2, 20, 20, 40, 40, &[])),
+            ],
+        };
+        let cache = FloodFillCache::precompute(&[ProcessedElement::Relation(rel.clone())], None);
+        generate_natural_from_relation(
+            &mut editor,
+            &rel,
+            &args,
+            &cache,
+            &BuildingFootprintBitmap::new_empty(),
+            &surface,
+        );
+        assert!(editor.check_for_block(10, 0, 10, Some(&[SAND])));
+        let in_hole = (22..39)
+            .flat_map(|x| (22..39).map(move |z| (x, z)))
+            .filter(|&(x, z)| editor.check_for_block(x, 0, z, Some(&[SAND])))
+            .count();
+        assert_eq!(in_hole, 0, "sand in the hole");
+        // The outer ring's edge along the world border does not run across the hole there.
+        let rel = ProcessedRelation {
+            id: 8,
+            tags: [("natural".to_string(), "beach".to_string())].into(),
+            members: vec![
+                member(ProcessedMemberRole::Outer, rect_way(3, 5, 5, 59, 54, &[])),
+                member(ProcessedMemberRole::Inner, rect_way(4, 30, 20, 59, 40, &[])),
+            ],
+        };
+        let cache = FloodFillCache::precompute(&[ProcessedElement::Relation(rel.clone())], None);
+        generate_natural_from_relation(
+            &mut editor,
+            &rel,
+            &args,
+            &cache,
+            &BuildingFootprintBitmap::new_empty(),
+            &surface,
+        );
+        assert!(editor.check_for_block(59, 0, 10, Some(&[SAND])));
+        assert!(
+            !editor.check_for_block(59, 0, 30, Some(&[SAND])),
+            "edge through the hole"
+        );
+    }
+
     fn count(editor: &WorldEditor, y: i32, blocks: &[Block]) -> usize {
         (10..50)
             .flat_map(|x| (10..50).map(move |z| (x, z)))
@@ -957,6 +1017,14 @@ mod tests {
         assert_eq!(count(&gravel, 0, &[GRAVEL]), 1600);
         let sand = render_natural(place, &[("natural", "beach")]);
         assert_eq!(count(&sand, 0, &[SAND]), 1600);
+    }
+
+    #[test]
+    fn a_rock_is_rock_not_grass() {
+        let place = LLBBox::new(54.6, 9.9, 54.61, 9.91).unwrap();
+        let editor = render_natural(place, &[("natural", "rock")]);
+        assert_eq!(count(&editor, 0, &[GRASS_BLOCK]), 0);
+        assert!(count(&editor, 0, &[STONE, ANDESITE, COBBLESTONE]) > 1000);
     }
 
     #[test]
