@@ -68,6 +68,9 @@ pub fn repair_terrain_anomalies(heights: &mut [Vec<f64>], m_per_cell: f64) {
     // At block resolution this is the 6 m / 10 pass behaviour; past a few metres per cell the
     // window covers real landforms, so widen the gate and stop early.
     let abs_threshold = 6.0f64.max(0.25 * m_per_cell);
+    #[cfg(target_os = "android")]
+    let passes = if m_per_cell > 4.0 { 1 } else { 2 };
+    #[cfg(not(target_os = "android"))]
     let passes = if m_per_cell > 4.0 { 2 } else { 10 };
 
     let r = RADIUS as usize;
@@ -2995,6 +2998,38 @@ struct FitRange {
 }
 
 /// Kept in its original arithmetic so default worlds round exactly as before.
+fn apply_fit_in_place(
+    heights: &mut [Vec<f64>],
+    affine: &ElevationAffine,
+    fit: FitRange,
+    upper_clamp: f64,
+) {
+    let base = affine.ground_level as f64;
+    heights.par_iter_mut().for_each(|row| {
+        for h in row.iter_mut() {
+            let relative_height: f64 = if fit.height_range > 0.0 {
+                (*h - affine.min_height_m) / fit.height_range
+            } else {
+                0.0
+            };
+            *h = (base + relative_height * fit.scaled_range).clamp(base, upper_clamp);
+        }
+    });
+}
+
+fn apply_affine_in_place(
+    heights: &mut [Vec<f64>],
+    affine: &ElevationAffine,
+    upper_clamp: f64,
+) {
+    let base = affine.ground_level as f64;
+    heights.par_iter_mut().for_each(|row| {
+        for h in row.iter_mut() {
+            *h = affine.y_for_metres(*h).clamp(base, upper_clamp);
+        }
+    });
+}
+
 fn apply_fit(
     blurred_heights: &[Vec<f64>],
     affine: &ElevationAffine,

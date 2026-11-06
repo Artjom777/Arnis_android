@@ -147,8 +147,6 @@ const SAVED_WITH_PROTOCOL: i32 = 859;
 /// apart from its head, so the dangling pointer is reset by the next insert
 /// before anything reads it. The library reserves 10 handles, so 11 gives 1.
 /// Fixed upstream after 4.0.1; drop this once bedrockrs moves to a fixed release.
-const LEVELDB_MAX_OPEN_FILES: usize = 11;
-
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 static BEDROCK_MAX_FILE_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
@@ -157,29 +155,28 @@ static BEDROCK_CACHE_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
 
 /// Configures LevelDB options for Bedrock export in megabytes.
 pub fn set_bedrock_db_options(max_file_size_mb: usize, write_buffer_mb: usize, cache_mb: usize) {
-    if max_file_size_mb >= 4 {
-        BEDROCK_MAX_FILE_SIZE_MB.store(max_file_size_mb.clamp(4, 512), AtomicOrdering::Relaxed);
+    if max_file_size_mb >= 1 {
+        BEDROCK_MAX_FILE_SIZE_MB.store(max_file_size_mb, AtomicOrdering::Relaxed);
     }
-    if write_buffer_mb >= 4 {
-        BEDROCK_WRITE_BUFFER_SIZE_MB.store(write_buffer_mb.clamp(4, 512), AtomicOrdering::Relaxed);
+    if write_buffer_mb >= 1 {
+        BEDROCK_WRITE_BUFFER_SIZE_MB.store(write_buffer_mb, AtomicOrdering::Relaxed);
     }
-    if cache_mb >= 8 {
-        BEDROCK_CACHE_SIZE_MB.store(cache_mb.clamp(8, 1024), AtomicOrdering::Relaxed);
+    if cache_mb >= 1 {
+        BEDROCK_CACHE_SIZE_MB.store(cache_mb, AtomicOrdering::Relaxed);
     }
 }
 
-/// LevelDB options for writing a Bedrock world. `mcpe_options` sets the
-/// compressors; this adds the workarounds for rusty-leveldb panics.
+/// LevelDB options for Bedrock export with generous capacities and safe eviction.
 fn bedrock_db_options() -> Options {
     let mut opts = mcpe_options(DEFAULT_BEDROCK_COMPRESSION_LEVEL);
     opts.env = Rc::new(Box::new(MonotonicDiskEnv::new()));
-    opts.max_open_files = LEVELDB_MAX_OPEN_FILES;
     let max_file_mb = BEDROCK_MAX_FILE_SIZE_MB.load(AtomicOrdering::Relaxed);
     let write_buffer_mb = BEDROCK_WRITE_BUFFER_SIZE_MB.load(AtomicOrdering::Relaxed);
     let cache_mb = BEDROCK_CACHE_SIZE_MB.load(AtomicOrdering::Relaxed);
-    opts.write_buffer_size = write_buffer_mb.max(4) * 1024 * 1024;
-    opts.max_file_size = max_file_mb.max(4) * 1024 * 1024;
-    opts.block_cache_capacity_bytes = cache_mb.max(8) * 1024 * 1024;
+    opts.write_buffer_size = write_buffer_mb.max(1) * 1024 * 1024;
+    opts.max_file_size = max_file_mb.max(1) * 1024 * 1024;
+    opts.max_open_files = 1000;
+    opts.block_cache_capacity_bytes = cache_mb.max(1) * 1024 * 1024;
     opts
 }
 
@@ -451,6 +448,8 @@ pub struct BedrockWriter {
     mob_spawning: crate::args::MobSpawning,
     size_options: WorldSizeOptions,
     addon: Option<crate::bedrock_addon::Addon>,
+    db: Option<DB>,
+    staging: Option<Staging>,
 }
 
 
@@ -465,6 +464,8 @@ struct BedrockLocalPlayer {
     rotation: Vec<f32>,
     #[serde(rename = "Motion")]
     motion: Vec<f64>,
+    #[serde(rename = "DimensionId")]
+    dimension_id: i32,
     #[serde(rename = "Dimension")]
     dimension: i32,
     #[serde(rename = "SpawnX")]
@@ -504,7 +505,7 @@ impl BedrockWriter {
             append_mcworld_extension(&output_path)
         };
 
-        Self {
+        let mut writer = Self {
             mcworld_path,
             ground_origin: None,
             center_lat: 0.0,
@@ -520,6 +521,94 @@ impl BedrockWriter {
             mob_spawning: crate::args::MobSpawning::Off,
             size_options: WorldSizeOptions::default(),
             addon: None,
+            db: None,
+            staging: None,
+        };
+        writer.cleanup_destination_pngs();
+        writer
+    }
+
+    /// Ensures the LevelDB database in the staging directory is open for streaming writes.
+    pub fn ensure_db_open(&mut self, xzbbox: &XZBBox) -> Result<&mut DB, BedrockSaveError> {
+        if self.db.is_none() {
+            let staging = if self.private_staging_fits(xzbbox) {
+                self.private_staging().or_else(|_| self.staging_beside_archive())?
+            } else {
+                self.staging_beside_archive()?
+            };
+            let db_path = staging.dir.join("db");
+            let mut opts = bedrock_db_options();
+            opts.create_if_missing = true;
+            let db = DB::open(db_path.into_boxed_path(), opts)?;
+            self.db = Some(db);
+            self.staging = Some(staging);
+        }
+        Ok(self.db.as_mut().unwrap())
+    }
+
+    /// Stream a single sealed region directly to LevelDB on disk and release its memory.
+    pub fn flush_single_region(
+        &mut self,
+        region_x: i32,
+        region_z: i32,
+        mut region: super::common::RegionToModify,
+    ) -> Result<(), BedrockSaveError> {
+        let dummy_bbox = XZBBox::default();
+        let db = self.ensure_db_open(&dummy_bbox)?;
+        const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
+        let chunk_coords: Vec<(i32, i32)> = region.chunks.keys().copied().collect();
+        for chunk_coord_batch in chunk_coords.chunks(ENCODE_BATCH_CHUNKS) {
+            let mut chunk_batch: Vec<(i32, i32, super::common::ChunkToModify)> =
+                Vec::with_capacity(chunk_coord_batch.len());
+            for &coord in chunk_coord_batch {
+                if let Some(chunk) = region.chunks.remove(&coord) {
+                    chunk_batch.push((region_x * 32 + coord.0, region_z * 32 + coord.1, chunk));
+                }
+            }
+
+            let encoded: Vec<ChunkRecords> = chunk_batch
+                .iter()
+                .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                .collect::<Result<_, _>>()?;
+
+            drop(chunk_batch);
+
+            for records in encoded {
+                for (key, value) in records {
+                    db.put(&key, &value)
+                        .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Purges any leftover preview map PNG files from destination / download folder
+    pub fn cleanup_destination_pngs(&self) {
+        let parent = self.mcworld_path.parent();
+        let stem = self.mcworld_path.file_stem().and_then(|s| s.to_str()).unwrap_or("arnis_world");
+        Self::cleanup_png_in_dir(parent, stem);
+
+        #[cfg(target_os = "android")]
+        {
+            let download_dir = crate::world_utils::resolve_android_download_dir();
+            Self::cleanup_png_in_dir(Some(&download_dir), stem);
+        }
+    }
+
+    pub fn cleanup_png_in_dir(dir: Option<&Path>, stem: &str) {
+        if let Some(dir) = dir {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        if name.contains("map") || name.starts_with(stem) || name.starts_with("arnis_world") {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -550,21 +639,90 @@ impl BedrockWriter {
     /// Writes the world to disk
     pub fn write_world(
         &mut self,
-        world: &WorldToModify,
+        world: &mut WorldToModify,
         xzbbox: &XZBBox,
         llbbox: &LLBBox,
     ) -> Result<(), BedrockSaveError> {
         self.ground_origin
             .get_or_insert((xzbbox.min_x(), xzbbox.min_z()));
         self.center_lat = (llbbox.min().lat() + llbbox.max().lat()) * 0.5;
+        self.cleanup_destination_pngs();
         self.remove_legacy_staging();
-        let staging = self.stage_world(world, xzbbox, llbbox)?;
+
+        let staging = if let Some(st) = self.staging.take() {
+            let spawn = self.resolve_spawn(world, xzbbox);
+            emit_gui_progress_update(91.0, "Saving Bedrock world...");
+            self.write_level_dat(&st.dir, xzbbox, spawn)?;
+
+            emit_gui_progress_update(92.0, "Saving Bedrock world...");
+            if let Some(mut db) = self.db.take() {
+                let (spawn_x, spawn_z, spawn_y) = spawn;
+                let player = BedrockLocalPlayer {
+                    pos: vec![spawn_x as f64 + 0.5, spawn_y as f64, spawn_z as f64 + 0.5],
+                    rotation: vec![0.0, 0.0],
+                    motion: vec![0.0, 0.0, 0.0],
+                    dimension_id: 0,
+                    dimension: 0,
+                    spawn_x,
+                    spawn_y,
+                    spawn_z,
+                    spawn_dimension: 0,
+                    fall_distance: 0.0,
+                    on_ground: 1,
+                    player_game_mode: self.game_mode.bedrock_game_type(),
+                };
+                if let Ok(player_bytes) = nbtx::to_le_bytes(&player) {
+                    let _ = db.put(b"~local_player", &player_bytes);
+                }
+
+                const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
+                let chunks: Vec<(i32, i32, ChunkToModify)> = world
+                    .regions
+                    .drain()
+                    .flat_map(|((rx, rz), mut region)| {
+                        region
+                            .chunks
+                            .drain()
+                            .map(move |((lx, lz), chunk)| (rx * 32 + lx, rz * 32 + lz, chunk))
+                    })
+                    .collect();
+                for batch in chunks.chunks(ENCODE_BATCH_CHUNKS) {
+                    let encoded: Vec<ChunkRecords> = batch
+                        .iter()
+                        .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                        .collect::<Result<_, _>>()?;
+                    for records in encoded {
+                        for (key, value) in records {
+                            db.put(&key, &value)
+                                .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                        }
+                    }
+                }
+                db.flush()
+                    .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                drop(db);
+            }
+            emit_gui_progress_update(97.0, "Saving Bedrock world...");
+            fs::write(st.dir.join("levelname.txt"), &self.level_name)?;
+            self.write_metadata(&st.dir, world, xzbbox, llbbox)?;
+            st
+        } else {
+            self.stage_world(world, xzbbox, llbbox)?
+        };
+
+        // Free in-memory voxel world chunks and regions now that they are persisted in LevelDB on disk.
+        world.regions.clear();
+        world.regions.shrink_to_fit();
+        crate::world_utils::collect_memory(true);
 
         emit_gui_progress_update(98.0, "Saving Bedrock world...");
         self.package_mcworld(&staging.dir)?;
 
         emit_gui_progress_update(99.0, "Saving Bedrock world...");
         drop(staging);
+        cleanup_orphaned_staging_dirs();
+        self.cleanup_destination_pngs();
+        crate::world_utils::collect_memory(true);
         Ok(())
     }
 
@@ -915,12 +1073,14 @@ impl BedrockWriter {
             // Misc settings
             nether_scale: 8,
             spawn_radius: 0,
+            spawn_radius_camel: 0,
+            spawn_radius_pascal: 0,
             random_tick_speed: 1,
             function_command_limit: 10000,
             max_command_chain_length: 65535,
             server_chunk_tick_range: 4,
-            limited_world_depth: 16,
-            limited_world_width: 16,
+            limited_world_depth: 0,
+            limited_world_width: 0,
             limited_world_origin_x: spawn_x,
             limited_world_origin_y: 64,
             limited_world_origin_z: spawn_z,
@@ -1019,6 +1179,7 @@ impl BedrockWriter {
                 pos: vec![spawn_x as f64 + 0.5, spawn_y as f64, spawn_z as f64 + 0.5],
                 rotation: vec![0.0, 0.0],
                 motion: vec![0.0, 0.0, 0.0],
+                dimension_id: 0,
                 dimension: 0,
                 spawn_x,
                 spawn_y,
@@ -1035,7 +1196,7 @@ impl BedrockWriter {
 
         // Chunks per parallel-encode window. Bounds transient memory (only one window of encoded
         // bytes is held at a time) while giving rayon plenty of work per batch.
-        const ENCODE_BATCH_CHUNKS: usize = 256;
+        const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
 
         // Flatten to absolute-coord chunk refs (cheap — references only). Iteration order matches
         // the original nested loop, so LevelDB receives writes in the same order.
@@ -1518,12 +1679,19 @@ pub fn cleanup_orphaned_staging_dirs() {
     #[cfg(target_os = "android")]
     {
         let download_dir = crate::world_utils::resolve_android_download_dir();
+        let staging_root = download_dir.join(".arnis_bedrock_staging");
+        if staging_root.exists() {
+            let _ = fs::remove_dir_all(&staging_root);
+        }
+        let staging_old = download_dir.join(".arnis_staging");
+        if staging_old.exists() {
+            let _ = fs::remove_dir_all(&staging_old);
+        }
         let candidate_bases = [
             std::env::var_os("TMPDIR").map(PathBuf::from),
             Some(PathBuf::from("/data/data/com.louisdev.arnis/cache")),
             Some(PathBuf::from("/data/user/0/com.louisdev.arnis/cache")),
             dirs::cache_dir(),
-            Some(download_dir.join(".arnis_staging")),
         ];
         for base in candidate_bases.into_iter().flatten() {
             if let Ok(entries) = fs::read_dir(&base) {
@@ -1532,7 +1700,7 @@ pub fn cleanup_orphaned_staging_dirs() {
                     if path.is_dir() {
                         let name = entry.file_name();
                         let name_str = name.to_string_lossy();
-                        if name_str.starts_with("arnis_staging_") || name_str == ".arnis_staging" {
+                        if name_str.starts_with("arnis_staging_") || name_str.starts_with("world-") || name_str == ".arnis_staging" || name_str == ".arnis_bedrock_staging" {
                             let _ = fs::remove_dir_all(&path);
                         }
                     }
@@ -2029,6 +2197,10 @@ struct BedrockLevelDat {
     nether_scale: i32,
     #[serde(rename = "spawnradius")]
     spawn_radius: i32,
+    #[serde(rename = "spawnRadius")]
+    spawn_radius_camel: i32,
+    #[serde(rename = "SpawnRadius")]
+    spawn_radius_pascal: i32,
     #[serde(rename = "randomtickspeed")]
     random_tick_speed: i32,
     #[serde(rename = "functioncommandlimit")]

@@ -1550,6 +1550,14 @@ fn gui_start_generation(
     use progress::emit_gui_error;
     use LLBBox;
 
+    if let (Some(max_f), Some(wb), Some(c)) = (
+        leveldb_max_file_size_mb,
+        leveldb_write_buffer_size_mb,
+        leveldb_cache_size_mb,
+    ) {
+        crate::world_editor::bedrock::set_bedrock_db_options(max_f, wb, c);
+    }
+
     // A One World is resolved inside the worker, once `Args` exist. Refused rather than
     // dropped: `selected_world` is then the saves folder, which a new-world cleanup deletes.
     if let Err(e) = one_world_request(one_world, &world_format, &celestial_body_name) {

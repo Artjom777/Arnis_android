@@ -20,7 +20,7 @@ use crate::progress::{
 #[cfg(feature = "gui")]
 use crate::telemetry::{send_log, LogLevel};
 use crate::tile;
-use crate::world_editor::{FlushWorker, WorldEditor, WorldFormat, WorldStyle};
+use crate::world_editor::{BedrockWriter, FlushWorker, WorldEditor, WorldFormat, WorldStyle};
 use colored::Colorize;
 use fnv::FnvHashMap;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -1398,6 +1398,7 @@ pub fn generate_world_with_options(
     let mut water_borders = crate::water_steps::Borders::default();
     // Background writer for eviction; None unless eviction is active.
     let mut flush_worker: Option<FlushWorker> = None;
+    let mut bedrock_writer: Option<BedrockWriter> = None;
     // The spawn's region is kept resident (never evicted) so the finalize map-item lands on
     // real ground. Resolved exactly like the finalize call; spawn doesn't change during generation.
     // An explicit spawn wins over level.dat, which the CLI only updates after generation.
@@ -1884,6 +1885,9 @@ pub fn generate_world_with_options(
                                     crate::building_facades::flush_region(&mut editor, d.0, d.1);
                                     if let Some(w) = flush_worker.as_ref() {
                                         editor.flush_region_via(w, d.0, d.1)?;
+                                    } else if world_format == WorldFormat::BedrockMcWorld {
+                                        let writer = bedrock_writer.get_or_insert_with(|| editor.create_bedrock_writer());
+                                        editor.flush_bedrock_region_via(writer, d.0, d.1)?;
                                     }
                                     evicted_regions.insert(d);
                                 }
@@ -2235,6 +2239,9 @@ pub fn generate_world_with_options(
             crate::building_facades::flush_region(&mut editor, rx, rz);
             if let Some(w) = flush_worker.as_ref() {
                 editor.flush_region_via(w, rx, rz)?;
+            } else if world_format == WorldFormat::BedrockMcWorld {
+                let writer = bedrock_writer.get_or_insert_with(|| editor.create_bedrock_writer());
+                editor.flush_bedrock_region_via(writer, rx, rz)?;
             }
             evicted_regions.insert((rx, rz));
         }
@@ -2309,11 +2316,20 @@ pub fn generate_world_with_options(
         }
     }
 
+    // Release surface and auxiliary caches before saving
+    editor.release_sealed_surface();
+    crate::world_utils::collect_memory(true);
+
     // Save world
-    if let Err(e) = editor.save() {
+    if let Err(e) = editor.save_with_bedrock_writer(bedrock_writer) {
         // The panels were waiting for the pack this save was going to make a
         // world for; without one they are only memory.
         crate::mapillary::displays::discard();
+        #[cfg(target_os = "android")]
+        {
+            let log_entry = format!("EDITOR SAVE ERROR: {e}\n");
+            crate::world_utils::write_android_crash_log(&log_entry);
+        }
         return Err(e.to_string());
     }
     bench.mark("save");

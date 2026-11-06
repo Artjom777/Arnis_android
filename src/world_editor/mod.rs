@@ -2608,6 +2608,52 @@ impl<'a> WorldEditor<'a> {
         )
     }
 
+    /// Creates a BedrockWriter configured for this world's output directory and settings.
+    pub(crate) fn create_bedrock_writer(&self) -> BedrockWriter {
+        let level_name = self.bedrock_level_name.clone().unwrap_or_else(|| {
+            self.world_dir
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Arnis World")
+                .to_string()
+        });
+        BedrockWriter::new(
+            self.world_dir.clone(),
+            level_name,
+            self.bedrock_spawn_point,
+            self.ground.clone(),
+            self.bedrock_extend_height,
+            self.projection.clone(),
+            self.scale,
+            self.game_mode,
+            self.world_time,
+            self.start_with_map,
+        )
+        .with_addon(self.bedrock_addon.clone())
+        .with_mob_spawning(self.mob_spawning)
+    }
+
+    /// Evict one Bedrock region (stream-to-disk): encode its chunks and write them directly
+    /// into the staging LevelDB, then drop the region to keep resident memory flat.
+    pub(crate) fn flush_bedrock_region_via(
+        &mut self,
+        writer: &mut BedrockWriter,
+        rx: i32,
+        rz: i32,
+    ) -> Result<bool, String> {
+        if self.format != WorldFormat::BedrockMcWorld {
+            return Ok(false);
+        }
+        let Some(region) = self.world.regions.remove(&(rx, rz)) else {
+            return Ok(false);
+        };
+        writer
+            .flush_single_region(rx, rz, region)
+            .map_err(|e| format!("Failed to flush Bedrock region ({rx}, {rz}): {e:?}"))?;
+        self.flushed_regions.insert((rx, rz));
+        Ok(true)
+    }
+
     /// Saves all changes made to the world by writing to the appropriate format.
     ///
     /// Returns `Err` on I/O failure so callers can abort the generation pipeline
@@ -2615,6 +2661,15 @@ impl<'a> WorldEditor<'a> {
     /// before returning so the GUI is notified regardless of how the caller handles
     /// the `Result`.
     pub fn save(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.save_with_bedrock_writer(None)
+    }
+
+    /// Saves all changes made to the world by writing to the appropriate format,
+    /// optionally reusing an in-progress BedrockWriter that has already ingested streamed regions.
+    pub fn save_with_bedrock_writer(
+        &mut self,
+        existing_bedrock_writer: Option<BedrockWriter>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!(
             "Generating world for: {}",
             match self.format {
@@ -2627,6 +2682,7 @@ impl<'a> WorldEditor<'a> {
         // Compact sections before saving: collapses uniform mixed sections back to
         // Uniform and repacks any overflowed direct sections that fit a palette again.
         self.world.compact_sections();
+        crate::world_utils::collect_memory(false);
 
         // Non-Java formats have no per-region write hook, so feed the preview here.
         if self.format != WorldFormat::JavaAnvil {
@@ -2638,6 +2694,20 @@ impl<'a> WorldEditor<'a> {
                     .for_each(|(&(rx, rz), region)| preview.ingest_region(rx, rz, region));
             }
         }
+
+        // Drop auxiliary structures and masks not needed for world serialization
+        self.tree_pack = None;
+        self.sealed_surface = None;
+        self.mapped_trunks = None;
+        self.road_surface_overrides.clear();
+        self.road_surface_overrides.shrink_to_fit();
+        self.support_columns.clear();
+        self.support_columns.shrink_to_fit();
+        self.flushed_regions.clear();
+        self.flushed_regions.shrink_to_fit();
+        self.preview = None;
+
+        crate::world_utils::collect_memory(true);
 
         match self.format {
             WorldFormat::JavaAnvil => {
@@ -2655,7 +2725,7 @@ impl<'a> WorldEditor<'a> {
                 self.finish_voxy();
                 self.finish_dh();
             }
-            WorldFormat::BedrockMcWorld => self.save_bedrock()?,
+            WorldFormat::BedrockMcWorld => self.save_bedrock(existing_bedrock_writer)?,
             WorldFormat::LuantiWorld => {
                 if let Err(e) = luanti::save_luanti_world(
                     &self.world,
@@ -2733,11 +2803,37 @@ impl<'a> WorldEditor<'a> {
         }
     }
 
-    fn save_bedrock(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn save_bedrock(
+        &mut self,
+        existing_writer: Option<BedrockWriter>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("{} Saving Bedrock world...", "[7/7]".bold());
         emit_gui_progress_update(90.0, "Saving Bedrock world...");
 
-        if let Err(error) = self.save_bedrock_internal() {
+        // Release all auxiliary caches and data structures not needed for Bedrock export
+        self.preview = None;
+        self.tree_pack = None;
+        self.sealed_surface = None;
+        self.mapped_trunks = None;
+        self.signage = None;
+        self.voxy = None;
+        self.dh = None;
+        self.road_surface_overrides.clear();
+        self.road_surface_overrides.shrink_to_fit();
+        self.support_columns.clear();
+        self.support_columns.shrink_to_fit();
+        self.frame_cells.clear();
+        self.frame_cells.shrink_to_fit();
+
+        crate::world_utils::collect_memory(true);
+
+        let res = if let Some(mut writer) = existing_writer {
+            writer.write_world(&mut self.world, self.xzbbox, &self.llbbox)
+        } else {
+            self.save_bedrock_internal()
+        };
+
+        if let Err(error) = res {
             // The GUI shows this again and cuts it at 35 characters, so the cause leads.
             let user_msg = format!("Bedrock save: {} ({error})", error.reason());
             eprintln!("{user_msg}");
@@ -2776,7 +2872,7 @@ impl<'a> WorldEditor<'a> {
         .with_size_options(self.size_options)
         .with_mob_spawning(self.mob_spawning)
         .with_addon(self.bedrock_addon.take())
-        .write_world(&self.world, self.xzbbox, &self.llbbox)
+        .write_world(&mut self.world, self.xzbbox, &self.llbbox)
     }
 
     /// Saves world metadata to a JSON file
