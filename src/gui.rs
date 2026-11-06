@@ -1744,53 +1744,6 @@ fn gui_start_generation(
                 }
             };
 
-            // Determine output path and level name based on format
-            let (generation_path, level_name) = match world_format {
-                WorldFormat::JavaAnvil => {
-                    // Java: use the selected world path, add localized name if new
-                    let updated_path = if is_new_world {
-                        add_localized_world_name(world_path.clone(), &bbox, celestial_body)
-                    } else {
-                        world_path.clone()
-                    };
-                    (updated_path, None)
-                }
-                WorldFormat::BedrockMcWorld => {
-                    // Bedrock: generate .mcworld in the configured directory
-                    let custom_name = if !selected_world.trim().is_empty() {
-                        Some(selected_world.as_str())
-                    } else {
-                        None
-                    };
-                    let (output_path, lvl_name) = crate::world_utils::build_bedrock_output_with_name(
-                        &bbox,
-                        bedrock_output_dir,
-                        celestial_body,
-                        custom_name,
-                    );
-                    progress::emit_world_name_update(&lvl_name);
-                    (output_path, Some(lvl_name))
-                }
-                WorldFormat::LuantiWorld => {
-                    let worlds_dir = luanti_output_dir.clone();
-                    let _ = std::fs::create_dir_all(&worlds_dir);
-                    let mut counter = 1;
-                    let world_name = loop {
-                        let candidate = format!("Arnis Luanti World {counter}");
-                        if !worlds_dir.join(&candidate).exists() {
-                            break candidate;
-                        }
-                        counter += 1;
-                    };
-                    let luanti_path = worlds_dir.join(&world_name);
-                    println!(
-                        "Creating Luanti world at: {}",
-                        luanti_path.display().to_string().bright_white().bold()
-                    );
-                    (luanti_path, Some(world_name))
-                }
-            };
-
             // The toggle lets the terrain fit extend the build height where the area needs it,
             // in a world this run creates. A world that already exists keeps the height it
             // has, and a One World is sent the height it keeps.
@@ -1991,10 +1944,16 @@ fn gui_start_generation(
                 }
                 WorldFormat::BedrockMcWorld => {
                     // Bedrock: generate .mcworld in the configured directory
-                    let (output_path, lvl_name) = crate::world_utils::build_bedrock_output(
+                    let custom_name = if !selected_world.trim().is_empty() {
+                        Some(selected_world.as_str())
+                    } else {
+                        None
+                    };
+                    let (output_path, lvl_name) = crate::world_utils::build_bedrock_output_with_name(
                         &bbox,
                         bedrock_output_dir,
                         celestial_body,
+                        custom_name,
                     );
                     progress::emit_world_name_update(&lvl_name);
                     (output_path, Some(lvl_name))
