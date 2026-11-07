@@ -3017,25 +3017,6 @@ fn apply_fit_in_place(
     });
 }
 
-fn apply_fit_in_place(
-    heights: &mut [Vec<f64>],
-    affine: &ElevationAffine,
-    fit: FitRange,
-    upper_clamp: f64,
-) {
-    let base = affine.ground_level as f64;
-    heights.par_iter_mut().for_each(|row| {
-        for h in row.iter_mut() {
-            let relative_height: f64 = if fit.height_range > 0.0 {
-                (*h - affine.min_height_m) / fit.height_range
-            } else {
-                0.0
-            };
-            *h = (base + relative_height * fit.scaled_range).clamp(base, upper_clamp);
-        }
-    });
-}
-
 fn apply_affine_in_place(
     heights: &mut [Vec<f64>],
     affine: &ElevationAffine,

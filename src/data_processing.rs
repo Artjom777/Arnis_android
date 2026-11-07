@@ -1411,14 +1411,16 @@ pub fn generate_world_with_options(
     });
 
     // Decide between sequential and parallel processing based on world size.
-    // Tile subdivision is aligned to 512-block Minecraft region boundaries.
-    let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
+    // Tile size is configurable (clamped to a minimum of 16 blocks, multiples of 16).
+    let tile_size = args.tile_size.max(16);
+    let tiles = tile::create_tiles(&xzbbox, tile_size);
 
-    // Tile editors are created as JavaAnvil (WorldEditor::new), so their
-    // format-dependent block-entity schema (banners) only matches Java output.
-    // Restrict the parallel tile path to Java; Bedrock/Luanti large worlds use
-    // the sequential path (correct, just not tile-parallel).
-    let use_parallel_tiles = tiles.len() >= 3 && matches!(world_format, WorldFormat::JavaAnvil);
+    // If tiled_generation is enabled (default) and there are 2 or more tiles,
+    // process the world in parts (tiles) and assemble them into 1 world.
+    // Supported on JavaAnvil and BedrockMcWorld.
+    let use_parallel_tiles = args.tiled_generation
+        && tiles.len() >= 2
+        && matches!(world_format, WorldFormat::JavaAnvil | WorldFormat::BedrockMcWorld);
 
     if use_parallel_tiles {
         // Large area: process tiles in parallel using rayon.
@@ -1443,17 +1445,30 @@ pub fn generate_world_with_options(
         );
 
         // Stream-to-disk: flush+evict each region once its owner + 8 neighbour tiles merge.
-        // Java only; regions a 3D placement still needs stay until it has gone in.
+        // Auto-enabled when the resident world would crowd available RAM or user-configured limit.
         // Read at the decision point: the precompute above allocates heavily, and an
         // optimistic figure would size the thread pools past what is free.
-        let available_mb = available_memory_mb();
-        let tile_batch_size =
-            tile_processing_threads(rayon::current_num_threads(), available_mb, args.fillground);
+        let available_mb = if args.ram_limit_mb > 0 {
+            args.ram_limit_mb
+        } else {
+            available_memory_mb()
+        };
+        let max_concurrency = if args.ram_limit_mb > 0 && args.ram_limit_mb <= 2048 {
+            1
+        } else if args.ram_limit_mb > 0 && args.ram_limit_mb <= 4096 {
+            2
+        } else if cfg!(target_os = "android") {
+            (rayon::current_num_threads().saturating_sub(2)).clamp(1, 4)
+        } else {
+            tile_processing_threads(rayon::current_num_threads(), available_mb, args.fillground)
+        };
+        let tile_batch_size = max_concurrency;
         println!(
-            "  Processing {} tiles across {tile_batch_size} threads...",
+            "  Processing {} tiles across {tile_batch_size} threads (tile size: {tile_size}x{tile_size})...",
             tiles.len()
         );
-        eviction_active = matches!(world_format, WorldFormat::JavaAnvil) && should_stream_to_disk();
+        eviction_active = (matches!(world_format, WorldFormat::JavaAnvil) && should_stream_to_disk())
+            || matches!(world_format, WorldFormat::BedrockMcWorld);
 
         let region_of_tile: Vec<(i32, i32)> =
             tiles.iter().map(|t| (t.min_x >> 9, t.min_z >> 9)).collect();
@@ -1558,7 +1573,15 @@ pub fn generate_world_with_options(
             )
             .expect("Failed to create tile XZBBox");
 
-            let mut tile_editor = WorldEditor::new(PathBuf::new(), &tile_xzbbox, llbbox);
+            let mut tile_editor = WorldEditor::new_with_format_and_name(
+                PathBuf::new(),
+                &tile_xzbbox,
+                llbbox,
+                world_format,
+                options.level_name.clone(),
+                options.spawn_point,
+                args.disable_height_limit,
+            );
             tile_editor.set_ground(Arc::clone(&ground));
             tile_editor.set_water_field(Arc::clone(&big_water_field));
             tile_editor.set_ground_origin(xzbbox.min_x(), xzbbox.min_z());
@@ -1726,13 +1749,17 @@ pub fn generate_world_with_options(
 
             let tile_road_overrides = tile_editor.take_road_surface_overrides();
 
-            // Emit on whole-percent steps only; the monotonic clamp
-            // reconciles these with the merge-side emits.
+            // Emit progress with tile counters so the user sees live tile completion
             let placed = tiles_placed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if (placed * 50 / total_tiles) != ((placed - 1) * 50 / total_tiles) {
-                let pct = 20.0 + (placed as f64 / total_tiles as f64) * 50.0;
-                emit_gui_progress_update_ex(pct, "Generating area...", eviction_active);
-            }
+            let pct = 20.0 + (placed as f64 / total_tiles as f64) * 25.0;
+            let msg = format!("Generating part {placed}/{total_tiles}...");
+            crate::progress::emit_gui_progress_update_tiled(
+                pct,
+                &msg,
+                eviction_active,
+                Some(placed),
+                Some(total_tiles),
+            );
 
             (
                 tile_idx,
@@ -1906,14 +1933,17 @@ pub fn generate_world_with_options(
                             tunnel_cells.extend(tile_tunnel_cells);
                         }
 
-                        // Step 20%->70% per merged tile, throttled to whole-percent steps.
+                        // Step 45%->70% per merged tile.
                         tiles_merged += 1;
-                        let pct = 20.0 + (tiles_merged as f64 / total_tiles as f64) * 50.0;
-                        if pct - last_emitted_pct >= 1.0 {
-                            emit_gui_progress_update_ex(pct, "Generating area...", eviction_active);
-                            last_emitted_pct = pct;
-                        }
-                        // Shaping is reported on its own line.
+                        let pct = 45.0 + (tiles_merged as f64 / total_tiles as f64) * 25.0;
+                        let msg = format!("Assembling part {tiles_merged}/{total_tiles} into 1 world...");
+                        crate::progress::emit_gui_progress_update_tiled(
+                            pct,
+                            &msg,
+                            eviction_active,
+                            Some(tiles_merged),
+                            Some(total_tiles),
+                        );
                         merge_dur += merge_start
                             .elapsed()
                             .saturating_sub(water_steps_dur - shaped_before);
@@ -1921,6 +1951,10 @@ pub fn generate_world_with_options(
                         next_merge += 1;
                         *gate.0.lock().unwrap_or_else(|p| p.into_inner()) = next_merge;
                         gate.1.notify_all();
+
+                        if cfg!(target_os = "android") || args.ram_limit_mb > 0 {
+                            crate::world_utils::collect_memory(true);
+                        }
                     }
                 }
                 Ok(())
