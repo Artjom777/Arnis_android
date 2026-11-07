@@ -3017,6 +3017,25 @@ fn apply_fit_in_place(
     });
 }
 
+fn apply_fit_in_place(
+    heights: &mut [Vec<f64>],
+    affine: &ElevationAffine,
+    fit: FitRange,
+    upper_clamp: f64,
+) {
+    let base = affine.ground_level as f64;
+    heights.par_iter_mut().for_each(|row| {
+        for h in row.iter_mut() {
+            let relative_height: f64 = if fit.height_range > 0.0 {
+                (*h - affine.min_height_m) / fit.height_range
+            } else {
+                0.0
+            };
+            *h = (base + relative_height * fit.scaled_range).clamp(base, upper_clamp);
+        }
+    });
+}
+
 fn apply_affine_in_place(
     heights: &mut [Vec<f64>],
     affine: &ElevationAffine,
@@ -3028,6 +3047,140 @@ fn apply_affine_in_place(
             *h = affine.y_for_metres(*h).clamp(base, upper_clamp);
         }
     });
+}
+
+pub fn scale_to_minecraft_in_place(
+    heights: &mut [Vec<f64>],
+    scale: f64,
+    ground_level: i32,
+    min_ground_level: i32,
+    disable_height_limit: bool,
+    extended_max_y: i32,
+    policy: AffinePolicy,
+    top_reserve: i32,
+) -> ElevationAffine {
+    let ceiling = terrain_ceiling(disable_height_limit, extended_max_y);
+    let upper_clamp = ceiling as f64;
+
+    let mut fit = None;
+    let affine = match policy {
+        AffinePolicy::Fit => {
+            let (affine, range) = derive_affine(
+                heights,
+                scale,
+                ground_level,
+                min_ground_level,
+                disable_height_limit,
+                extended_max_y,
+                top_reserve,
+            );
+            fit = Some(range);
+            affine
+        }
+        AffinePolicy::FitWithHeadroom => {
+            let (mut affine, range) = derive_affine(
+                heights,
+                scale,
+                ground_level,
+                min_ground_level,
+                disable_height_limit,
+                extended_max_y,
+                top_reserve,
+            );
+            if affine.blocks_per_meter <= 0.0 {
+                affine.blocks_per_meter = scale;
+            }
+            let margin_blocks = headroom_margin(
+                ceiling - top_reserve,
+                affine.ground_level,
+                range.scaled_range,
+            );
+            if margin_blocks > 0.0 {
+                affine.min_height_m -= margin_blocks / affine.blocks_per_meter;
+                eprintln!(
+                    "One World: keeping {} blocks below the lowest terrain for neighbouring areas",
+                    margin_blocks as i32
+                );
+            }
+            affine
+        }
+        AffinePolicy::Fixed(affine) => {
+            eprintln!(
+                "One World: using the world's elevation mapping (1 block = {:.2} m, {:.0} m at Y {}{})",
+                if affine.blocks_per_meter > 0.0 {
+                    1.0 / affine.blocks_per_meter
+                } else {
+                    f64::INFINITY
+                },
+                affine.min_height_m,
+                affine.ground_level,
+                match affine.soft_top {
+                    Some(top) => format!(", compressed above {:.0} m", top.knee_m),
+                    None => String::new(),
+                }
+            );
+            affine
+        }
+    };
+
+    if let AffinePolicy::Fixed(_) = policy {
+        let base = affine.ground_level as f64;
+        let (clamped, total) = heights
+            .par_iter()
+            .map(|row| {
+                let mut c = 0usize;
+                let mut n = 0usize;
+                for &h in row {
+                    if h.is_finite() {
+                        n += 1;
+                        let y = affine.y_for_metres(h);
+                        if (y < base && h > LOWEST_LAND_M) || y > upper_clamp {
+                            c += 1;
+                        }
+                    }
+                }
+                (c, n)
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        if total > 0 && clamped * 200 > total {
+            let pct = clamped as f64 * 100.0 / total as f64;
+            eprintln!(
+                "Warning: {pct:.1}% of this area lies outside the world's height band (Y {} to {}) and is flattened there.{}",
+                affine.ground_level,
+                upper_clamp as i32,
+                if disable_height_limit {
+                    ""
+                } else {
+                    " The band was fixed by the first area; a new One World has room for all of Earth."
+                }
+            );
+            crate::progress::emit_gui_progress_update(
+                crate::progress::MESSAGE_ONLY,
+                &format!("Note: {pct:.0}% of the area exceeds the world's height band"),
+            );
+        }
+    }
+
+    match fit {
+        Some(range) => apply_fit_in_place(heights, &affine, range, upper_clamp),
+        None => apply_affine_in_place(heights, &affine, upper_clamp),
+    }
+
+    let top = match fit {
+        Some(range) => affine.ground_level as f64 + range.scaled_range,
+        None => heights
+            .par_iter()
+            .map(|row| row.iter().cloned().fold(f64::MIN, f64::max))
+            .reduce(|| f64::MIN, f64::max),
+    };
+    let top = if top.is_finite() {
+        top
+    } else {
+        affine.ground_level as f64
+    };
+    crate::world_editor::common::set_terrain_top_y(top.min(upper_clamp).round() as i32);
+
+    affine
 }
 
 fn apply_fit(
@@ -3104,132 +3257,18 @@ pub fn scale_to_minecraft_reserving(
     policy: AffinePolicy,
     top_reserve: i32,
 ) -> (Vec<Vec<f64>>, ElevationAffine) {
-    let ceiling = terrain_ceiling(disable_height_limit, extended_max_y);
-    let upper_clamp = ceiling as f64;
-
-    let mut fit = None;
-    let affine = match policy {
-        AffinePolicy::Fit => {
-            let (affine, range) = derive_affine(
-                blurred_heights,
-                scale,
-                ground_level,
-                min_ground_level,
-                disable_height_limit,
-                extended_max_y,
-                top_reserve,
-            );
-            fit = Some(range);
-            affine
-        }
-        AffinePolicy::FitWithHeadroom => {
-            let (mut affine, range) = derive_affine(
-                blurred_heights,
-                scale,
-                ground_level,
-                min_ground_level,
-                disable_height_limit,
-                extended_max_y,
-                top_reserve,
-            );
-            // A flat first area chose no slope; later areas need one.
-            if affine.blocks_per_meter <= 0.0 {
-                affine.blocks_per_meter = scale;
-            }
-            // Measured under the reserved ceiling, or the lift would fill the models' room.
-            let margin_blocks = headroom_margin(
-                ceiling - top_reserve,
-                affine.ground_level,
-                range.scaled_range,
-            );
-            if margin_blocks > 0.0 {
-                affine.min_height_m -= margin_blocks / affine.blocks_per_meter;
-                eprintln!(
-                    "One World: keeping {} blocks below the lowest terrain for neighbouring areas",
-                    margin_blocks as i32
-                );
-            }
-            affine
-        }
-        AffinePolicy::Fixed(affine) => {
-            eprintln!(
-                "One World: using the world's elevation mapping (1 block = {:.2} m, {:.0} m at Y {}{})",
-                if affine.blocks_per_meter > 0.0 {
-                    1.0 / affine.blocks_per_meter
-                } else {
-                    f64::INFINITY
-                },
-                affine.min_height_m,
-                affine.ground_level,
-                match affine.soft_top {
-                    Some(top) => format!(", compressed above {:.0} m", top.knee_m),
-                    None => String::new(),
-                }
-            );
-            affine
-        }
-    };
-
-    let mc_heights = match fit {
-        Some(range) => apply_fit(blurred_heights, &affine, range, upper_clamp),
-        None => apply_affine(blurred_heights, &affine, upper_clamp),
-    };
-
-    if let AffinePolicy::Fixed(_) = policy {
-        let base = affine.ground_level as f64;
-        let (clamped, total) = blurred_heights
-            .par_iter()
-            .map(|row| {
-                let mut c = 0usize;
-                let mut n = 0usize;
-                for &h in row {
-                    if h.is_finite() {
-                        n += 1;
-                        let y = affine.y_for_metres(h);
-                        // Anything below the lowest land is sea floor, under water anyway.
-                        if (y < base && h > LOWEST_LAND_M) || y > upper_clamp {
-                            c += 1;
-                        }
-                    }
-                }
-                (c, n)
-            })
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-        if total > 0 && clamped * 200 > total {
-            let pct = clamped as f64 * 100.0 / total as f64;
-            eprintln!(
-                "Warning: {pct:.1}% of this area lies outside the world's height band (Y {} to {}) and is flattened there.{}",
-                affine.ground_level,
-                upper_clamp as i32,
-                if disable_height_limit {
-                    ""
-                } else {
-                    " The band was fixed by the first area; a new One World has room for all of Earth."
-                }
-            );
-            crate::progress::emit_gui_progress_update(
-                crate::progress::MESSAGE_ONLY,
-                &format!("Note: {pct:.0}% of the area exceeds the world's height band"),
-            );
-        }
-    }
-
-    // The map preview shades over the band the terrain fills, so publish where it ended up.
-    let top = match fit {
-        Some(range) => affine.ground_level as f64 + range.scaled_range,
-        None => mc_heights
-            .par_iter()
-            .map(|row| row.iter().cloned().fold(f64::MIN, f64::max))
-            .reduce(|| f64::MIN, f64::max),
-    };
-    let top = if top.is_finite() {
-        top
-    } else {
-        affine.ground_level as f64
-    };
-    crate::world_editor::common::set_terrain_top_y(top.min(upper_clamp).round() as i32);
-
-    (mc_heights, affine)
+    let mut heights = blurred_heights.to_vec();
+    let affine = scale_to_minecraft_in_place(
+        &mut heights,
+        scale,
+        ground_level,
+        min_ground_level,
+        disable_height_limit,
+        extended_max_y,
+        policy,
+        top_reserve,
+    );
+    (heights, affine)
 }
 
 #[cfg(test)]
