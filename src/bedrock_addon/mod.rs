@@ -79,6 +79,7 @@ pub struct Body {
     pub shapes: Vec<Shape>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Pack {
     pub id: String,
     pub folder: &'static str,
@@ -86,6 +87,7 @@ pub struct Pack {
     pub files: Vec<(String, Vec<u8>)>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Addon {
     pub behavior: Pack,
     pub resources: Pack,

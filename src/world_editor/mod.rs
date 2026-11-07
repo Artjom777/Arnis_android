@@ -2629,6 +2629,8 @@ impl<'a> WorldEditor<'a> {
             self.world_time,
             self.start_with_map,
         )
+        .with_ground_origin((self.ground_origin_x, self.ground_origin_z))
+        .with_size_options(self.size_options)
         .with_addon(self.bedrock_addon.clone())
         .with_mob_spawning(self.mob_spawning)
     }

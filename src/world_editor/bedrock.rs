@@ -429,17 +429,20 @@ struct BedrockBlockState {
     version: i32,
 }
 
+/// Thread-safe encoder for Bedrock chunk records and biomes
+#[derive(Clone)]
+pub struct BedrockChunkEncoder {
+    pub ground_origin: Option<(i32, i32)>,
+    pub center_lat: f64,
+    pub ground: Option<Arc<Ground>>,
+    pub extend_build_height: bool,
+}
+
 /// Writer for Bedrock Edition worlds
 pub struct BedrockWriter {
     mcworld_path: PathBuf,
-    /// World position of the ground grid's first cell; the area's corner when unset.
-    ground_origin: Option<(i32, i32)>,
-    /// Latitude of the area's centre, which picks temperate biome variants.
-    center_lat: f64,
     level_name: String,
     spawn_point: Option<(i32, i32)>,
-    ground: Option<Arc<Ground>>,
-    extend_build_height: bool,
     projection: String,
     scale: f64,
     game_mode: crate::args::GameMode,
@@ -448,6 +451,7 @@ pub struct BedrockWriter {
     mob_spawning: crate::args::MobSpawning,
     size_options: WorldSizeOptions,
     addon: Option<crate::bedrock_addon::Addon>,
+    pub encoder: BedrockChunkEncoder,
     db: Option<DB>,
     staging: Option<Staging>,
 }
@@ -505,14 +509,17 @@ impl BedrockWriter {
             append_mcworld_extension(&output_path)
         };
 
-        let mut writer = Self {
-            mcworld_path,
+        let encoder = BedrockChunkEncoder {
             ground_origin: None,
             center_lat: 0.0,
-            level_name,
-            spawn_point,
             ground,
             extend_build_height,
+        };
+
+        let writer = Self {
+            mcworld_path,
+            level_name,
+            spawn_point,
             projection,
             scale,
             game_mode,
@@ -521,6 +528,7 @@ impl BedrockWriter {
             mob_spawning: crate::args::MobSpawning::Off,
             size_options: WorldSizeOptions::default(),
             addon: None,
+            encoder,
             db: None,
             staging: None,
         };
@@ -529,13 +537,9 @@ impl BedrockWriter {
     }
 
     /// Ensures the LevelDB database in the staging directory is open for streaming writes.
-    pub fn ensure_db_open(&mut self, xzbbox: &XZBBox) -> Result<&mut DB, BedrockSaveError> {
+    pub fn ensure_db_open(&mut self) -> Result<&mut DB, BedrockSaveError> {
         if self.db.is_none() {
-            let staging = if self.private_staging_fits(xzbbox) {
-                self.private_staging().or_else(|_| self.staging_beside_archive())?
-            } else {
-                self.staging_beside_archive()?
-            };
+            let staging = self.staging_beside_archive()?;
             let db_path = staging.dir.join("db");
             let mut opts = bedrock_db_options();
             opts.create_if_missing = true;
@@ -551,32 +555,28 @@ impl BedrockWriter {
         &mut self,
         region_x: i32,
         region_z: i32,
-        mut region: super::common::RegionToModify,
+        region: super::common::RegionToModify,
     ) -> Result<(), BedrockSaveError> {
-        let dummy_bbox = XZBBox::default();
-        let db = self.ensure_db_open(&dummy_bbox)?;
+        let db = self.ensure_db_open()?;
         const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
-        let chunk_coords: Vec<(i32, i32)> = region.chunks.keys().copied().collect();
-        for chunk_coord_batch in chunk_coords.chunks(ENCODE_BATCH_CHUNKS) {
-            let mut chunk_batch: Vec<(i32, i32, super::common::ChunkToModify)> =
-                Vec::with_capacity(chunk_coord_batch.len());
-            for &coord in chunk_coord_batch {
-                if let Some(chunk) = region.chunks.remove(&coord) {
-                    chunk_batch.push((region_x * 32 + coord.0, region_z * 32 + coord.1, chunk));
-                }
-            }
-
+        let entries: Vec<((i32, i32), super::common::ChunkToModify)> =
+            region.chunks.into_entries().collect();
+        let encoder = &self.encoder;
+        for chunk_batch in entries.chunks(ENCODE_BATCH_CHUNKS) {
             let encoded: Vec<ChunkRecords> = chunk_batch
-                .iter()
-                .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                .par_iter()
+                .map(|&((coord_x, coord_z), ref chunk)| {
+                    encoder.encode_chunk_records(
+                        region_x * 32 + coord_x,
+                        region_z * 32 + coord_z,
+                        chunk,
+                    )
+                })
                 .collect::<Result<_, _>>()?;
-
-            drop(chunk_batch);
 
             for records in encoded {
                 for (key, value) in records {
-                    db.put(&key, &value)
-                        .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                    db.put(&key, &value)?;
                 }
             }
         }
@@ -620,7 +620,7 @@ impl BedrockWriter {
 
     /// Where the ground grid starts, which the biomes and the spawn height read it from.
     pub fn with_ground_origin(mut self, origin: (i32, i32)) -> Self {
-        self.ground_origin = Some(origin);
+        self.encoder.ground_origin = Some(origin);
         self
     }
 
@@ -643,9 +643,10 @@ impl BedrockWriter {
         xzbbox: &XZBBox,
         llbbox: &LLBBox,
     ) -> Result<(), BedrockSaveError> {
-        self.ground_origin
+        self.encoder
+            .ground_origin
             .get_or_insert((xzbbox.min_x(), xzbbox.min_z()));
-        self.center_lat = (llbbox.min().lat() + llbbox.max().lat()) * 0.5;
+        self.encoder.center_lat = (llbbox.min().lat() + llbbox.max().lat()) * 0.5;
         self.cleanup_destination_pngs();
         self.remove_legacy_staging();
 
@@ -679,27 +680,28 @@ impl BedrockWriter {
                 let chunks: Vec<(i32, i32, ChunkToModify)> = world
                     .regions
                     .drain()
-                    .flat_map(|((rx, rz), mut region)| {
+                    .flat_map(|((rx, rz), region)| {
                         region
                             .chunks
-                            .drain()
+                            .into_entries()
                             .map(move |((lx, lz), chunk)| (rx * 32 + lx, rz * 32 + lz, chunk))
                     })
                     .collect();
+                let encoder = &self.encoder;
                 for batch in chunks.chunks(ENCODE_BATCH_CHUNKS) {
                     let encoded: Vec<ChunkRecords> = batch
-                        .iter()
-                        .map(|(abs_x, abs_z, chunk)| self.encode_chunk_records(*abs_x, *abs_z, chunk))
+                        .par_iter()
+                        .map(|&(abs_x, abs_z, ref chunk)| {
+                            encoder.encode_chunk_records(abs_x, abs_z, chunk)
+                        })
                         .collect::<Result<_, _>>()?;
                     for records in encoded {
                         for (key, value) in records {
-                            db.put(&key, &value)
-                                .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                            db.put(&key, &value)?;
                         }
                     }
                 }
-                db.flush()
-                    .map_err(|e| BedrockSaveError::Database(format!("{:?}", e)))?;
+                db.flush()?;
                 drop(db);
             }
             emit_gui_progress_update(97.0, "Saving Bedrock world...");
@@ -772,12 +774,13 @@ impl BedrockWriter {
             let sz = user_z;
 
             let (origin_x, origin_z) = self
+                .encoder
                 .ground_origin
                 .unwrap_or((xzbbox.min_x(), xzbbox.min_z()));
             let rel_x = sx - origin_x;
             let rel_z = sz - origin_z;
             let coord = crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z);
-            let ground_lvl = self.ground.as_ref().map(|g| g.level(coord)).unwrap_or(-60);
+            let ground_lvl = self.encoder.ground.as_ref().map(|g| g.level(coord)).unwrap_or(-60);
 
             let mut highest_solid_y = None;
             for y in (ground_lvl.max(-60)..=318).rev() {
@@ -801,12 +804,13 @@ impl BedrockWriter {
             let max_z = xzbbox.max_z().max(min_z);
 
             let (origin_x, origin_z) = self
+                .encoder
                 .ground_origin
                 .unwrap_or((xzbbox.min_x(), xzbbox.min_z()));
             let rel_0_x = 0 - origin_x;
             let rel_0_z = 0 - origin_z;
             let coord_0 = crate::coordinate_system::cartesian::XZPoint::new(rel_0_x, rel_0_z);
-            let ground_lvl = self.ground.as_ref().map(|g| g.level(coord_0)).unwrap_or(-60);
+            let ground_lvl = self.encoder.ground.as_ref().map(|g| g.level(coord_0)).unwrap_or(-60);
 
             let mut best_coord = None;
             let max_search_r = max_x.max(max_z).min(2048).max(16);
@@ -909,7 +913,7 @@ impl BedrockWriter {
         };
         let km2 = xzbbox.bounding_rect().total_blocks() as f64 / 1e6;
         let options = WorldSizeOptions {
-            tall: self.extend_build_height,
+            tall: self.encoder.extend_build_height,
             ..self.size_options
         };
         let bound = estimated_world_bytes(km2, super::WorldFormat::BedrockMcWorld, options);
@@ -1229,11 +1233,12 @@ impl BedrockWriter {
         // Encode each window's chunk records in parallel (CPU-bound), then write them to LevelDB
         // sequentially — rusty_leveldb writes aren't concurrent-safe. Records are byte-identical
         // to the previous serial path; only the encoding is now multi-threaded.
+        let encoder = &self.encoder;
         let mut chunks_processed: usize = 0;
         for window in chunks.chunks(ENCODE_BATCH_CHUNKS) {
             let encoded: Vec<ChunkRecords> = window
                 .par_iter()
-                .map(|&(abs_x, abs_z, chunk)| self.encode_chunk_records(abs_x, abs_z, chunk))
+                .map(|&(abs_x, abs_z, chunk)| encoder.encode_chunk_records(abs_x, abs_z, chunk))
                 .collect::<Result<_, _>>()?;
 
             for records in &encoded {
@@ -1257,7 +1262,19 @@ impl BedrockWriter {
     }
 
     /// Encodes every LevelDB record for one chunk: version, Data3D, subchunks, then entities.
-    fn encode_chunk_records(
+    pub fn encode_chunk_records(
+        &self,
+        abs_chunk_x: i32,
+        abs_chunk_z: i32,
+        chunk: &ChunkToModify,
+    ) -> Result<ChunkRecords, BedrockSaveError> {
+        self.encoder.encode_chunk_records(abs_chunk_x, abs_chunk_z, chunk)
+    }
+}
+
+impl BedrockChunkEncoder {
+    /// Encodes every LevelDB record for one chunk: version, Data3D, subchunks, then entities.
+    pub fn encode_chunk_records(
         &self,
         abs_chunk_x: i32,
         abs_chunk_z: i32,
@@ -1514,7 +1531,9 @@ impl BedrockWriter {
             pots,
         }
     }
+}
 
+impl BedrockWriter {
     fn write_metadata(
         &self,
         dir: &Path,
@@ -1590,7 +1609,7 @@ impl BedrockWriter {
         writer.write_all(WORLD_ICON)?;
 
         let mut behavior_packs: Vec<&str> = Vec::new();
-        if self.extend_build_height {
+        if self.encoder.extend_build_height {
             const BP_MANIFEST: &[u8] =
                 include_bytes!("../../assets/minecraft/bp_tall/manifest.json");
             const BP_OVERWORLD: &[u8] =
@@ -1630,7 +1649,7 @@ impl BedrockWriter {
                     }
                 }
             }
-            if self.extend_build_height {
+            if self.encoder.extend_build_height {
                 folders.remove("behavior_packs/");
             }
             for folder in &folders {
