@@ -557,11 +557,11 @@ impl BedrockWriter {
         region_z: i32,
         region: super::common::RegionToModify,
     ) -> Result<(), BedrockSaveError> {
+        let encoder = self.encoder.clone();
         let db = self.ensure_db_open()?;
         const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
         let entries: Vec<((i32, i32), super::common::ChunkToModify)> =
             region.chunks.into_entries().collect();
-        let encoder = &self.encoder;
         for chunk_batch in entries.chunks(ENCODE_BATCH_CHUNKS) {
             let encoded: Vec<ChunkRecords> = chunk_batch
                 .par_iter()
@@ -828,6 +828,7 @@ impl BedrockWriter {
                     let rel_x = x - origin_x;
                     let rel_z = z - origin_z;
                     let ground_at = self
+                        .encoder
                         .ground
                         .as_ref()
                         .map(|g| g.level(crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z)))
@@ -857,6 +858,7 @@ impl BedrockWriter {
                     let rel_x = x - origin_x;
                     let rel_z = z - origin_z;
                     let ground_at = self
+                        .encoder
                         .ground
                         .as_ref()
                         .map(|g| g.level(crate::coordinate_system::cartesian::XZPoint::new(rel_x, rel_z)))
