@@ -549,9 +549,10 @@ impl BedrockWriter {
     ) -> Result<(), BedrockSaveError> {
         let ground_origin = self.ground_origin.unwrap_or_default();
         let center_lat = self.center_lat;
-        let ground = self.ground.as_deref();
+        let ground = self.ground.clone();
         let extend_build_height = self.extend_build_height;
         let db = self.ensure_db_open()?;
+        let ground_ref = ground.as_deref();
         const ENCODE_BATCH_CHUNKS: usize = if cfg!(target_os = "android") { 64 } else { 128 };
         let entries: Vec<((i32, i32), super::common::ChunkToModify)> =
             region.chunks.into_entries().collect();
@@ -565,7 +566,7 @@ impl BedrockWriter {
                         chunk,
                         ground_origin,
                         center_lat,
-                        ground,
+                        ground_ref,
                         extend_build_height,
                     )
                 })
@@ -1240,7 +1241,8 @@ impl BedrockWriter {
         // to the previous serial path; only the encoding is now multi-threaded.
         let ground_origin = self.ground_origin.unwrap_or_default();
         let center_lat = self.center_lat;
-        let ground = self.ground.as_deref();
+        let ground = self.ground.clone();
+        let ground_ref = ground.as_deref();
         let extend_build_height = self.extend_build_height;
         let mut chunks_processed: usize = 0;
         for window in chunks.chunks(ENCODE_BATCH_CHUNKS) {
@@ -1253,7 +1255,7 @@ impl BedrockWriter {
                         chunk,
                         ground_origin,
                         center_lat,
-                        ground,
+                        ground_ref,
                         extend_build_height,
                     )
                 })
