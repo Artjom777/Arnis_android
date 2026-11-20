@@ -1,0 +1,125 @@
+name: Build Patched Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream Arnis Git Tag or Ref'
+        required: true
+        default: 'v3.5.0'
+
+jobs:
+  build:
+    name: Build Patched APK (${{ github.event.inputs.upstream_tag }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Patcher
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Clone Upstream Arnis
+        run: |
+          echo "Cloning upstream Arnis at ${{ github.event.inputs.upstream_tag }}..."
+          git clone --depth 1 --branch "${{ github.event.inputs.upstream_tag }}" https://github.com/louis-e/arnis.git ./arnis
+
+      - name: Run Patcher
+        run: |
+          python3 patcher.py --target ./arnis --overlay ./overlay
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.1.12297006"
+
+      - name: Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Configure Build Environment
+        run: |
+          SDK_DIR=${ANDROID_HOME:-${ANDROID_SDK_ROOT}}
+          echo "ANDROID_HOME=${SDK_DIR}" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=${SDK_DIR}" >> $GITHUB_ENV
+
+          SDKMANAGER_PATH=$(find "$SDK_DIR/cmdline-tools" -name sdkmanager 2>/dev/null | head -n 1)
+          if [ -n "$SDKMANAGER_PATH" ]; then
+            SDKMANAGER_DIR=$(dirname "$SDKMANAGER_PATH")
+            echo "$SDKMANAGER_DIR" >> $GITHUB_PATH
+            export PATH="$SDKMANAGER_DIR:$PATH"
+          fi
+
+          ANDROID_NDK_HOME=$(find ${SDK_DIR}/ndk -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME}" >> $GITHUB_ENV
+          echo "NDK_HOME=${ANDROID_NDK_HOME}" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> $GITHUB_ENV
+
+      - name: Install Tauri CLI
+        run: |
+          cargo install tauri-cli --version "^2.0.0" --locked
+
+      - name: Tauri Android Init
+        working-directory: ./arnis
+        run: |
+          cargo tauri android init
+
+      - name: Configure Android Project
+        working-directory: ./arnis
+        run: |
+          python3 scripts/configure_android.py
+
+          if [ -d "assets/icons/android" ]; then
+            cp -r assets/icons/android/* gen/android/app/src/main/res/ 2>/dev/null || true
+          fi
+
+      - name: Update Dependencies
+        working-directory: ./arnis
+        run: |
+          cargo update -p reqwest || true
+          cargo update -p rusty-leveldb || true
+
+      - name: Build APK (arm64-v8a)
+        working-directory: ./arnis
+        run: |
+          cargo tauri android build --apk --target aarch64
+
+      - name: Sign & Align APK
+        working-directory: ./arnis
+        run: |
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -maxdepth 1 -mindepth 1 2>/dev/null | sort -V | tail -n 1)
+          ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+
+          UNSIGNED_APK=$(find gen/android/app/build/outputs/apk -name "*.apk" 2>/dev/null | head -n 1)
+          echo "Found APK: $UNSIGNED_APK"
+
+          keytool -genkeypair -v -keystore release.keystore -alias arnis_key -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Arnis, OU=Mobile, O=Arnis, L=City, S=State, C=US"
+
+          if [ -x "$ZIPALIGN" ]; then
+            $ZIPALIGN -f -P 16 4 "$UNSIGNED_APK" aligned.apk || $ZIPALIGN -f -p 4 "$UNSIGNED_APK" aligned.apk || cp "$UNSIGNED_APK" aligned.apk
+          else
+            cp "$UNSIGNED_APK" aligned.apk
+          fi
+
+          if [ -x "$APKSIGNER" ]; then
+            $APKSIGNER sign --ks release.keystore --ks-pass pass:android --key-pass pass:android --out arnis-arm64-v8a.apk aligned.apk
+          else
+            cp aligned.apk arnis-arm64-v8a.apk
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arnis-${{ github.event.inputs.upstream_tag }}-arm64-v8a
+          path: ./arnis/arnis-arm64-v8a.apk
