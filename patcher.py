@@ -685,26 +685,24 @@ def patch_bedrock(target_dir: Path):
     # 1. Add atomic settings and set_bedrock_db_options
     if "pub fn set_bedrock_db_options" not in content:
         atomics_block = """
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-static BEDROCK_MAX_FILE_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
-static BEDROCK_WRITE_BUFFER_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
-static BEDROCK_CACHE_SIZE_MB: AtomicUsize = AtomicUsize::new(64);
+static BEDROCK_MAX_FILE_SIZE_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
+static BEDROCK_WRITE_BUFFER_SIZE_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
+static BEDROCK_CACHE_SIZE_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
 /// Configures LevelDB options for Bedrock export in megabytes.
 pub fn set_bedrock_db_options(max_file_size_mb: usize, write_buffer_mb: usize, cache_mb: usize) {
     if max_file_size_mb >= 1 {
-        BEDROCK_MAX_FILE_SIZE_MB.store(max_file_size_mb, AtomicOrdering::Relaxed);
+        BEDROCK_MAX_FILE_SIZE_MB.store(max_file_size_mb, std::sync::atomic::Ordering::Relaxed);
     }
     if write_buffer_mb >= 1 {
-        BEDROCK_WRITE_BUFFER_SIZE_MB.store(write_buffer_mb, AtomicOrdering::Relaxed);
+        BEDROCK_WRITE_BUFFER_SIZE_MB.store(write_buffer_mb, std::sync::atomic::Ordering::Relaxed);
     }
     if cache_mb >= 1 {
-        BEDROCK_CACHE_SIZE_MB.store(cache_mb, AtomicOrdering::Relaxed);
+        BEDROCK_CACHE_SIZE_MB.store(cache_mb, std::sync::atomic::Ordering::Relaxed);
     }
 }
 """
-        content = atomics_block + "\n" + content
+        content += "\n" + atomics_block
 
     # 2. Add flush_single_region if not present
     if "fn flush_single_region" not in content:
@@ -1377,13 +1375,13 @@ fn gui_set_bedrock_options(
         content += cmd
 
     # Add gui_set_bedrock_options to invoke_handler
-    m_hand = re.search(r"invoke_handler\(tauri::generate_handler!\[([\s\S]*?)\]\)", content)
-    if m_hand and "gui_set_bedrock_options" not in m_hand.group(1):
-        content = re.sub(
-            r"(invoke_handler\(tauri::generate_handler!\[[\s\S]*?)(\]\))",
-            """\\g<1>    gui_set_bedrock_options,\n\\g<2>""",
-            content
-        )
+    m_hand = re.search(r"(invoke_handler\(tauri::generate_handler!\[)([\s\S]*?)(\]\))", content)
+    if m_hand and "gui_set_bedrock_options" not in m_hand.group(2):
+        body = m_hand.group(2).rstrip()
+        if not body.endswith(","):
+            body += ","
+        body += "\n            gui_set_bedrock_options,\n        "
+        content = content[:m_hand.start(2)] + body + content[m_hand.end(2):]
 
     # 5. In run_gui(), call protect_process_memory() and set TMPDIR
     m_rungui = re.search(r"pub fn run_gui\(\)\s*->\s*Result<\(\),\s*String>\s*\{", content)
