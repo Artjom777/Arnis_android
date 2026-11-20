@@ -1274,18 +1274,12 @@ def patch_map_preview(target_dir: Path):
     if mp_path.exists():
         with open(mp_path, "r", encoding="utf-8") as f:
             content = f.read()
-        m = re.search(r"WorldFormat::BedrockMcWorld\s*=>\s*\{([\s\S]*?)\}", content)
-        if m and "temp_dir()" not in m.group(1):
-            replacement = """WorldFormat::BedrockMcWorld => {
-            let stem = world_output
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("arnis_world");
-            std::env::temp_dir().join(format!("{stem}_map.png"))
-        }"""
-            content = content[:m.start()] + replacement + content[m.end():]
+        target = 'world_output.with_file_name(format!("{stem} map.png"))'
+        if target in content:
+            content = content.replace(target, 'std::env::temp_dir().join(format!("{stem}_map.png"))')
             with open(mp_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            print("    src/map_preview.rs patched successfully.")
 
 
 def patch_gui(target_dir: Path):
