@@ -117,16 +117,14 @@ trash = { version = "5.3.0", optional = true }
     if "[target.'cfg(not(target_os = \"android\"))'.dependencies]" not in content:
         content += desktop_deps
 
-    # 8. Add patch sections for rusty-leveldb
-    patch_block = """
+    # 8. Add patch section for rusty-leveldb ONLY if upstream uses legacy crates-io version
+    if 'git = "https://github.com/louis-e/leveldb-rs"' not in content and 'git = "https://github.com/louis-e/leveldb-rs.git"' not in content:
+        patch_block = """
 [patch.crates-io]
 rusty-leveldb = { path = "third_party/rusty-leveldb" }
-
-[patch."https://github.com/louis-e/leveldb-rs"]
-rusty-leveldb = { path = "third_party/rusty-leveldb" }
 """
-    if 'rusty-leveldb = { path = "third_party/rusty-leveldb" }' not in content:
-        content += patch_block
+        if 'rusty-leveldb = { path = "third_party/rusty-leveldb" }' not in content:
+            content += patch_block
 
     with open(cargo_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -451,34 +449,64 @@ def patch_gui(target_dir: Path):
     )
 
     # 2. Gate FileDialog in gui_pick_save_directory
-    m_pick = re.search(r"fn gui_pick_save_directory\([^)]*\)\s*->\s*Result<String,\s*String>\s*\{", content)
-    if m_pick:
-        ins = m_pick.end()
-        pick_override = """
+    pick_regex = re.compile(
+        r"fn gui_pick_save_directory\([^)]*\)\s*->\s*Result<String,\s*String>\s*\{[\s\S]*?\n\}"
+    )
+    if pick_regex.search(content):
+        replacement = """fn gui_pick_save_directory(start_path: String) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
         let _ = start_path;
         return Ok(crate::world_utils::resolve_android_download_dir().display().to_string());
     }
-"""
-        content = content[:ins] + pick_override + content[ins:]
+    #[cfg(not(target_os = "android"))]
+    {
+        let start = PathBuf::from(&start_path);
+        let mut dialog = FileDialog::new();
+        if start.is_dir() {
+            dialog = dialog.set_directory(&start);
+        }
+        match dialog.pick_folder() {
+            Some(folder) => Ok(folder.display().to_string()),
+            None => Ok(start_path),
+        }
+    }
+}"""
+        content = pick_regex.sub(replacement, content, count=1)
     else:
         report_error("fn gui_pick_save_directory", str(gui_path))
 
     # 3. Bypass trash on Android in trash_world / gui_trash_one_world
-    m_trash = re.search(r"fn trash_world\([^)]*\)\s*->\s*Result<\(\),\s*String>\s*\{", content)
-    if m_trash:
-        ins = m_trash.end()
-        trash_override = """
+    trash_regex = re.compile(
+        r"fn trash_world\([^)]*\)\s*->\s*Result<\(\),\s*String>\s*\{[\s\S]*?\n\}"
+    )
+    if trash_regex.search(content):
+        replacement = """fn trash_world(world: &Path) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
         if world.is_dir() {
             let _ = fs::remove_dir_all(world);
+        } else if world.is_file() {
+            let _ = fs::remove_file(world);
         }
-        return Ok(());
+        Ok(())
     }
-"""
-        content = content[:ins] + trash_override + content[ins:]
+    #[cfg(not(target_os = "android"))]
+    {
+        #[cfg(target_os = "macos")]
+        let bin = {
+            use trash::macos::{DeleteMethod, TrashContextExtMacos};
+            let mut bin = trash::TrashContext::new();
+            bin.set_delete_method(DeleteMethod::NsFileManager);
+            bin
+        };
+        #[cfg(not(target_os = "macos"))]
+        let bin = trash::TrashContext::new();
+        bin.delete(world)
+            .map_err(|e| format!("Could not move the world to the trash: {e}"))
+    }
+}"""
+        content = trash_regex.sub(replacement, content, count=1)
 
     # 4. In run_gui(), call protect_process_memory() and set TMPDIR
     m_rungui = re.search(r"pub fn run_gui\(\)\s*->\s*Result<\(\),\s*String>\s*\{", content)
@@ -534,13 +562,13 @@ def patch_elevation_and_canopy_caches(target_dir: Path):
         if "pub fn user_cache_dir() -> Option<PathBuf> {" in content:
             content = content.replace(
                 "pub fn user_cache_dir() -> Option<PathBuf> {",
-                "pub fn user_cache_dir() -> Option<PathBuf> {\n    #[cfg(target_os = \"android\")]\n    return Some(crate::world_utils::resolve_android_download_dir().join(\".arnis_cache\"));"
+                "pub fn user_cache_dir() -> Option<PathBuf> {\n    #[cfg(target_os = \"android\")]\n    {\n        return Some(crate::world_utils::resolve_android_download_dir().join(\".arnis_cache\"));\n    }"
             )
         elif "pub fn get_cache_dir(" in content:
             m = re.search(r"pub fn get_cache_dir\([^)]*\)\s*->\s*PathBuf\s*\{", content)
             if m:
                 ins = m.end()
-                content = content[:ins] + '\n    #[cfg(target_os = "android")]\n    return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/elevation").join(provider_name);\n' + content[ins:]
+                content = content[:ins] + '\n    #[cfg(target_os = "android")]\n    {\n        return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/elevation").join(provider_name);\n    }\n' + content[ins:]
 
         with open(elev_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -555,7 +583,7 @@ def patch_elevation_and_canopy_caches(target_dir: Path):
         if "fn cache_dir() -> PathBuf {" in content:
             content = content.replace(
                 "fn cache_dir() -> PathBuf {",
-                "fn cache_dir() -> PathBuf {\n    #[cfg(target_os = \"android\")]\n    return crate::world_utils::resolve_android_download_dir().join(\".arnis_cache/canopy\");"
+                "fn cache_dir() -> PathBuf {\n    #[cfg(target_os = \"android\")]\n    {\n        return crate::world_utils::resolve_android_download_dir().join(\".arnis_cache/canopy\");\n    }"
             )
 
         with open(canopy_path, "w", encoding="utf-8") as f:
