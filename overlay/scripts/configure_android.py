@@ -8,7 +8,9 @@ def main():
         with open(manifest_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        permissions = """    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+        permissions = """    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
