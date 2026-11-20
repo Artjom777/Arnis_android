@@ -910,9 +910,14 @@ fn should_stream_to_disk(num_tiles: usize, available_mb: u64, fillground: bool) 
 
     # 3. Ensure memory collect is invoked before save
     if "crate::world_utils::collect_memory(true);" not in content:
-        save_call = "editor.save()"
-        if save_call in content:
-            content = content.replace(save_call, "crate::world_utils::collect_memory(true);\n    editor.save()")
+        if "// Save world" in content:
+            content = content.replace("// Save world", "crate::world_utils::collect_memory(true);\n\n    // Save world", 1)
+        elif "let output_path = match editor.save()" in content:
+            content = content.replace("let output_path = match editor.save()", "crate::world_utils::collect_memory(true);\n    let output_path = match editor.save()", 1)
+        elif "if let Err(e) = editor.save()" in content:
+            content = content.replace("if let Err(e) = editor.save()", "crate::world_utils::collect_memory(true);\n    if let Err(e) = editor.save()", 1)
+        elif "editor.save()" in content:
+            content = content.replace("editor.save()", "{\n        crate::world_utils::collect_memory(true);\n        editor.save()\n    }", 1)
 
     with open(dp_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -1224,9 +1229,8 @@ def patch_canopy_and_caches(target_dir: Path):
                 "fn cache_dir() -> PathBuf {",
                 """fn cache_dir() -> PathBuf {
     #[cfg(target_os = "android")]
-    {
-        return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/canopy");
-    }"""
+    return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/canopy");
+    #[cfg(not(target_os = "android"))]"""
             )
             with open(canopy_path, "w", encoding="utf-8") as f:
                 f.write(c)
@@ -1240,9 +1244,8 @@ def patch_canopy_and_caches(target_dir: Path):
                 "pub fn user_cache_dir() -> Option<PathBuf> {",
                 """pub fn user_cache_dir() -> Option<PathBuf> {
     #[cfg(target_os = "android")]
-    {
-        return Some(crate::world_utils::resolve_android_download_dir().join(".arnis_cache"));
-    }"""
+    return Some(crate::world_utils::resolve_android_download_dir().join(".arnis_cache"));
+    #[cfg(not(target_os = "android"))]"""
             )
         elif "pub fn get_cache_dir(" in c:
             m = re.search(r"pub fn get_cache_dir\([^)]*\)\s*->\s*PathBuf\s*\{", c)
@@ -1250,9 +1253,8 @@ def patch_canopy_and_caches(target_dir: Path):
                 ins = m.end()
                 c = c[:ins] + """
     #[cfg(target_os = "android")]
-    {
-        return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/elevation").join(provider_name);
-    }
+    return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/elevation").join(provider_name);
+    #[cfg(not(target_os = "android"))]
 """ + c[ins:]
         with open(elev_cache, "w", encoding="utf-8") as f:
             f.write(c)
