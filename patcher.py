@@ -1224,14 +1224,19 @@ def patch_canopy_and_caches(target_dir: Path):
     if canopy_path.exists():
         with open(canopy_path, "r", encoding="utf-8") as f:
             c = f.read()
-        if "fn cache_dir() -> PathBuf {" in c:
-            c = c.replace(
-                "fn cache_dir() -> PathBuf {",
-                """fn cache_dir() -> PathBuf {
+        m = re.search(r"fn cache_dir\(\)\s*->\s*PathBuf\s*\{([\s\S]*?)\n\}", c)
+        if m:
+            orig_body = m.group(1)
+            new_fn = """fn cache_dir() -> PathBuf {
     #[cfg(target_os = "android")]
-    return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/canopy");
-    #[cfg(not(target_os = "android"))]"""
-            )
+    {
+        crate::world_utils::resolve_android_download_dir().join(".arnis_cache/canopy")
+    }
+    #[cfg(not(target_os = "android"))]
+    {""" + orig_body + """
+    }
+}"""
+            c = c[:m.start()] + new_fn + c[m.end():]
             with open(canopy_path, "w", encoding="utf-8") as f:
                 f.write(c)
 
@@ -1239,23 +1244,33 @@ def patch_canopy_and_caches(target_dir: Path):
     if elev_cache.exists():
         with open(elev_cache, "r", encoding="utf-8") as f:
             c = f.read()
-        if "pub fn user_cache_dir() -> Option<PathBuf> {" in c:
-            c = c.replace(
-                "pub fn user_cache_dir() -> Option<PathBuf> {",
-                """pub fn user_cache_dir() -> Option<PathBuf> {
+        m_user = re.search(r"pub fn user_cache_dir\(\)\s*->\s*Option<PathBuf>\s*\{([\s\S]*?)\n\}", c)
+        if m_user:
+            orig_body = m_user.group(1)
+            new_fn = """pub fn user_cache_dir() -> Option<PathBuf> {
     #[cfg(target_os = "android")]
-    return Some(crate::world_utils::resolve_android_download_dir().join(".arnis_cache"));
-    #[cfg(not(target_os = "android"))]"""
-            )
-        elif "pub fn get_cache_dir(" in c:
-            m = re.search(r"pub fn get_cache_dir\([^)]*\)\s*->\s*PathBuf\s*\{", c)
-            if m:
-                ins = m.end()
-                c = c[:ins] + """
-    #[cfg(target_os = "android")]
-    return crate::world_utils::resolve_android_download_dir().join(".arnis_cache/elevation").join(provider_name);
+    {
+        Some(crate::world_utils::resolve_android_download_dir().join(".arnis_cache"))
+    }
     #[cfg(not(target_os = "android"))]
-""" + c[ins:]
+    {""" + orig_body + """
+    }
+}"""
+            c = c[:m_user.start()] + new_fn + c[m_user.end():]
+        else:
+            m_get = re.search(r"pub fn get_cache_dir\([^)]*\)\s*->\s*PathBuf\s*\{([\s\S]*?)\n\}", c)
+            if m_get:
+                orig_body = m_get.group(1)
+                new_fn = """pub fn get_cache_dir(provider_name: &str) -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        crate::world_utils::resolve_android_download_dir().join(".arnis_cache/elevation").join(provider_name)
+    }
+    #[cfg(not(target_os = "android"))]
+    {""" + orig_body + """
+    }
+}"""
+                c = c[:m_get.start()] + new_fn + c[m_get.end():]
         with open(elev_cache, "w", encoding="utf-8") as f:
             f.write(c)
 
