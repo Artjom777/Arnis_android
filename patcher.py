@@ -963,6 +963,67 @@ def patch_tile(target_dir: Path):
     }"""
         content = tg_regex.sub(new_tg, content)
 
+    # Adapt lookups to iterate over tile_indices from tile_grid
+    site1_regex = re.compile(
+        r'if\s+let\s+Some\(&tile_idx\)\s*=\s*tile_grid\.get\(&\(rx,\s*rz\)\)\s*\{\s*if\s+aabb_intersects\(aabb,\s*&tiles\[tile_idx\]\)\s*\{\s*tile_elements\[tile_idx\]\.push\(elem_idx\);\s*\}\s*\}'
+    )
+    site1_repl = """if let Some(tile_indices) = tile_grid.get(&(rx, rz)) {
+                            for &tile_idx in tile_indices {
+                                if tile_elements[tile_idx].last() != Some(&elem_idx)
+                                    && aabb_intersects(aabb, &tiles[tile_idx])
+                                {
+                                    tile_elements[tile_idx].push(elem_idx);
+                                }
+                            }
+                        }"""
+    content = site1_regex.sub(site1_repl, content)
+
+    site2_regex = re.compile(
+        r'if\s+let\s+Some\(&tile_idx\)\s*=\s*tile_grid\.get\(&\(node\.x\s*>>\s*9,\s*node\.z\s*>>\s*9\)\)\s*\{\s*if\s+tiles\[tile_idx\]\.contains\(node\.x,\s*node\.z\)\s*\{\s*tile_elements\[tile_idx\]\.push\(elem_idx\);\s*\}\s*\}'
+    )
+    site2_repl = """if let Some(tile_indices) = tile_grid.get(&(node.x >> 9, node.z >> 9)) {
+                    for &tile_idx in tile_indices {
+                        if tiles[tile_idx].contains(node.x, node.z) {
+                            tile_elements[tile_idx].push(elem_idx);
+                            break;
+                        }
+                    }
+                }"""
+    content = site2_regex.sub(site2_repl, content)
+
+    site3_regex = re.compile(
+        r'if\s+let\s+Some\(&tile_idx\)\s*=\s*tile_grid\.get\(&\(rx,\s*rz\)\)\s*\{\s*if\s+aabb_intersects\(aabb,\s*&tiles\[tile_idx\]\.expanded\(halo\)\)\s*\{\s*tile_elements\[tile_idx\]\.push\(elem_idx\);\s*\}\s*\}'
+    )
+    site3_repl = """if let Some(tile_indices) = tile_grid.get(&(rx, rz)) {
+                            for &tile_idx in tile_indices {
+                                if tile_elements[tile_idx].last() != Some(&elem_idx)
+                                    && aabb_intersects(aabb, &tiles[tile_idx].expanded(halo))
+                                {
+                                    tile_elements[tile_idx].push(elem_idx);
+                                }
+                            }
+                        }"""
+    content = site3_regex.sub(site3_repl, content)
+
+    site4_regex = re.compile(
+        r'if\s+let\s+Some\(&tile_idx\)\s*=\s*tile_grid\.get\(&\(rx,\s*rz\)\)\s*\{\s*let\s+expanded\s*=\s*tiles\[tile_idx\]\.expanded\(TILE_EDITOR_HALO\);\s*if\s+member_aabbs\s*\.iter\(\)\s*\.copied\(\)\s*\.any\(\|member_aabb\|\s*aabb_intersects\(member_aabb,\s*&expanded\)\)\s*\{\s*tile_elements\[tile_idx\]\.push\(elem_idx\);\s*\}\s*\}'
+    )
+    site4_repl = """if let Some(tile_indices) = tile_grid.get(&(rx, rz)) {
+                            for &tile_idx in tile_indices {
+                                if tile_elements[tile_idx].last() != Some(&elem_idx) {
+                                    let expanded = tiles[tile_idx].expanded(TILE_EDITOR_HALO);
+                                    if member_aabbs
+                                        .iter()
+                                        .copied()
+                                        .any(|member_aabb| aabb_intersects(member_aabb, &expanded))
+                                    {
+                                        tile_elements[tile_idx].push(elem_idx);
+                                    }
+                                }
+                            }
+                        }"""
+    content = site4_regex.sub(site4_repl, content)
+
     with open(tile_path, "w", encoding="utf-8") as f:
         f.write(content)
     print("    src/tile.rs patched successfully.")
